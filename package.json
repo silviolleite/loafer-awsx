@@ -1,0 +1,13 @@
+{
+  "name": "loafer-awsx-dev-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Developer tooling for loafer-awsx (Conventional Commits enforcement).",
+  "scripts": {
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.5.0",
+    "@commitlint/config-conventional": "^19.5.0"
+  }
+}
