@@ -30,7 +30,7 @@ func Recovery(log *slog.Logger) Middleware {
 						"stack", string(stack),
 					}
 					if msg != nil {
-						attrs = append(attrs, "message_id", msg.Identifier())
+						attrs = append(attrs, logKeyMessageID, msg.Identifier())
 					}
 					log.Error("panic recovered", attrs...)
 					err = errors.Wrap(errors.ErrPanic, fmt.Errorf("%v", r))

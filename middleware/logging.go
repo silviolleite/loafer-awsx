@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// Log attribute keys shared by the logging and recovery middlewares.
+const (
+	logKeyMessageID = "message_id"
+	logKeyDuration  = "duration"
+	logKeyError     = "error"
+)
+
 // Logging returns a Middleware that records the lifecycle of message
 // processing through the supplied logger.
 //
@@ -25,7 +32,7 @@ func Logging(log *slog.Logger) Middleware {
 		return func(ctx context.Context, msg Message) error {
 			var idAttrs []any
 			if msg != nil {
-				idAttrs = append(idAttrs, "message_id", msg.Identifier())
+				idAttrs = append(idAttrs, logKeyMessageID, msg.Identifier())
 			}
 
 			log.Info("message received", idAttrs...)
@@ -35,12 +42,12 @@ func Logging(log *slog.Logger) Middleware {
 			duration := time.Since(start)
 
 			if err != nil {
-				attrs := append([]any{"duration", duration, "error", err}, idAttrs...)
+				attrs := append([]any{logKeyDuration, duration, logKeyError, err}, idAttrs...)
 				log.Error("message processing failed", attrs...)
 				return err
 			}
 
-			attrs := append([]any{"duration", duration}, idAttrs...)
+			attrs := append([]any{logKeyDuration, duration}, idAttrs...)
 			log.Info("message processed", attrs...)
 			return err
 		}
