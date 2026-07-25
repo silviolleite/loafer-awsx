@@ -111,3 +111,8 @@ logs/
 ehthumbs.db
 Thumbs.db
 Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Kiro (keep specs, ignore local steering/workflow config)
+# ---------------------------------------------------------------------------
+.kiro/steering/
