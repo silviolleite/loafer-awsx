@@ -1,0 +1,29 @@
+# docker-compose.yml starts a LocalStack instance exposing the SQS and SNS
+# services on the gateway port 4566, ready for the Terraform in this directory
+# to provision resources against.
+#
+# Usage:
+#   docker compose up -d
+#   terraform init
+#   terraform apply -auto-approve
+#
+# The default provider endpoint (http://localhost:4566) and region (us-east-1)
+# match the defaults in variables.tf, so no overrides are needed locally.
+
+services:
+  localstack:
+    container_name: "loafer-awsx-localstack"
+    # Pin to the 3.x community line. The unpinned `latest` tag now resolves to a
+    # build that refuses to start without a LocalStack license token (exit 55).
+    image: localstack/localstack:3
+    ports:
+      - "127.0.0.1:4566:4566" # LocalStack gateway (SQS + SNS)
+    environment:
+      - SERVICES=sqs,sns
+      - AWS_DEFAULT_REGION=us-east-1
+      - DEBUG=${DEBUG-0}
+    volumes:
+      - "localstack:/var/lib/localstack"
+
+volumes:
+  localstack:
