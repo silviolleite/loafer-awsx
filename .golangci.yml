@@ -1,0 +1,194 @@
+version: "2"
+run:
+  go: "1.26"
+  tests: false
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - copyloopvar
+    - depguard
+    - dogsled
+    - dupl
+    - errcheck
+    - exhaustive
+    - funlen
+    - gochecknoinits
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - godox
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - mnd
+    - nakedret
+    - nolintlint
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+    - whitespace
+  settings:
+    depguard:
+      rules:
+        main:
+          files:
+            - $all
+            - '!$test'
+          deny:
+            - pkg: github.com/sirupsen/logrus
+              desc: not allowed
+            - pkg: github.com/pkg/errors
+              desc: Should be replaced by standard lib errors package
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - (io.ReadCloser).Close
+    funlen:
+      lines: 100
+      statements: 50
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+        - importShadow
+        - stringConcatSimplify
+        - redundantSprint
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    gocyclo:
+      min-complexity: 15
+    godox:
+      keywords:
+        - BUG
+        - NOTE
+        - FIXME
+        - HACK
+    gosec:
+      includes:
+        - G401
+        - G306
+        - G402
+      excludes:
+        - G204
+        - G101
+      config:
+        G306: "0600"
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+    mnd:
+      checks:
+        - argument
+        - case
+        - condition
+        - return
+    nakedret:
+      max-func-lines: 50
+    revive:
+      confidence: 0
+      severity: warning
+      rules:
+        - name: atomic
+        - name: blank-imports
+        - name: exported
+        - name: var-naming
+          arguments:
+            - - SKU
+            - - VM
+        - name: cyclomatic
+          arguments:
+            - 28
+        - name: unexported-return
+          severity: warning
+        - name: unhandled-error
+          arguments:
+            - fmt.Fprintf
+            - resp.Body.Close
+        - name: indent-error-flow
+          severity: warning
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+        - -ST1020
+        - -ST1021
+        - -ST1022
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - bodyclose
+          - dogsled
+          - err113
+          - errcheck
+          - funlen
+          - gochecknoglobals
+          - gocognit
+          - gocritic
+          - godot
+          - interfacer
+          - maligned
+          - misspell
+          - nestif
+          - revive
+          - scopelint
+          - testpackage
+          - unconvert
+          - wsl
+        path: _test.go
+      - linters:
+          - revive
+        text: 'avoid package names that conflict with Go standard library'
+        path: errors/
+    paths:
+      - .github
+      - example
+      - examples
+      - fake
+      - tmp
+      - third_party$
+      - builtin$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - prefix(github.com/silviolleite/loafer-awsx)
+    goimports:
+      local-prefixes:
+        - github.com/silviolleite/loafer-awsx
+  exclusions:
+    generated: lax
+    paths:
+      - .github
+      - example
+      - examples
+      - fake
+      - tmp
+      - third_party$
+      - builtin$
