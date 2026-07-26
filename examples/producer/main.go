@@ -127,7 +127,7 @@ func publishOrder(ctx context.Context, p *producer.Producer, topicARN string) {
 func publishStandardSingle(ctx context.Context, p *producer.Producer, topicARN string) {
 	msgID, err := p.Publish(ctx, &producer.PublishInput{
 		TopicARN:   topicARN,
-		Message:    `{"event":"user.created","id":"u-1001"}`,
+		Message:    `{"id":"u-1001","text":"user created"}`,
 		Attributes: map[string]string{"event_type": "user.created"},
 	})
 	if err != nil {
@@ -146,12 +146,12 @@ func publishStandardBatch(ctx context.Context, p *producer.Producer, topicARN st
 		Messages: []*producer.PublishBatchEntry{
 			{
 				ID:         "1",
-				Message:    `{"event":"user.updated","id":"u-1001"}`,
+				Message:    `{"id":"u-1001","text":"user updated"}`,
 				Attributes: map[string]string{"event_type": "user.updated"},
 			},
 			{
 				ID:         "2",
-				Message:    `{"event":"user.deleted","id":"u-1002"}`,
+				Message:    `{"id":"u-1002","text":"user deleted"}`,
 				Attributes: map[string]string{"event_type": "user.deleted"},
 			},
 		},
