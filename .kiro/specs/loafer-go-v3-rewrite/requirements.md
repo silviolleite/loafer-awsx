@@ -36,7 +36,7 @@ This document specifies the requirements for loafer-awsx (formerly the loafer-go
 
 1. THE Library SHALL organize code into the following top-level packages: conn, producer, router, consumer, broker, logger, typed, middleware, and idgen.
 2. THE Library SHALL use the module path `github.com/silviolleite/loafer-awsx`.
-3. THE Library SHALL require Go 1.24 or later as the minimum supported version.
+3. THE Library SHALL require Go 1.26 or later as the minimum supported version.
 4. THE Library SHALL use aws-sdk-go-v2 as the sole AWS SDK dependency.
 5. THE conn Package SHALL expose a function to create an AWS SDK v2 configuration from functional options (region, credentials, endpoint, profile, retry count).
 

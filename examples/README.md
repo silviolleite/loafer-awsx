@@ -18,7 +18,7 @@ Each example is a standalone `package main` under this directory:
 
 - **Docker** (with the `docker compose` plugin) — runs LocalStack.
 - **Terraform** `>= 1.3` — provisions the SQS queues, SNS topics, and subscriptions.
-- **Go** `1.24+` — builds and runs the example programs.
+- **Go** `1.26+` — builds and runs the example programs.
 - **curl** — used by the `make up` health check.
 
 ## Quick start

@@ -7,10 +7,10 @@ This plan implements loafer-awsx (formerly the loafer-go v3 rewrite, extracted i
 ## Tasks
 
 - [x] 1. Initialize Module and Project Skeleton
-  - Initialize the Go module with the loafer-awsx module path, set up go.mod with Go 1.24 minimum, add aws-sdk-go-v2 and test dependencies (testify, rapid, goleak).
+  - Initialize the Go module with the loafer-awsx module path, set up go.mod with Go 1.26 minimum, add aws-sdk-go-v2 and test dependencies (testify, rapid, goleak).
   - Create the top-level directory structure for all packages (conn, producer, router, consumer, broker, logger, typed, middleware, idgen, errors, fake, examples).
   - Files to create/modify: `go.mod`, `go.sum`, directory stubs with `package` declarations for each package.
-  - Acceptance criteria: `go build ./...` passes with Go 1.24; module path is `github.com/silviolleite/loafer-awsx` at the repository root; all required packages exist with valid Go files.
+  - Acceptance criteria: `go build ./...` passes with Go 1.26; module path is `github.com/silviolleite/loafer-awsx` at the repository root; all required packages exist with valid Go files.
   - _Requirements: 1_
 
 - [x] 2. Sentinel Errors Package
@@ -195,7 +195,7 @@ This plan implements loafer-awsx (formerly the loafer-go v3 rewrite, extracted i
   - _Requirements: 18_
 
 - [x] 31. Examples README and Makefile
-  - Create a README and a Makefile under `examples/` to make running the examples easier. The README documents the prerequisites (Docker, Terraform, Go 1.24), how to bring up LocalStack and provision resources with the existing Terraform config, the required environment variables (region, endpoint, account ID), and how to run each example (basic, fifo, typed, middleware, producer). The Makefile provides convenience targets (e.g. `up`/`down` for LocalStack, `provision`/`destroy` for Terraform, and per-example `run-*` targets plus a `run-all` helper).
+  - Create a README and a Makefile under `examples/` to make running the examples easier. The README documents the prerequisites (Docker, Terraform, Go 1.26), how to bring up LocalStack and provision resources with the existing Terraform config, the required environment variables (region, endpoint, account ID), and how to run each example (basic, fifo, typed, middleware, producer). The Makefile provides convenience targets (e.g. `up`/`down` for LocalStack, `provision`/`destroy` for Terraform, and per-example `run-*` targets plus a `run-all` helper).
   - Files to create/modify: `examples/README.md`, `examples/Makefile`.
   - Acceptance criteria: `examples/README.md` documents prerequisites, LocalStack + Terraform setup, environment variables, and step-by-step run instructions for every example; `examples/Makefile` exposes targets to start/stop LocalStack, provision/destroy Terraform resources, and run each example; targets are self-documented and reuse the existing `examples/terraform/docker-compose.yml`.
   - _Requirements: 19_

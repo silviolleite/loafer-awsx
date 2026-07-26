@@ -1768,7 +1768,7 @@ loafer-go/
 ```go
 module github.com/silviolleite/loafer-awsx
 
-go 1.24
+go 1.26
 
 require (
     github.com/aws/aws-sdk-go-v2             v1.40.x
