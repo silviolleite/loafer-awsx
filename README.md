@@ -389,6 +389,13 @@ Medians of `-benchtime=2s -count=6` on an Intel Core i5-8265U (Go 1.26,
 `linux/amd64`). Absolute numbers are machine-specific; the relative gap is what
 matters, and both the code and methodology are reproducible.
 
+Relative to `loafer-go`, on this run:
+
+- **Standard queue:** ~41% lower latency, ~70% higher throughput, ~6% less
+  memory per message, and the same number of allocations.
+- **FIFO queue:** ~38% lower latency, ~62% higher throughput, ~5% less memory
+  per message, and the same number of allocations.
+
 The benchmarks live in their own module under [`benchmarks/`](benchmarks) (kept
 separate so the competitor dependency never touches the library's `go.mod`). To
 reproduce:
