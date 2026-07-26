@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [0.3.0](https://github.com/silviolleite/loafer-awsx/compare/v0.2.0...v0.3.0) (2026-07-26)
+
+
+### Features
+
+* require Go 1.26 as the minimum supported version ([a9a8bee](https://github.com/silviolleite/loafer-awsx/commit/a9a8beede2cdb5ac8458e97de1bd22694b6a24b2))
+
 ## [0.2.0](https://github.com/silviolleite/loafer-awsx/compare/v0.1.0...v0.2.0) (2026-07-25)
 
 
