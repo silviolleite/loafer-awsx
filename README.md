@@ -31,8 +31,9 @@ functional options, and every component accepts the standard library
 3. [Quickstart](#quickstart)
 4. [Examples](#examples)
 5. [Configuration Reference](#configuration-reference)
-6. [Acknowledgements](#acknowledgements)
-7. [License](#license)
+6. [Benchmarks](#benchmarks)
+7. [Acknowledgements](#acknowledgements)
+8. [License](#license)
 
 ---
 
@@ -362,6 +363,40 @@ The `errors` package exports sentinels matchable with `errors.Is`, including
 `ErrPanic`. `errors.New(text string) error` and `errors.Wrap(sentinel, err error) error`
 help build and combine errors while preserving `errors.Is` matching against both
 causes.
+
+---
+
+## Benchmarks
+
+The numbers below compare the per-message processing overhead of `loafer-awsx`
+with [JustCodes/loafer-go](https://github.com/JustCodes/loafer-go) for both
+standard and FIFO (PerGroupID) routing.
+
+Both libraries are driven by the same in-memory SQS client, a no-op handler, and
+an identical 8-worker pool, so the results isolate library overhead (dispatch,
+worker routing, visibility bookkeeping) and deliberately exclude AWS and network
+latency. In production, end-to-end throughput is dominated by SQS round-trips, so
+treat these figures as a measure of framework cost, not real-world throughput.
+
+| Mode | Library | Time/op | Throughput | Allocs/op | Bytes/op |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Standard | `loafer-awsx` | ~5.4 µs | ~184k msg/s | 19 | 1,175 B |
+| Standard | `loafer-go` | ~9.3 µs | ~105k msg/s | 19 | 1,245 B |
+| FIFO | `loafer-awsx` | ~6.1 µs | ~165k msg/s | 22 | 1,518 B |
+| FIFO | `loafer-go` | ~9.9 µs | ~100k msg/s | 22 | 1,589 B |
+
+Medians of `-benchtime=2s -count=6` on an Intel Core i5-8265U (Go 1.26,
+`linux/amd64`). Absolute numbers are machine-specific; the relative gap is what
+matters, and both the code and methodology are reproducible.
+
+The benchmarks live in their own module under [`benchmarks/`](benchmarks) (kept
+separate so the competitor dependency never touches the library's `go.mod`). To
+reproduce:
+
+```bash
+cd benchmarks
+go test -run '^$' -bench . -benchtime=2s -count=6
+```
 
 ---
 
