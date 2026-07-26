@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/silviolleite/loafer-awsx.svg)](https://pkg.go.dev/github.com/silviolleite/loafer-awsx)
 [![CI](https://github.com/silviolleite/loafer-awsx/actions/workflows/ci.yml/badge.svg)](https://github.com/silviolleite/loafer-awsx/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/silviolleite/loafer-awsx)](https://goreportcard.com/report/github.com/silviolleite/loafer-awsx)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/silviolleite/loafer-awsx)](go.mod)
 [![License](https://img.shields.io/github/license/silviolleite/loafer-awsx)](LICENSE)
 
 > A modern, idiomatic Go library for AWS SQS/SNS message processing, built on
