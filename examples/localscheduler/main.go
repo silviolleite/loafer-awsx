@@ -70,11 +70,11 @@ type sqsMessageAttributeValue struct {
 // sqsSendMessageRequest is the JSON payload the consumer stores as the schedule
 // Target.Input. It matches the SQS SendMessage API request shape.
 type sqsSendMessageRequest struct {
-	QueueUrl               string                              `json:"QueueUrl"`
-	MessageBody            string                              `json:"MessageBody"`
-	MessageGroupId         string                              `json:"MessageGroupId"`
-	MessageDeduplicationId string                              `json:"MessageDeduplicationId"`
 	MessageAttributes      map[string]sqsMessageAttributeValue `json:"MessageAttributes,omitempty"`
+	QueueURL               string                              `json:"QueueUrl"`
+	MessageBody            string                              `json:"MessageBody"`
+	MessageGroupID         string                              `json:"MessageGroupId"`
+	MessageDeduplicationID string                              `json:"MessageDeduplicationId"`
 }
 
 func main() {
@@ -186,7 +186,7 @@ func fireIfDue(
 	}
 
 	log.Printf("fired schedule %q: re-published message to %s (group=%s retry_count=%s)",
-		name, request.QueueUrl, request.MessageGroupId, request.MessageAttributes["retry_count"].StringValue)
+		name, request.QueueURL, request.MessageGroupID, request.MessageAttributes["retry_count"].StringValue)
 
 	if _, err := schedClient.DeleteSchedule(ctx, &scheduler.DeleteScheduleInput{
 		Name:      aws.String(name),
@@ -201,14 +201,14 @@ func fireIfDue(
 // message attributes.
 func buildSendMessageInput(request sqsSendMessageRequest) *sqs.SendMessageInput {
 	input := &sqs.SendMessageInput{
-		QueueUrl:    aws.String(request.QueueUrl),
+		QueueUrl:    aws.String(request.QueueURL),
 		MessageBody: aws.String(request.MessageBody),
 	}
-	if request.MessageGroupId != "" {
-		input.MessageGroupId = aws.String(request.MessageGroupId)
+	if request.MessageGroupID != "" {
+		input.MessageGroupId = aws.String(request.MessageGroupID)
 	}
-	if request.MessageDeduplicationId != "" {
-		input.MessageDeduplicationId = aws.String(request.MessageDeduplicationId)
+	if request.MessageDeduplicationID != "" {
+		input.MessageDeduplicationId = aws.String(request.MessageDeduplicationID)
 	}
 	if len(request.MessageAttributes) > 0 {
 		attrs := make(map[string]sqstypes.MessageAttributeValue, len(request.MessageAttributes))

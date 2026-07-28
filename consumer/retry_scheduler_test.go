@@ -98,7 +98,7 @@ func TestRetrySchedulerPreservesBodyAndFIFOIdentity(t *testing.T) {
 		second := decodeInput(t, calls[1])
 
 		assert.Equal(t, body, first.MessageBody)
-		assert.Equal(t, groupID, first.MessageGroupId)
+		assert.Equal(t, groupID, first.MessageGroupID)
 		assert.LessOrEqual(t, len(first.MessageAttributes), maxMessageAttributes)
 
 		rc, ok := first.MessageAttributes[retryCountAttribute]
@@ -115,12 +115,12 @@ func TestRetrySchedulerPreservesBodyAndFIFOIdentity(t *testing.T) {
 			}
 		}
 
-		assert.NotEmpty(t, first.MessageDeduplicationId)
-		assert.NotEqual(t, "original-dedup-id", first.MessageDeduplicationId)
-		assert.NotEqual(t, first.MessageDeduplicationId, second.MessageDeduplicationId)
+		assert.NotEmpty(t, first.MessageDeduplicationID)
+		assert.NotEqual(t, "original-dedup-id", first.MessageDeduplicationID)
+		assert.NotEqual(t, first.MessageDeduplicationID, second.MessageDeduplicationID)
 
 		require.NotNil(t, calls[0].Name)
-		assert.Equal(t, first.MessageDeduplicationId, *calls[0].Name)
+		assert.Equal(t, first.MessageDeduplicationID, *calls[0].Name)
 	})
 }
 

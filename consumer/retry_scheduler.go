@@ -39,11 +39,11 @@ type sqsMessageAttributeValue struct {
 // Input. It matches the SQS SendMessage API request shape so EventBridge
 // Scheduler can invoke SendMessage against the Entry_Queue.
 type sqsSendMessageRequest struct {
-	QueueUrl               string                              `json:"QueueUrl"`
-	MessageBody            string                              `json:"MessageBody"`
-	MessageGroupId         string                              `json:"MessageGroupId"`
-	MessageDeduplicationId string                              `json:"MessageDeduplicationId"`
 	MessageAttributes      map[string]sqsMessageAttributeValue `json:"MessageAttributes,omitempty"`
+	QueueURL               string                              `json:"QueueUrl"`
+	MessageBody            string                              `json:"MessageBody"`
+	MessageGroupID         string                              `json:"MessageGroupId"`
+	MessageDeduplicationID string                              `json:"MessageDeduplicationId"`
 }
 
 // retryScheduler creates one-time EventBridge Scheduler schedules that
@@ -55,10 +55,10 @@ type sqsSendMessageRequest struct {
 type retryScheduler struct {
 	client           SchedulerClient
 	idgen            idgen.GroupIDGenerator
+	now              func() time.Time
 	targetQueueARN   string
 	executionRoleARN string
 	targetQueueURL   string
-	now              func() time.Time
 }
 
 // newRetryScheduler builds a retryScheduler from the scheduler client, the
@@ -95,10 +95,10 @@ func (rs *retryScheduler) schedule(ctx context.Context, msg *message, next int, 
 	}
 
 	request := sqsSendMessageRequest{
-		QueueUrl:               rs.targetQueueURL,
+		QueueURL:               rs.targetQueueURL,
 		MessageBody:            string(msg.Body()),
-		MessageGroupId:         msg.SystemAttributeByKey(messageGroupIDKey),
-		MessageDeduplicationId: dedupID,
+		MessageGroupID:         msg.SystemAttributeByKey(messageGroupIDKey),
+		MessageDeduplicationID: dedupID,
 		MessageAttributes:      buildRetryAttributes(msg.UserMessageAttributes(), next),
 	}
 

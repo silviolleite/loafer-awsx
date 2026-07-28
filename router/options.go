@@ -291,12 +291,12 @@ func WithMaxRetryCount(n int) ScheduledRetryOption {
 }
 
 // WithBackoff sets the base and maximum Backoff_Delay for the Scheduled Retry
-// model. Both must be within the inclusive range [1ms, 86,400,000ms] and max
-// must be greater than or equal to base. When base is left unset it defaults to
-// 1000ms (Req 4.1, 4.5, 4.6, 4.7).
-func WithBackoff(base, max time.Duration) ScheduledRetryOption {
+// model. Both must be within the inclusive range [1ms, 86,400,000ms] and
+// maxDelay must be greater than or equal to base. When base is left unset it
+// defaults to 1000ms (Req 4.1, 4.5, 4.6, 4.7).
+func WithBackoff(base, maxDelay time.Duration) ScheduledRetryOption {
 	return func(c *ScheduledRetryConfig) {
 		c.BaseBackoff = base
-		c.MaxBackoff = max
+		c.MaxBackoff = maxDelay
 	}
 }
