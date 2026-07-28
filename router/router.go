@@ -24,6 +24,7 @@ const (
 type Route struct {
 	handler           middleware.Handler
 	dlqConfig         *DLQConfig
+	scheduledRetry    *ScheduledRetryConfig
 	queueName         string
 	middlewares       []middleware.Middleware
 	customGroupFields []string
@@ -33,6 +34,7 @@ type Route struct {
 	maxMessages       int32
 	waitTimeSeconds   int32
 	visibilityTimeout int32
+	retryModel        RetryModel
 }
 
 // Option configures a Route. Options are applied in order and may return an
@@ -135,4 +137,16 @@ func (r *Route) CustomGroupFields() []string {
 // DLQ returns the DLQ configuration, or nil when the route has no DLQ.
 func (r *Route) DLQ() *DLQConfig {
 	return r.dlqConfig
+}
+
+// RetryModel returns the configured retry model. It defaults to
+// VisibilityRetryModel when no retry model is configured.
+func (r *Route) RetryModel() RetryModel {
+	return r.retryModel
+}
+
+// ScheduledRetry returns the Scheduled Retry configuration, or nil when the
+// route uses the Visibility model.
+func (r *Route) ScheduledRetry() *ScheduledRetryConfig {
+	return r.scheduledRetry
 }
