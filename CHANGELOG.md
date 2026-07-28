@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [0.4.0](https://github.com/silviolleite/loafer-awsx/compare/v0.3.0...v0.4.0) (2026-07-28)
+
+
+### Features
+
+* **consumer:** add FIFO scheduled retry model ([f52c12c](https://github.com/silviolleite/loafer-awsx/commit/f52c12ca4ebf22db717ca4a9139594dfeadd00dc))
+* **errors:** add scheduled-retry sentinel errors ([a19fc2b](https://github.com/silviolleite/loafer-awsx/commit/a19fc2bfb47a15f2edbe566d11112535cf94497c))
+* **examples:** add scheduled retry example, provisioning, and local scheduler ([3ee45c7](https://github.com/silviolleite/loafer-awsx/commit/3ee45c7f1734765af27b362ac98b5686e4ef2253))
+* **middleware:** expose native SQS user message attributes to handlers ([ddad86d](https://github.com/silviolleite/loafer-awsx/commit/ddad86dadfefd631d83cf56462a489ea7771879b))
+* **router:** add per-route scheduled retry model configuration ([f06a379](https://github.com/silviolleite/loafer-awsx/commit/f06a3798c04b6a2e13103c86ccaa4ba78357a3cf))
+
 ## [0.3.0](https://github.com/silviolleite/loafer-awsx/compare/v0.2.0...v0.3.0) (2026-07-26)
 
 
