@@ -31,6 +31,9 @@ func TestSentinels(t *testing.T) {
 		{"ErrInvalidOption", liberrors.ErrInvalidOption, "invalid option"},
 		{"ErrEmptyFields", liberrors.ErrEmptyFields, "fields must be filled"},
 		{"ErrPanic", liberrors.ErrPanic, "handler panicked"},
+		{"ErrRetryScheduleCreate", liberrors.ErrRetryScheduleCreate, "failed to create retry schedule"},
+		{"ErrDLQPublish", liberrors.ErrDLQPublish, "failed to publish to dead-letter queue"},
+		{"ErrScheduledRetryConfig", liberrors.ErrScheduledRetryConfig, "invalid scheduled retry configuration"},
 	}
 
 	for _, tt := range tests {
@@ -57,6 +60,9 @@ func TestSentinelsAreDistinct(t *testing.T) {
 		liberrors.ErrInvalidOption,
 		liberrors.ErrEmptyFields,
 		liberrors.ErrPanic,
+		liberrors.ErrRetryScheduleCreate,
+		liberrors.ErrDLQPublish,
+		liberrors.ErrScheduledRetryConfig,
 	}
 
 	for i := range all {
@@ -66,6 +72,23 @@ func TestSentinelsAreDistinct(t *testing.T) {
 			}
 			assert.False(t, stderrors.Is(all[i], all[j]))
 		}
+	}
+}
+
+func TestScheduledRetrySentinelsMatchThroughWrap(t *testing.T) {
+	cause := stderrors.New("boom")
+
+	sentinels := []error{
+		liberrors.ErrRetryScheduleCreate,
+		liberrors.ErrDLQPublish,
+		liberrors.ErrScheduledRetryConfig,
+	}
+
+	for _, sentinel := range sentinels {
+		wrapped := liberrors.Wrap(sentinel, cause)
+		require.Error(t, wrapped)
+		assert.True(t, stderrors.Is(wrapped, sentinel))
+		assert.True(t, stderrors.Is(wrapped, cause))
 	}
 }
 

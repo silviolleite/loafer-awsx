@@ -32,6 +32,19 @@ var (
 	ErrEmptyFields = New("fields must be filled")
 	// ErrPanic indicates that a handler panicked and the panic was recovered.
 	ErrPanic = New("handler panicked")
+	// ErrRetryScheduleCreate indicates that creating an EventBridge Scheduler
+	// schedule for a scheduled retry failed; the original message is retained.
+	ErrRetryScheduleCreate = New("failed to create retry schedule")
+	// ErrDLQPublish indicates that publishing a message to the dead-letter queue
+	// failed; the original message is retained.
+	ErrDLQPublish = New("failed to publish to dead-letter queue")
+	// ErrScheduledRetryConfig indicates that a Scheduled-model route
+	// configuration is invalid or incomplete.
+	ErrScheduledRetryConfig = New("invalid scheduled retry configuration")
+	// ErrNoSchedulerClient indicates that a Scheduled-model route was given to a
+	// consumer without an EventBridge Scheduler client, so scheduled retries
+	// cannot be created; the consumer must not begin consuming.
+	ErrNoSchedulerClient = New("scheduler client is nil")
 )
 
 // New returns a new error that formats as the given text. It is a thin wrapper
