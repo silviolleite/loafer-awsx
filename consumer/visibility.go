@@ -41,6 +41,11 @@ type visibilityManager struct {
 	sleepInterval     time.Duration
 	visibilityTimeout int32
 	extensionLimit    int
+	// scheduled selects the scheduled-aware mode. When true the run loop never
+	// reacts to backoff signals so no backoff-driven ChangeMessageVisibility is
+	// issued; visibility is only extended on the ticker until the message is
+	// dispatched or the context is canceled. Used by the Scheduled Retry model.
+	scheduled bool
 }
 
 // newVisibilityManager builds a visibilityManager for a queue. visibilityTimeout
@@ -64,6 +69,25 @@ func newVisibilityManager(
 		visibilityTimeout: visibilityTimeout,
 		extensionLimit:    extensionLimit,
 	}
+}
+
+// newScheduledVisibilityManager builds a visibilityManager in scheduled-aware
+// mode for use by the Scheduled Retry model. Its run loop selects only on the
+// ticker, the dispatch signal, and context cancellation — never on the backoff
+// signal — so no backoff-driven ChangeMessageVisibility is issued and the
+// buffered backoff channel is left unconsumed. It is otherwise identical to
+// newVisibilityManager.
+func newScheduledVisibilityManager(
+	client SQSClient,
+	queueURL string,
+	visibilityTimeout int32,
+	extensionLimit int,
+	log *slog.Logger,
+) *visibilityManager {
+	vm := newVisibilityManager(client, queueURL, visibilityTimeout, extensionLimit, log)
+	vm.scheduled = true
+
+	return vm
 }
 
 // interval returns the delay between visibility extensions. When an explicit
@@ -91,6 +115,11 @@ func (v *visibilityManager) interval() time.Duration {
 // arrives the visibility is set to the backoff duration and the loop stops. run
 // is intended to be launched as a goroutine, one per in-flight message, and is
 // guaranteed to return so it never leaks.
+//
+// In scheduled-aware mode the loop never selects on the backoff signal: a
+// handler backoff is treated as a failure by the Scheduled Retry model rather
+// than a visibility extension, so the buffered backoff channel is left
+// unconsumed and no backoff-driven ChangeMessageVisibility is issued.
 func (v *visibilityManager) run(ctx context.Context, msg *message) {
 	ticker := time.NewTicker(v.interval())
 	defer ticker.Stop()
@@ -101,6 +130,23 @@ func (v *visibilityManager) run(ctx context.Context, msg *message) {
 	for {
 		if count > v.extensionLimit {
 			return
+		}
+
+		if v.scheduled {
+			select {
+			case <-ctx.Done():
+				return
+			case <-msg.dispatchSignal():
+				return
+			case <-ticker.C:
+				if count > 0 {
+					extension += v.visibilityTimeout
+				}
+				v.changeVisibility(ctx, msg, extension)
+				count++
+			}
+
+			continue
 		}
 
 		select {

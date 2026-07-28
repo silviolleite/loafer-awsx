@@ -68,6 +68,10 @@ func (f *fakeSQSClient) GetQueueUrl(_ context.Context, _ *sqs.GetQueueUrlInput, 
 	return &sqs.GetQueueUrlOutput{}, nil
 }
 
+func (f *fakeSQSClient) SendMessage(_ context.Context, _ *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	return &sqs.SendMessageOutput{}, nil
+}
+
 func (f *fakeSQSClient) calls() []int32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -259,6 +263,43 @@ func TestVisibilityManagerBackoffStops(t *testing.T) {
 			waitDone(t, done)
 
 			assert.Equal(t, []int32{tt.want}, client.calls())
+		})
+	}
+}
+
+func TestVisibilityManagerScheduledIgnoresBackoff(t *testing.T) {
+	tests := []struct {
+		name string
+		stop func(msg *message, cancel context.CancelFunc)
+	}{
+		{
+			name: "returns on dispatch",
+			stop: func(msg *message, _ context.CancelFunc) { msg.Dispatch() },
+		},
+		{
+			name: "returns on context cancellation",
+			stop: func(_ *message, cancel context.CancelFunc) { cancel() },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeSQSClient{}
+			v := newScheduledVisibilityManager(client, "queue-url", 3600, 5, logger.NewNoOp())
+			v.sleepInterval = time.Hour
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			msg := testMessage("receipt-1")
+			msg.Backoff(45 * time.Second)
+			tt.stop(msg, cancel)
+
+			done := runManager(v, ctx, msg)
+			waitDone(t, done)
+
+			assert.Empty(t, client.calls())
+			assert.True(t, msg.BackedOff())
 		})
 	}
 }

@@ -85,6 +85,10 @@ func (s *stubClient) GetQueueUrl(_ context.Context, in *sqs.GetQueueUrlInput, _ 
 	return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(s.queueURL)}, nil
 }
 
+func (s *stubClient) SendMessage(_ context.Context, _ *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	return &sqs.SendMessageOutput{}, nil
+}
+
 func (s *stubClient) receives() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,6 +112,20 @@ func (s *stubClient) deletedHandles() []string {
 	defer s.mu.Unlock()
 	out := make([]string, len(s.deleted))
 	copy(out, s.deleted)
+	return out
+}
+
+func (s *stubClient) resolveCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+func (s *stubClient) visibilityChanges() []int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int32, len(s.changeVis))
+	copy(out, s.changeVis)
 	return out
 }
 
@@ -193,6 +211,17 @@ func rawMessage(handle, body string) types.Message {
 }
 
 func nilHandler(_ context.Context, _ middleware.Message) error { return nil }
+
+func scheduledRoute(tb require.TestingT, handler middleware.Handler) *router.Route {
+	return newRoute(tb, handler,
+		router.WithScheduledRetry(
+			router.WithSchedulerIdentity("arn:aws:sqs:us-east-1:123456789012:orders.fifo", "arn:aws:iam::123456789012:role/scheduler"),
+			router.WithScheduledDLQ("https://sqs.us-east-1.amazonaws.com/123456789012/orders-dlq"),
+			router.WithMaxRetryCount(5),
+			router.WithBackoff(1000*time.Millisecond, 2000*time.Millisecond),
+		),
+	)
+}
 
 func dlqReuseCounter(tb require.TestingT, reg *prometheus.Registry) *prometheus.CounterVec {
 	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -657,4 +686,72 @@ func TestRunLeavesExhaustedMessageForRedrive(t *testing.T) {
 
 	assert.Empty(t, client.deletedHandles())
 	assert.Equal(t, 1, onDLQCalls)
+}
+
+func TestNewVisibilityModelRequiresNoSchedulerOrDLQConfig(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &stubClient{queueURL: "https://sqs/orders"}
+	client.receiveFn = func(int) (*sqs.ReceiveMessageOutput, error) {
+		cancel()
+		return &sqs.ReceiveMessageOutput{}, nil
+	}
+
+	route := newRoute(t, nilHandler)
+	assert.Equal(t, router.VisibilityRetryModel, route.RetryModel())
+	assert.Nil(t, route.ScheduledRetry())
+
+	c := newConsumer(t, client, route)
+
+	require.NoError(t, c.Run(ctx))
+	assert.Empty(t, client.visibilityChanges())
+	assert.Empty(t, client.deletedHandles())
+}
+
+func TestRunVisibilityModelBackoffExtendsVisibilityAndLeavesMessage(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	client := &stubClient{queueURL: "https://sqs/orders"}
+	processed := make(chan struct{})
+
+	handler := func(_ context.Context, m middleware.Message) error {
+		m.(consumer.Message).Backoff(45 * time.Second)
+		deadline := time.Now().Add(2 * time.Second)
+		for len(client.visibilityChanges()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		close(processed)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
+		if call == 0 {
+			return messageBatch("receipt-backoff"), nil
+		}
+		<-processed
+		cancel()
+		return &sqs.ReceiveMessageOutput{}, nil
+	}
+
+	c := newConsumer(t, client, newRoute(t, handler))
+
+	require.NoError(t, c.Run(ctx))
+	assert.Equal(t, []int32{45}, client.visibilityChanges())
+	assert.Empty(t, client.deletedHandles())
+}
+
+func TestRunReturnsErrorWhenScheduledModelMissingSchedulerClient(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	client := &stubClient{queueURL: "https://sqs/orders"}
+	c := newConsumer(t, client, scheduledRoute(t, nilHandler))
+
+	err := c.Run(context.Background())
+
+	require.Error(t, err)
+	assert.True(t, stderrors.Is(err, verrors.ErrNoSchedulerClient))
+	assert.Equal(t, 0, client.resolveCalls())
+	assert.Equal(t, 0, client.receives())
 }

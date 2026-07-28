@@ -148,6 +148,34 @@ func (m *message) SystemAttributes() map[string]string {
 	return attrs
 }
 
+// UserMessageAttribute returns a single native SQS user message attribute by
+// key, or the empty string when the key is absent or carries no string value.
+// These are the attributes carried directly on the SQS message
+// (types.Message.MessageAttributes), distinct from the SNS-envelope attributes
+// exposed by Attribute and the SQS system attributes exposed by
+// SystemAttributeByKey.
+func (m *message) UserMessageAttribute(key string) string {
+	attr, ok := m.original.MessageAttributes[key]
+	if !ok || attr.StringValue == nil {
+		return ""
+	}
+	return *attr.StringValue
+}
+
+// UserMessageAttributes returns all native SQS user message attributes as a
+// string map. The returned map is a fresh copy owned by the caller. Attributes
+// without a string value are omitted.
+func (m *message) UserMessageAttributes() map[string]string {
+	attrs := make(map[string]string, len(m.original.MessageAttributes))
+	for k, v := range m.original.MessageAttributes {
+		if v.StringValue == nil {
+			continue
+		}
+		attrs[k] = *v.StringValue
+	}
+	return attrs
+}
+
 // Metadata returns message metadata as a string map. Metadata is sourced from
 // the SNS envelope message attributes. The returned map is a fresh copy owned
 // by the caller.

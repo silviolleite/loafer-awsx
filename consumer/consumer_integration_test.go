@@ -20,6 +20,7 @@ import (
 
 	"github.com/silviolleite/loafer-awsx/conn"
 	"github.com/silviolleite/loafer-awsx/consumer"
+	"github.com/silviolleite/loafer-awsx/fake"
 	"github.com/silviolleite/loafer-awsx/middleware"
 	"github.com/silviolleite/loafer-awsx/router"
 )
@@ -361,4 +362,112 @@ func TestIntegrationPerGroupIDRoutingConsistency(t *testing.T) {
 			assert.Equal(t, i, seqs[i])
 		}
 	}
+}
+
+func runScheduledConsumer(t *testing.T, client consumer.SQSClient, route *router.Route, sched consumer.SchedulerClient) (context.CancelFunc, <-chan error) {
+	t.Helper()
+
+	c, err := consumer.New(client, route, consumer.WithSchedulerClient(sched))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	return cancel, done
+}
+
+func schedulerIdentity(t *testing.T, client *sqs.Client, url string) (string, string) {
+	t.Helper()
+
+	out, err := client.GetQueueAttributes(context.Background(), &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(url),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn},
+	})
+	require.NoError(t, err)
+
+	arn := out.Attributes[string(types.QueueAttributeNameQueueArn)]
+	require.NotEmpty(t, arn)
+
+	return arn, "arn:aws:iam::000000000000:role/loafer-scheduler"
+}
+
+func TestIntegrationScheduledRetryCreatesScheduleAndDeletesOriginal(t *testing.T) {
+	client := newSQSClient(t)
+	entryURL := createFIFOQueue(t, client)
+	dlqURL := createFIFOQueue(t, client)
+	name := queueNameFromURL(t, client, entryURL)
+	targetARN, roleARN := schedulerIdentity(t, client, entryURL)
+
+	sched := &fake.SchedulerClient{}
+
+	handler := func(_ context.Context, _ middleware.Message) error {
+		return fmt.Errorf("handler failed")
+	}
+
+	sendMessage(t, client, entryURL, map[string]string{"event": "scheduled"}, "group-scheduled")
+
+	route := itNewRoute(t, name, handler,
+		router.WithWaitTimeSeconds(1),
+		router.WithVisibilityTimeout(11),
+		router.WithScheduledRetry(
+			router.WithSchedulerIdentity(targetARN, roleARN),
+			router.WithScheduledDLQ(dlqURL),
+			router.WithMaxRetryCount(3),
+			router.WithBackoff(1*time.Second, 10*time.Second),
+		),
+	)
+	cancel, done := runScheduledConsumer(t, client, route, sched)
+
+	require.Eventually(t, func() bool {
+		return len(sched.CreateScheduleCalls()) >= 1
+	}, 45*time.Second, 250*time.Millisecond)
+	waitQueueDrained(t, client, entryURL)
+
+	stopConsumer(t, cancel, done)
+	assert.GreaterOrEqual(t, len(sched.CreateScheduleCalls()), 1)
+}
+
+func TestIntegrationScheduledExhaustedGoesToDLQ(t *testing.T) {
+	client := newSQSClient(t)
+	entryURL := createFIFOQueue(t, client)
+	dlqURL := createFIFOQueue(t, client)
+	name := queueNameFromURL(t, client, entryURL)
+	targetARN, roleARN := schedulerIdentity(t, client, entryURL)
+
+	sched := &fake.SchedulerClient{}
+
+	handler := func(_ context.Context, _ middleware.Message) error {
+		return fmt.Errorf("handler failed")
+	}
+
+	sendMessage(t, client, entryURL, map[string]string{"event": "exhausted"}, "group-exhausted")
+
+	route := itNewRoute(t, name, handler,
+		router.WithWaitTimeSeconds(1),
+		router.WithVisibilityTimeout(11),
+		router.WithScheduledRetry(
+			router.WithSchedulerIdentity(targetARN, roleARN),
+			router.WithScheduledDLQ(dlqURL),
+			router.WithMaxRetryCount(0),
+			router.WithBackoff(1*time.Second, 10*time.Second),
+		),
+	)
+	cancel, done := runScheduledConsumer(t, client, route, sched)
+
+	require.Eventually(t, func() bool {
+		out, err := client.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(dlqURL),
+			MaxNumberOfMessages: 1,
+			WaitTimeSeconds:     1,
+		})
+		if err != nil {
+			return false
+		}
+		return len(out.Messages) >= 1
+	}, 45*time.Second, 250*time.Millisecond)
+	waitQueueDrained(t, client, entryURL)
+
+	stopConsumer(t, cancel, done)
+	assert.Empty(t, sched.CreateScheduleCalls())
 }

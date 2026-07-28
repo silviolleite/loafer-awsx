@@ -83,6 +83,10 @@ func (f *fakeClient) ChangeMessageVisibility(_ context.Context, _ *sqs.ChangeMes
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
 }
 
+func (f *fakeClient) SendMessage(_ context.Context, _ *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	return &sqs.SendMessageOutput{}, nil
+}
+
 func (f *fakeClient) resolveCalls(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

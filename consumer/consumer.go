@@ -32,6 +32,10 @@ type Consumer struct {
 	route             *router.Route
 	log               *slog.Logger
 	dlqMetric         DLQMetric
+	successMetric     SuccessMetric
+	retryMetric       RetryMetric
+	deadLetterMetric  DeadLetterMetric
+	schedulerClient   SchedulerClient
 	globalMiddlewares []middleware.Middleware
 	retryTimeout      time.Duration
 }
@@ -78,14 +82,37 @@ func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, erro
 // channels and waiting for all in-flight messages and visibility goroutines to
 // finish), and returns nil for a clean shutdown.
 func (c *Consumer) Run(ctx context.Context) error {
+	scheduled := c.route.RetryModel() == router.ScheduledRetryModel
+
+	// A Scheduled-model route cannot create retry schedules without a scheduler
+	// client, so fail fast before resolving the queue URL or starting any
+	// goroutine: consumption must never begin in this misconfiguration.
+	if scheduled && c.schedulerClient == nil {
+		return errors.ErrNoSchedulerClient
+	}
+
 	queueURL, err := c.resolveQueueURL(ctx)
 	if err != nil {
 		return err
 	}
 
-	vm := newVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
-	d := newDispatcher(c.client, c.route, queueURL, vm, c.log, c.globalMiddlewares...)
+	var vm *visibilityManager
+	if scheduled {
+		vm = newScheduledVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
+	} else {
+		vm = newVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
+	}
+
+	d := newDispatcher(c.client, c.route, queueURL, vm, c.schedulerClient, c.log, c.globalMiddlewares...)
 	d.dlqMetric = c.dlqMetric
+
+	// The Scheduled Retry model reports success, retry, and dead-letter outcomes
+	// through these hooks; the Visibility model never uses them.
+	if scheduled {
+		d.successMetric = c.successMetric
+		d.retryMetric = c.retryMetric
+		d.deadLetterMetric = c.deadLetterMetric
+	}
 
 	d.start(ctx)
 	defer d.stop()

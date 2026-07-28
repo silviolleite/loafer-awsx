@@ -27,7 +27,7 @@ func newTestDispatcher(tb require.TestingT, client SQSClient, log *slog.Logger, 
 	vm := newVisibilityManager(client, "queue-url", route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
 	vm.sleepInterval = time.Hour
 
-	return newDispatcher(client, route, "queue-url", vm, log)
+	return newDispatcher(client, route, "queue-url", vm, nil, log)
 }
 
 func buildGroupMessage(tb require.TestingT, receipt, groupID string, custom map[string]string) *message {
@@ -184,7 +184,7 @@ func TestDispatcherAppliesMiddlewareInOrder(t *testing.T) {
 	client := &fakeSQSClient{}
 	vm := newVisibilityManager(client, "queue-url", route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
 	vm.sleepInterval = time.Hour
-	d := newDispatcher(client, route, "queue-url", vm, logger.NewNoOp(), record("global"))
+	d := newDispatcher(client, route, "queue-url", vm, nil, logger.NewNoOp(), record("global"))
 
 	d.process(context.Background(), testMessage("receipt-mw"))
 	d.wg.Wait()
@@ -198,7 +198,7 @@ func TestNewDispatcherNilLoggerDefaultsToNoOp(t *testing.T) {
 	require.NoError(t, err)
 	vm := newVisibilityManager(client, "queue-url", route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
 
-	d := newDispatcher(client, route, "queue-url", vm, nil)
+	d := newDispatcher(client, route, "queue-url", vm, nil, nil)
 
 	require.NotNil(t, d.log)
 	assert.Equal(t, route.WorkerPoolSize(), d.workerPoolSize)

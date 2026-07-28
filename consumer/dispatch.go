@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"github.com/silviolleite/loafer-awsx/idgen"
 	"github.com/silviolleite/loafer-awsx/logger"
 	"github.com/silviolleite/loafer-awsx/middleware"
 	"github.com/silviolleite/loafer-awsx/router"
@@ -52,12 +53,19 @@ type dispatcher struct {
 	log               *slog.Logger
 	dlq               *router.DLQConfig
 	dlqMetric         DLQMetric
+	retryScheduler    *retryScheduler
+	dlqPublisher      *dlqPublisher
+	scheduledRetry    *router.ScheduledRetryConfig
+	successMetric     SuccessMetric
+	retryMetric       RetryMetric
+	deadLetterMetric  DeadLetterMetric
 	queueURL          string
 	queueName         string
 	channels          []chan *message
 	randIntN          func(int) int
 	customGroupFields []string
 	mode              router.Mode
+	retryModel        router.RetryModel
 	workerPoolSize    int
 	bufferSize        int
 	wg                sync.WaitGroup
@@ -68,11 +76,19 @@ type dispatcher struct {
 // preserving first-is-outermost semantics. queueURL is the resolved URL of the
 // route queue and vm is the shared visibility manager used to extend visibility
 // while each message is in flight. A nil logger is replaced with a no-op logger.
+//
+// schedulerClient is the EventBridge Scheduler client used only by the Scheduled
+// Retry model. The retryScheduler and dlqPublisher collaborators are constructed
+// solely when the route selects ScheduledRetryModel, a validated
+// ScheduledRetryConfig is present, and schedulerClient is non-nil; for the
+// Visibility model schedulerClient is ignored and no scheduler or DLQ collaborator
+// is created.
 func newDispatcher(
 	client SQSClient,
 	route *router.Route,
 	queueURL string,
 	vm *visibilityManager,
+	schedulerClient SchedulerClient,
 	log *slog.Logger,
 	globalMiddlewares ...middleware.Middleware,
 ) *dispatcher {
@@ -95,7 +111,7 @@ func newDispatcher(
 		buffer = 1
 	}
 
-	return &dispatcher{
+	d := &dispatcher{
 		client:            client,
 		handler:           handler,
 		visibility:        vm,
@@ -106,9 +122,24 @@ func newDispatcher(
 		randIntN:          rand.IntN,
 		customGroupFields: route.CustomGroupFields(),
 		mode:              route.RunMode(),
+		retryModel:        route.RetryModel(),
 		workerPoolSize:    workers,
 		bufferSize:        buffer,
 	}
+
+	if cfg := route.ScheduledRetry(); route.RetryModel() == router.ScheduledRetryModel && cfg != nil && schedulerClient != nil {
+		d.scheduledRetry = cfg
+		d.retryScheduler = newRetryScheduler(
+			schedulerClient,
+			cfg.TargetQueueARN,
+			cfg.ExecutionRoleARN,
+			queueURL,
+			idgen.NewRandom(),
+		)
+		d.dlqPublisher = newDLQPublisher(client, cfg.DLQQueueURL, idgen.NewRandom())
+	}
+
+	return d
 }
 
 // start launches the worker pool. It allocates one buffered channel and one
@@ -183,6 +214,11 @@ func (d *dispatcher) process(ctx context.Context, msg *message) {
 
 	err := d.handler(ctx, msg)
 
+	if d.retryModel == router.ScheduledRetryModel {
+		d.processScheduled(ctx, msg, err)
+		return
+	}
+
 	if msg.BackedOff() {
 		return
 	}
@@ -205,6 +241,67 @@ func (d *dispatcher) process(ctx context.Context, msg *message) {
 	}
 
 	d.deleteMessage(ctx, msg)
+}
+
+// processScheduled applies the Scheduled Retry model outcome for a message after
+// its handler returns. It first calls msg.Dispatch to stop the visibility
+// goroutine so no backoff-driven ChangeMessageVisibility is issued, then:
+//
+//   - Failure (handler error OR requested backoff): the current retry count is
+//     parsed from the message (defaulting to 0) and the next count is
+//     current+1. When the next count is at or below MaxRetryCount a one-time
+//     retry schedule is created for the computed backoff; on success the
+//     original message is deleted and the retry metric is emitted. When the next
+//     count exceeds MaxRetryCount the message is published to the DLQ; on success
+//     the original message is deleted and the dead-letter metric is emitted. If
+//     either orchestration step fails the error is logged and the message is
+//     retained (not deleted) for redelivery after its visibility timeout.
+//   - Success: the message is deleted and the success metric is emitted. The
+//     library performs no success-side publishing; that is the handler's
+//     responsibility.
+func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err error) {
+	msg.Dispatch()
+
+	if err != nil || msg.BackedOff() {
+		current := parseRetryCount(msg, d.log)
+		next := current + 1
+
+		if next <= d.scheduledRetry.MaxRetryCount {
+			backoff := computeBackoff(next, d.scheduledRetry.BaseBackoff, d.scheduledRetry.MaxBackoff)
+			if scheduleErr := d.retryScheduler.schedule(ctx, msg, next, backoff); scheduleErr != nil {
+				d.log.Error("failed to create retry schedule; retaining message",
+					slog.String("queue_url", d.queueURL),
+					slog.String("receipt_handle", msg.Identifier()),
+					slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+					slog.Int("retry_count", next),
+					slog.Any("error", scheduleErr),
+				)
+				return
+			}
+
+			d.deleteMessage(ctx, msg)
+			emitMetric(d.log, d.retryMetric, d.queueName)
+			return
+		}
+
+		if publishErr := d.dlqPublisher.publish(ctx, msg, next); publishErr != nil {
+			d.log.Error("failed to publish message to DLQ; retaining message",
+				slog.String("queue_url", d.queueURL),
+				slog.String("receipt_handle", msg.Identifier()),
+				slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+				slog.Int("retry_count", next),
+				slog.Any("error", publishErr),
+			)
+			return
+		}
+
+		d.deleteMessage(ctx, msg)
+		emitMetric(d.log, d.deadLetterMetric, d.queueName)
+		return
+	}
+
+	d.deleteMessage(ctx, msg)
+	emitMetric(d.log, d.successMetric, d.queueName)
 }
 
 // observeDLQ emits observe-only dead-letter signals for a message whose handler
@@ -293,13 +390,20 @@ func (d *dispatcher) groupIndex(key string) int {
 }
 
 // groupKey builds the routing key for PerGroupID mode by joining the message
-// group ID with the configured custom group fields read from the message
-// attributes. The separator keeps distinct field combinations from colliding.
+// group ID with the configured custom group fields. Each field is read from the
+// native SQS user message attributes first (where SNS places them under raw
+// message delivery) and falls back to the SNS-envelope attributes, so custom
+// group fields work under both delivery modes. The separator keeps distinct
+// field combinations from colliding.
 func (d *dispatcher) groupKey(msg *message) string {
 	parts := make([]string, 0, len(d.customGroupFields)+1)
 	parts = append(parts, msg.SystemAttributeByKey(messageGroupIDKey))
 	for _, field := range d.customGroupFields {
-		parts = append(parts, msg.Attribute(field))
+		value := msg.UserMessageAttribute(field)
+		if value == "" {
+			value = msg.Attribute(field)
+		}
+		parts = append(parts, value)
 	}
 	return strings.Join(parts, groupKeySeparator)
 }

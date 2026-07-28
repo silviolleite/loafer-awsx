@@ -365,3 +365,56 @@ func TestMessageAttributesRoundTripProperty(t *testing.T) {
 		}
 	})
 }
+
+func TestMessageUserMessageAttribute(t *testing.T) {
+	m := newMessage(types.Message{
+		MessageAttributes: map[string]types.MessageAttributeValue{
+			"trace":  {DataType: aws.String("String"), StringValue: aws.String("abc-123")},
+			"region": {DataType: aws.String("String"), StringValue: aws.String("us-east-1")},
+			"binary": {DataType: aws.String("Binary")},
+		},
+	})
+
+	tests := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{name: "existing key", key: "trace", want: "abc-123"},
+		{name: "second key", key: "region", want: "us-east-1"},
+		{name: "missing key", key: "absent", want: ""},
+		{name: "nil string value", key: "binary", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, m.UserMessageAttribute(tt.key))
+		})
+	}
+}
+
+func TestMessageUserMessageAttributeEmptyMap(t *testing.T) {
+	m := newMessage(types.Message{})
+	assert.Equal(t, "", m.UserMessageAttribute("any"))
+}
+
+func TestMessageUserMessageAttributes(t *testing.T) {
+	m := newMessage(types.Message{
+		MessageAttributes: map[string]types.MessageAttributeValue{
+			"trace":  {DataType: aws.String("String"), StringValue: aws.String("abc-123")},
+			"region": {DataType: aws.String("String"), StringValue: aws.String("us-east-1")},
+			"binary": {DataType: aws.String("Binary")},
+		},
+	})
+
+	got := m.UserMessageAttributes()
+	assert.Equal(t, map[string]string{"trace": "abc-123", "region": "us-east-1"}, got)
+
+	got["mutation"] = "x"
+	assert.NotContains(t, m.UserMessageAttributes(), "mutation")
+}
+
+func TestMessageUserMessageAttributesEmptyMap(t *testing.T) {
+	m := newMessage(types.Message{})
+	assert.Empty(t, m.UserMessageAttributes())
+}

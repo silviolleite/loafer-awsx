@@ -26,10 +26,12 @@ type SQSClient struct {
 	DeleteMessageFunc            func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
 	ChangeMessageVisibilityFunc  func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
 	GetQueueUrlFunc              func(ctx context.Context, params *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
+	SendMessageFunc              func(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
 	receiveMessageCalls          []*sqs.ReceiveMessageInput
 	deleteMessageCalls           []*sqs.DeleteMessageInput
 	changeMessageVisibilityCalls []*sqs.ChangeMessageVisibilityInput
 	getQueueURLCalls             []*sqs.GetQueueUrlInput
+	sendMessageCalls             []*sqs.SendMessageInput
 	mu                           sync.Mutex
 }
 
@@ -86,6 +88,19 @@ func (c *SQSClient) GetQueueUrl(ctx context.Context, params *sqs.GetQueueUrlInpu
 	return nil, nil
 }
 
+// SendMessage records the call and delegates to SendMessageFunc, or returns a
+// nil output and nil error when the function is not set.
+func (c *SQSClient) SendMessage(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	c.mu.Lock()
+	c.sendMessageCalls = append(c.sendMessageCalls, params)
+	c.mu.Unlock()
+
+	if c.SendMessageFunc != nil {
+		return c.SendMessageFunc(ctx, params, optFns...)
+	}
+	return nil, nil
+}
+
 // ReceiveMessageCalls returns a copy of the inputs passed to ReceiveMessage, in
 // call order.
 func (c *SQSClient) ReceiveMessageCalls() []*sqs.ReceiveMessageInput {
@@ -123,5 +138,15 @@ func (c *SQSClient) GetQueueURLCalls() []*sqs.GetQueueUrlInput {
 	defer c.mu.Unlock()
 	out := make([]*sqs.GetQueueUrlInput, len(c.getQueueURLCalls))
 	copy(out, c.getQueueURLCalls)
+	return out
+}
+
+// SendMessageCalls returns a copy of the inputs passed to SendMessage, in call
+// order.
+func (c *SQSClient) SendMessageCalls() []*sqs.SendMessageInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*sqs.SendMessageInput, len(c.sendMessageCalls))
+	copy(out, c.sendMessageCalls)
 	return out
 }

@@ -26,6 +26,36 @@ type Option func(*Consumer)
 // untouched.
 type DLQMetric func(routeName string)
 
+// SuccessMetric increments the success counter for the named route. Under the
+// Scheduled Retry model the consumer invokes it once every time a handler
+// succeeds and the original message is deleted.
+//
+// It is wired through WithSuccessMetric and is expected to be backed by a
+// counter registered by the Metrics middleware, so it is supplied only when
+// metrics are enabled. A nil SuccessMetric means metrics are disabled and the
+// counter is left untouched.
+type SuccessMetric func(routeName string)
+
+// RetryMetric increments the retry counter for the named route. Under the
+// Scheduled Retry model the consumer invokes it once every time a retry
+// schedule is successfully created for a failed message.
+//
+// It is wired through WithRetryMetric and is expected to be backed by a counter
+// registered by the Metrics middleware, so it is supplied only when metrics are
+// enabled. A nil RetryMetric means metrics are disabled and the counter is left
+// untouched.
+type RetryMetric func(routeName string)
+
+// DeadLetterMetric increments the dead-letter counter for the named route.
+// Under the Scheduled Retry model the consumer invokes it once every time an
+// exhausted message is successfully published to the DLQ.
+//
+// It is wired through WithDeadLetterMetric and is expected to be backed by a
+// counter registered by the Metrics middleware, so it is supplied only when
+// metrics are enabled. A nil DeadLetterMetric means metrics are disabled and
+// the counter is left untouched.
+type DeadLetterMetric func(routeName string)
+
 // WithLogger sets the structured logger used by the consumer, its dispatcher,
 // and its visibility manager. A nil logger is ignored so the consumer keeps its
 // no-op default and callers never have to guard against nil.
@@ -66,6 +96,57 @@ func WithDLQMetric(inc DLQMetric) Option {
 	return func(c *Consumer) {
 		if inc != nil {
 			c.dlqMetric = inc
+		}
+	}
+}
+
+// WithSuccessMetric sets the incrementer used to record a successful handler
+// outcome under the Scheduled Retry model. It should be wired only when the
+// Metrics middleware is enabled and backed by the same registered counter. A
+// nil incrementer is ignored so the consumer keeps success metric reporting off
+// and callers never have to guard against nil.
+func WithSuccessMetric(inc SuccessMetric) Option {
+	return func(c *Consumer) {
+		if inc != nil {
+			c.successMetric = inc
+		}
+	}
+}
+
+// WithRetryMetric sets the incrementer used to record a scheduled retry under
+// the Scheduled Retry model. It should be wired only when the Metrics
+// middleware is enabled and backed by the same registered counter. A nil
+// incrementer is ignored so the consumer keeps retry metric reporting off and
+// callers never have to guard against nil.
+func WithRetryMetric(inc RetryMetric) Option {
+	return func(c *Consumer) {
+		if inc != nil {
+			c.retryMetric = inc
+		}
+	}
+}
+
+// WithDeadLetterMetric sets the incrementer used to record a dead-letter publish
+// under the Scheduled Retry model. It should be wired only when the Metrics
+// middleware is enabled and backed by the same registered counter. A nil
+// incrementer is ignored so the consumer keeps dead-letter metric reporting off
+// and callers never have to guard against nil.
+func WithDeadLetterMetric(inc DeadLetterMetric) Option {
+	return func(c *Consumer) {
+		if inc != nil {
+			c.deadLetterMetric = inc
+		}
+	}
+}
+
+// WithSchedulerClient sets the EventBridge Scheduler client used to create
+// retry schedules under the Scheduled Retry model. It should be wired for
+// routes that select the Scheduled Retry model. A nil client is ignored so the
+// consumer keeps its default and callers never have to guard against nil.
+func WithSchedulerClient(client SchedulerClient) Option {
+	return func(c *Consumer) {
+		if client != nil {
+			c.schedulerClient = client
 		}
 	}
 }
