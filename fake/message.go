@@ -26,6 +26,7 @@ type Message struct {
 	TimeStampValue        time.Time
 	MetadataValues        map[string]string
 	AttributeValues       map[string]string
+	UserAttributeValues   map[string]string
 	SystemAttributeValues map[string]string
 	DecodeFunc            func(out any) error
 	DecodeMessageFunc     func(out any) error
@@ -72,6 +73,18 @@ func (m *Message) Attribute(key string) string {
 // always non-nil.
 func (m *Message) Attributes() map[string]string {
 	return copyStringMap(m.AttributeValues)
+}
+
+// UserMessageAttribute returns the native SQS user message attribute for key,
+// or the empty string when the key is absent.
+func (m *Message) UserMessageAttribute(key string) string {
+	return m.UserAttributeValues[key]
+}
+
+// UserMessageAttributes returns a copy of the configured native SQS user
+// message attributes. The result is always non-nil.
+func (m *Message) UserMessageAttributes() map[string]string {
+	return copyStringMap(m.UserAttributeValues)
 }
 
 // SystemAttributeByKey returns the system attribute for key, or the empty

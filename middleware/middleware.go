@@ -19,10 +19,18 @@ type Message interface {
 	// DecodeMessage unmarshals the inner SNS Message field into out using JSON.
 	DecodeMessage(out any) error
 	// Attribute returns a custom attribute by key, or the empty string when
-	// the key is absent.
+	// the key is absent. This reads the SNS-envelope message attributes carried
+	// in the body when a topic fans out to the queue without raw delivery.
 	Attribute(key string) string
-	// Attributes returns all custom attributes.
+	// Attributes returns all custom attributes from the SNS envelope.
 	Attributes() map[string]string
+	// UserMessageAttribute returns a native SQS user message attribute by key,
+	// or the empty string when the key is absent. These are the attributes
+	// carried directly on the SQS message, which is where SNS places them under
+	// raw message delivery.
+	UserMessageAttribute(key string) string
+	// UserMessageAttributes returns all native SQS user message attributes.
+	UserMessageAttributes() map[string]string
 	// SystemAttributeByKey returns a system attribute by key, or the empty
 	// string when the key is absent.
 	SystemAttributeByKey(key string) string

@@ -21,17 +21,19 @@ type stubMessage struct {
 	id string
 }
 
-func (s stubMessage) Decode(any) error                    { return nil }
-func (s stubMessage) DecodeMessage(any) error             { return nil }
-func (s stubMessage) Attribute(string) string             { return "" }
-func (s stubMessage) Attributes() map[string]string       { return nil }
-func (s stubMessage) SystemAttributeByKey(string) string  { return "" }
-func (s stubMessage) SystemAttributes() map[string]string { return nil }
-func (s stubMessage) Metadata() map[string]string         { return nil }
-func (s stubMessage) Identifier() string                  { return s.id }
-func (s stubMessage) Body() []byte                        { return nil }
-func (s stubMessage) Message() string                     { return "" }
-func (s stubMessage) TimeStamp() time.Time                { return time.Time{} }
+func (s stubMessage) Decode(any) error                         { return nil }
+func (s stubMessage) DecodeMessage(any) error                  { return nil }
+func (s stubMessage) Attribute(string) string                  { return "" }
+func (s stubMessage) Attributes() map[string]string            { return nil }
+func (s stubMessage) UserMessageAttribute(string) string       { return "" }
+func (s stubMessage) UserMessageAttributes() map[string]string { return nil }
+func (s stubMessage) SystemAttributeByKey(string) string       { return "" }
+func (s stubMessage) SystemAttributes() map[string]string      { return nil }
+func (s stubMessage) Metadata() map[string]string              { return nil }
+func (s stubMessage) Identifier() string                       { return s.id }
+func (s stubMessage) Body() []byte                             { return nil }
+func (s stubMessage) Message() string                          { return "" }
+func (s stubMessage) TimeStamp() time.Time                     { return time.Time{} }
 
 func newCapturingLogger() (*slog.Logger, *bytes.Buffer) {
 	var buf bytes.Buffer

@@ -112,9 +112,11 @@ func main() {
 // error leaves the message on the queue for redelivery; because the queue is
 // FIFO, redelivery preserves the group's ordering.
 func handleMessage(_ context.Context, msg middleware.Message) error {
-	// The group attributes are exposed through the message's custom attributes.
-	tenantID := msg.Attribute(attrTenantID)
-	orderID := msg.Attribute(attrOrderID)
+	// The group attributes arrive as native SQS user message attributes because
+	// the FIFO subscription uses raw message delivery, so they are read through
+	// UserMessageAttribute rather than the SNS-envelope Attribute accessor.
+	tenantID := msg.UserMessageAttribute(attrTenantID)
+	orderID := msg.UserMessageAttribute(attrOrderID)
 
 	var payload struct {
 		Event string `json:"event"`

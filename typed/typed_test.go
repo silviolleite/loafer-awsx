@@ -23,17 +23,19 @@ type bodyMessage struct {
 	body []byte
 }
 
-func (bodyMessage) Decode(any) error                    { return nil }
-func (bodyMessage) DecodeMessage(any) error             { return nil }
-func (bodyMessage) Attribute(string) string             { return "" }
-func (bodyMessage) Attributes() map[string]string       { return nil }
-func (bodyMessage) SystemAttributeByKey(string) string  { return "" }
-func (bodyMessage) SystemAttributes() map[string]string { return nil }
-func (bodyMessage) Metadata() map[string]string         { return nil }
-func (bodyMessage) Identifier() string                  { return "" }
-func (m bodyMessage) Body() []byte                      { return m.body }
-func (bodyMessage) Message() string                     { return "" }
-func (bodyMessage) TimeStamp() time.Time                { return time.Time{} }
+func (bodyMessage) Decode(any) error                         { return nil }
+func (bodyMessage) DecodeMessage(any) error                  { return nil }
+func (bodyMessage) Attribute(string) string                  { return "" }
+func (bodyMessage) Attributes() map[string]string            { return nil }
+func (bodyMessage) UserMessageAttribute(string) string       { return "" }
+func (bodyMessage) UserMessageAttributes() map[string]string { return nil }
+func (bodyMessage) SystemAttributeByKey(string) string       { return "" }
+func (bodyMessage) SystemAttributes() map[string]string      { return nil }
+func (bodyMessage) Metadata() map[string]string              { return nil }
+func (bodyMessage) Identifier() string                       { return "" }
+func (m bodyMessage) Body() []byte                           { return m.body }
+func (bodyMessage) Message() string                          { return "" }
+func (bodyMessage) TimeStamp() time.Time                     { return time.Time{} }
 
 var _ middleware.Message = bodyMessage{}
 
