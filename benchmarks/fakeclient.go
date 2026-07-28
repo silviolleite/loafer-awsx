@@ -121,3 +121,10 @@ func (c *benchClient) DeleteMessage(_ context.Context, _ *sqs.DeleteMessageInput
 func (c *benchClient) ChangeMessageVisibility(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
 }
+
+// SendMessage is a no-op that satisfies the SendMessage method added to
+// consumer.SQSClient for the Scheduled Retry model. The benchmarks only
+// exercise the Visibility model, so it is never invoked.
+func (c *benchClient) SendMessage(_ context.Context, _ *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	return &sqs.SendMessageOutput{}, nil
+}

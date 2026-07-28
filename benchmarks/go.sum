@@ -16,6 +16,8 @@ github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 h1:mbRIur
 github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13/go.mod h1:ITg9em2KbJx1s0y4aqRX5OYWG6HBZ5TVR//OdpEZ2CQ=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.31 h1:w2SIhW92DZPFrSL4ksVCr8IYff5OZwIcxg8+95tzvAI=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.31/go.mod h1:wAhpCQbkov+IcvjozJbd2xRCoZybUEHNkcFunssNACg=
+github.com/aws/aws-sdk-go-v2/service/scheduler v1.20.0 h1:IuqEJTV2nR+2f9O5Rk0AvYmvc0aFc3wZ0biKCq3sRd0=
+github.com/aws/aws-sdk-go-v2/service/scheduler v1.20.0/go.mod h1:Pf5NllMdXVjlyyBR9hS5CeRfgnguDRVBrfmGMyKIeL0=
 github.com/aws/aws-sdk-go-v2/service/signin v1.5.0 h1:OHH5iTQvVGmfHjX/5Q+vFuA/Rf2x6/95aJ/75QCQSm4=
 github.com/aws/aws-sdk-go-v2/service/signin v1.5.0/go.mod h1:mCF3AK9PpL49oOrhniUXWAfhVBVQ/XbytoE5eccZUIs=
 github.com/aws/aws-sdk-go-v2/service/sns v1.42.0 h1:hE9mxcePgE1labOMy2zgkfy3KuxIk7P0DkJpAkd4vCw=
