@@ -21,7 +21,7 @@ COMPOSE_FILE   := $(TERRAFORM_DIR)/docker-compose.yml
 LOCALSTACK_URL := http://localhost:4566
 
 .PHONY: help up down down-clean provision destroy \
-        run-basic run-fifo run-typed run-middleware run-producer run-all
+        run-basic run-fifo run-fifo-scheduled-retry run-localscheduler run-typed run-middleware run-producer run-all
 
 # help is the default goal: it parses the `##` comments after each target name
 # and prints them as a self-documented target list (natsx/awsx style).
@@ -76,6 +76,14 @@ run-basic: ## Run the basic standard-queue consumer example
 run-fifo: ## Run the FIFO PerGroupID consumer example
 	@echo "Running fifo example (Ctrl+C to stop)..."
 	@$(GO) run ./fifo
+
+run-fifo-scheduled-retry: ## Run the FIFO Scheduled Retry consumer example
+	@echo "Running fifo-scheduled-retry example (Ctrl+C to stop)..."
+	@$(GO) run ./fifo-scheduled-retry
+
+run-localscheduler: ## Run the local EventBridge Scheduler simulator (LocalStack demo only; fires retry schedules)
+	@echo "Running local scheduler simulator (Ctrl+C to stop; LocalStack demo only)..."
+	@$(GO) run ./localscheduler
 
 run-typed: ## Run the typed handler consumer example
 	@echo "Running typed example (Ctrl+C to stop)..."

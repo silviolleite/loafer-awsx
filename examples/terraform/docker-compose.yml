@@ -1,6 +1,6 @@
-# docker-compose.yml starts a LocalStack instance exposing the SQS and SNS
-# services on the gateway port 4566, ready for the Terraform in this directory
-# to provision resources against.
+# docker-compose.yml starts a LocalStack instance exposing the SQS, SNS, IAM,
+# and EventBridge Scheduler services on the gateway port 4566, ready for the
+# Terraform in this directory to provision resources against.
 #
 # Usage:
 #   docker compose up -d
@@ -9,6 +9,14 @@
 #
 # The default provider endpoint (http://localhost:4566) and region (us-east-1)
 # match the defaults in variables.tf, so no overrides are needed locally.
+#
+# iam and scheduler are enabled for the FIFO Scheduled Retry example. NOTE:
+# LocalStack's EventBridge Scheduler is mock-only — CreateSchedule succeeds but
+# the schedule never actually fires to re-publish the message to the target SQS
+# queue (see https://docs.localstack.cloud/aws/services/scheduler/). So against
+# LocalStack you can observe the schedule-created / delete-original / retry-
+# metric path, but not the real re-delivery or DLQ loop; run the example against
+# real AWS to see the full scheduled-retry lifecycle.
 
 services:
   localstack:
@@ -17,9 +25,9 @@ services:
     # build that refuses to start without a LocalStack license token (exit 55).
     image: localstack/localstack:3
     ports:
-      - "127.0.0.1:4566:4566" # LocalStack gateway (SQS + SNS)
+      - "127.0.0.1:4566:4566" # LocalStack gateway (SQS + SNS + IAM + Scheduler)
     environment:
-      - SERVICES=sqs,sns
+      - SERVICES=sqs,sns,iam,scheduler
       - AWS_DEFAULT_REGION=us-east-1
       - DEBUG=${DEBUG-0}
     volumes:

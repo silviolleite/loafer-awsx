@@ -49,6 +49,12 @@ const (
 	// order payloads its codec knows how to decode.
 	ordersTopic = "example-orders-topic"
 
+	// scheduledTopic fans messages out to the FIFO Scheduled Retry Entry_Queue
+	// (example-scheduled.fifo). Publishing here seeds that queue so the
+	// fifo-scheduled-retry consumer has input to exercise the scheduled-retry
+	// and DLQ paths. FIFO topic names must end with ".fifo".
+	scheduledTopic = "example-scheduled-topic.fifo"
+
 	// publishTimeout bounds the whole publishing sequence.
 	publishTimeout = 15 * time.Second
 )
@@ -92,12 +98,14 @@ func main() {
 	standardARN := producer.BuildTopicARN(region, accountID, standardTopic)
 	fifoARN := producer.BuildTopicARN(region, accountID, fifoTopic)
 	ordersARN := producer.BuildTopicARN(region, accountID, ordersTopic)
+	scheduledARN := producer.BuildTopicARN(region, accountID, scheduledTopic)
 
 	publishStandardSingle(ctx, p, standardARN)
 	publishStandardBatch(ctx, p, standardARN)
 	publishFIFOSingle(ctx, p, fifoARN)
 	publishFIFOBatch(ctx, p, fifoARN)
 	publishOrder(ctx, p, ordersARN)
+	publishScheduledRetry(ctx, p, scheduledARN)
 
 	log.Println("all messages published")
 }
@@ -214,6 +222,43 @@ func publishFIFOBatch(ctx context.Context, p *producer.Producer, topicARN string
 	}
 
 	logBatchOutput("fifo", out)
+}
+
+// publishScheduledRetry publishes a small FIFO batch to the Scheduled Retry
+// topic, seeding the example-scheduled.fifo Entry_Queue consumed by the
+// fifo-scheduled-retry example. As with the other FIFO publishes, GroupID and
+// DeduplicationID are left empty so the producer auto-generates them from the
+// Attributes: the key-based generator derives the MessageGroupId from tenant_id
+// and order_id, and the random generator supplies a unique
+// MessageDeduplicationId. The scheduled-retry consumer's handler always fails,
+// so these messages exercise the scheduled-retry and DLQ paths.
+func publishScheduledRetry(ctx context.Context, p *producer.Producer, topicARN string) {
+	out, err := p.PublishBatch(ctx, &producer.PublishBatchInput{
+		TopicARN: topicARN,
+		Messages: []*producer.PublishBatchEntry{
+			{
+				ID:      "1",
+				Message: `{"event":"payment.retry","order_id":"o-77"}`,
+				Attributes: map[string]string{
+					"tenant_id": "acme",
+					"order_id":  "o-77",
+				},
+			},
+			{
+				ID:      "2",
+				Message: `{"event":"payment.retry","order_id":"o-88"}`,
+				Attributes: map[string]string{
+					"tenant_id": "acme",
+					"order_id":  "o-88",
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Fatalf("scheduled-retry batch publish failed: %v", err)
+	}
+
+	logBatchOutput("scheduled-retry", out)
 }
 
 // logBatchOutput reports the per-entry outcome of a batch publish.

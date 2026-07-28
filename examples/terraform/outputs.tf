@@ -55,3 +55,33 @@ output "fifo_topic_arn" {
   description = "ARN of the FIFO SNS topic."
   value       = aws_sns_topic.fifo.arn
 }
+
+output "scheduled_queue_arn" {
+  description = "ARN of the FIFO Scheduled Retry Entry_Queue (the scheduler target)."
+  value       = aws_sqs_queue.scheduled.arn
+}
+
+output "scheduled_queue_url" {
+  description = "URL of the FIFO Scheduled Retry Entry_Queue."
+  value       = aws_sqs_queue.scheduled.id
+}
+
+output "scheduled_dlq_url" {
+  description = "URL of the FIFO Scheduled Retry DLQ."
+  value       = aws_sqs_queue.scheduled_dlq.id
+}
+
+output "scheduled_dlq_arn" {
+  description = "ARN of the FIFO Scheduled Retry DLQ."
+  value       = aws_sqs_queue.scheduled_dlq.arn
+}
+
+output "scheduler_role_arn" {
+  description = "ARN of the IAM execution role EventBridge Scheduler assumes for Scheduled Retry re-publishes. Empty unless enable_scheduler_resources is true (the role is not created on LocalStack Community, which lacks IAM)."
+  value       = var.enable_scheduler_resources ? aws_iam_role.scheduler[0].arn : ""
+}
+
+output "scheduled_topic_arn" {
+  description = "ARN of the FIFO SNS topic the producer seeds the Scheduled Retry Entry_Queue through."
+  value       = aws_sns_topic.scheduled.arn
+}

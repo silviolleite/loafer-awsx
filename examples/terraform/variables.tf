@@ -75,3 +75,33 @@ variable "fifo_topic_name" {
   type        = string
   default     = "example-fifo-topic.fifo"
 }
+
+variable "scheduled_queue_name" {
+  description = "Name of the FIFO Scheduled Retry Entry_Queue. Uses explicit deduplication. Must end with .fifo."
+  type        = string
+  default     = "example-scheduled.fifo"
+}
+
+variable "scheduled_dlq_name" {
+  description = "Name of the FIFO Scheduled Retry DLQ for messages that exhaust their retries. Must end with .fifo."
+  type        = string
+  default     = "example-scheduled-dlq.fifo"
+}
+
+variable "scheduled_topic_name" {
+  description = "Name of the FIFO SNS topic the producer seeds the Scheduled Retry Entry_Queue through. Must end with .fifo."
+  type        = string
+  default     = "example-scheduled-topic.fifo"
+}
+
+variable "enable_scheduler_resources" {
+  description = "Whether to create the IAM execution role EventBridge Scheduler assumes for the FIFO Scheduled Retry example. Defaults to true; the bundled docker-compose enables the iam service so CreateRole succeeds locally. Set it to false if your LocalStack instance does not expose IAM (older SERVICES=sqs,sns setups return a 501 on CreateRole)."
+  type        = bool
+  default     = true
+}
+
+variable "scheduler_role_name" {
+  description = "Name of the IAM execution role EventBridge Scheduler assumes to deliver Scheduled Retry re-publishes."
+  type        = string
+  default     = "example-scheduler-role"
+}
