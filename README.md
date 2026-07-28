@@ -31,9 +31,10 @@ functional options, and every component accepts the standard library
 3. [Quickstart](#quickstart)
 4. [Examples](#examples)
 5. [Configuration Reference](#configuration-reference)
-6. [Benchmarks](#benchmarks)
-7. [Acknowledgements](#acknowledgements)
-8. [License](#license)
+6. [Scheduled Retry (FIFO)](#scheduled-retry-fifo)
+7. [Benchmarks](#benchmarks)
+8. [Acknowledgements](#acknowledgements)
+9. [License](#license)
 
 ---
 
@@ -363,6 +364,278 @@ The `errors` package exports sentinels matchable with `errors.Is`, including
 `ErrPanic`. `errors.New(text string) error` and `errors.Wrap(sentinel, err error) error`
 help build and combine errors while preserving `errors.Is` matching against both
 causes.
+
+---
+
+## Scheduled Retry (FIFO)
+
+The FIFO consumption path supports two per-route retry models, selected with
+`router.WithRetryModel` (or the `router.WithScheduledRetry` shortcut):
+
+| Model | Constant | Behavior |
+| --- | --- | --- |
+| Visibility (default) | `router.VisibilityRetryModel` | A failed message stays in the queue and its visibility timeout is extended until it succeeds or AWS SQS redrives it natively. This blocks the `MessageGroupId` until the message resolves. |
+| Scheduled | `router.ScheduledRetryModel` | The consumer owns the whole retry lifecycle: on failure it schedules a delayed re-publish through AWS EventBridge Scheduler and deletes the original message so the `MessageGroupId` is unblocked immediately. |
+
+When no retry model is configured a route uses `VisibilityRetryModel`, so
+existing routes are unchanged. Selecting the Scheduled model on one route never
+affects routes that use the Visibility model, and no scheduler client is
+constructed or required unless a route opts in.
+
+Under the Scheduled model, when a handler fails (returns an error **or** requests
+backoff) the consumer reads a `retry_count` message attribute (default `0`),
+computes `next = current + 1`, and either:
+
+- **Schedules a retry** when `next <= MaxRetryCount`: it creates a one-time
+  EventBridge Scheduler schedule that re-publishes the message to the queue after
+  the computed backoff, then deletes the original.
+- **Publishes to the DLQ** when `next > MaxRetryCount`: it sends the message to
+  the configured DLQ, then deletes the original.
+
+On success the message is simply deleted. The library performs **no** success-side
+publishing; whether success means publishing to a topic, calling an API, or doing
+nothing is the handler's responsibility.
+
+### Architecture
+
+```mermaid
+graph TD
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#232F3E;
+    classDef compute fill:#232F3E,stroke:#FF9900,stroke-width:2px,color:#FFFFFF;
+    classDef queue fill:#E2E3E5,stroke:#6C757D,stroke-width:2px,color:#232F3E;
+    classDef dlq fill:#F8D7DA,stroke:#DC3545,stroke-width:2px,color:#721C24;
+    classDef action fill:#D1E7DD,stroke:#0F5132,stroke-width:2px,color:#0F5132;
+
+    PROD[Producer service<br/>e.g. Checkout]:::compute
+    SNS{{SNS FIFO topic<br/>order_created.fifo}}:::aws
+    SQS[(Entry_Queue &mdash; SQS FIFO<br/>inventory_order_created.fifo)]:::queue
+    DLQ[(DLQ &mdash; SQS FIFO<br/>inventory_order_created_dlq.fifo)]:::dlq
+    WORKER[Consumer service<br/>loafer-awsx worker]:::compute
+    EBS((Amazon EventBridge<br/>Scheduler)):::aws
+    DEL{{Delete from Entry_Queue<br/>frees the MessageGroupId}}:::action
+
+    PROD -->|1. Publish event| SNS
+    SNS -->|2. Route, raw delivery| SQS
+    SQS -->|3. Poll / read batch| WORKER
+
+    WORKER -->|4a. Success| DEL
+
+    WORKER -->|4b. Transient error:<br/>compute backoff, create schedule,<br/>retry_count + 1| EBS
+    EBS -.->|5. Fire time reached:<br/>re-publish to the queue| SQS
+    WORKER -.->|Delete original now<br/>to free the MessageGroupId| DEL
+
+    WORKER -->|4c. retry_count &gt; MaxRetryCount:<br/>publish directly to the DLQ| DLQ
+```
+
+**Why this architecture.** A FIFO queue guarantees ordering within a
+`MessageGroupId` by delivering the group's messages one at a time. That guarantee
+turns a single poison or transiently failing message into a *head-of-line block*:
+under the default Visibility model the failed message stays in the queue and its
+visibility timeout is extended, so every later message sharing its group waits
+behind it until it finally succeeds or SQS redrives it. For a busy group, one bad
+message can stall a whole stream of otherwise healthy work.
+
+The Scheduled Retry model breaks that coupling by moving the wait *out of the
+queue*. On failure the consumer hands the retry to EventBridge Scheduler (step
+4b) and immediately deletes the original message (step 5, the dashed
+delete-to-free edge). The `MessageGroupId` is unblocked right away, so the next
+message in the group is processed while the failed one waits — off-queue — for its
+backoff to elapse. When the schedule fires, EventBridge Scheduler re-publishes the
+message to the same Entry_Queue with an incremented `retry_count`, and the cycle
+repeats until the message either succeeds or exceeds `MaxRetryCount` and is routed
+straight to the DLQ (step 4c).
+
+**Why it is efficient.**
+
+- **Group liveness:** a failing message no longer blocks its group. Throughput of
+  a group is bounded by its healthy messages, not by its slowest failure.
+- **No worker is held during backoff:** the delay lives in EventBridge Scheduler,
+  not in a sleeping goroutine or an extended visibility timeout, so worker slots
+  and in-flight-message limits are not consumed while waiting to retry.
+- **Backoff without polling churn:** exponential backoff is expressed as a
+  one-time schedule fire time, so the queue is not repeatedly re-reading and
+  re-hiding the same message across attempts.
+- **Deterministic, consumer-owned dead-lettering:** the DLQ decision is driven by
+  the `retry_count` carried on the message and the configured `MaxRetryCount`,
+  rather than SQS `maxReceiveCount` redrive, giving you explicit control over when
+  a message is dead-lettered and what metadata it carries.
+- **Self-cleaning schedules:** each retry schedule is created with
+  `ActionAfterCompletion = DELETE`, so it removes itself after its single
+  invocation and no schedule resources accumulate.
+
+**Accepted tradeoffs.** Because the original is deleted before the retry is
+delivered, the model provides **at-least-once** delivery (a delete failure after a
+successful schedule/DLQ publish leaves the original for redelivery), and **strict
+ordering within a `MessageGroupId` is not preserved for messages that are
+retried** — the retried message rejoins the queue later, after messages that were
+behind it. Design handlers to be idempotent. These tradeoffs are the deliberate
+price paid for group liveness.
+
+### Router configuration
+
+`router.WithRetryModel(m router.RetryModel)` sets the model explicitly and
+rejects any value other than `VisibilityRetryModel` or `ScheduledRetryModel`.
+`router.WithScheduledRetry(opts ...router.ScheduledRetryOption)` is the usual
+entry point: it sets the model to Scheduled **and** attaches a validated
+configuration assembled from its sub-options.
+
+| Sub-option | Signature | Description |
+| --- | --- | --- |
+| `WithSchedulerIdentity` | `WithSchedulerIdentity(targetQueueARN, executionRoleARN string)` | Required. The EventBridge Scheduler target (Entry_Queue) ARN and the execution role ARN the scheduler assumes. A missing item is named individually in the error. |
+| `WithScheduledDLQ` | `WithScheduledDLQ(dlqQueueURL string)` | Required. The DLQ destination queue URL for exhausted messages. |
+| `WithMaxRetryCount` | `WithMaxRetryCount(n int)` | Inclusive threshold before DLQ routing. Must be within `[0, 2147483647]`. |
+| `WithBackoff` | `WithBackoff(base, max time.Duration)` | Base and maximum backoff delay. Each must be within `[1ms, 24h]` and `max >= base`. Base defaults to `1000ms` when unset. |
+
+All Scheduled-model configuration is validated at `router.New` time. An invalid
+or incomplete configuration returns an error wrapping
+`errors.ErrScheduledRetryConfig` that identifies the offending value, so a
+misconfigured route is never built and consumption never starts for it.
+Configuring both `WithScheduledRetry` and the observe-only `WithDLQ` on the same
+route is a configuration error, regardless of option order.
+
+### Consumer wiring
+
+> The broker does **not** forward the scheduler client or the metric hooks to
+> the consumers it creates. Wire a Scheduled-model route through `consumer.New`
+> directly and run it yourself.
+
+`consumer.WithSchedulerClient(consumer.SchedulerClient)` supplies the EventBridge
+Scheduler client. A concrete `*scheduler.Client` from
+`github.com/aws/aws-sdk-go-v2/service/scheduler` satisfies the interface
+directly. A Scheduled-model route given to a consumer without a scheduler client
+fails fast at `Run` with `errors.ErrNoSchedulerClient` and never begins
+consuming.
+
+Three optional metric hooks report each outcome, each labeled by route name and
+no-op when nil:
+
+| Option | Signature | Emitted when |
+| --- | --- | --- |
+| `WithSuccessMetric` | `WithSuccessMetric(func(routeName string))` | A handler succeeds and the original message is deleted. |
+| `WithRetryMetric` | `WithRetryMetric(func(routeName string))` | A retry schedule is created successfully. |
+| `WithDeadLetterMetric` | `WithDeadLetterMetric(func(routeName string))` | An exhausted message is published to the DLQ successfully. |
+
+### Example
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "log/slog"
+    "time"
+
+    "github.com/aws/aws-sdk-go-v2/service/scheduler"
+    "github.com/aws/aws-sdk-go-v2/service/sqs"
+
+    "github.com/silviolleite/loafer-awsx/conn"
+    "github.com/silviolleite/loafer-awsx/consumer"
+    "github.com/silviolleite/loafer-awsx/logger"
+    "github.com/silviolleite/loafer-awsx/middleware"
+    "github.com/silviolleite/loafer-awsx/router"
+)
+
+func main() {
+    ctx := context.Background()
+    log := logger.New()
+
+    cfg, err := conn.New(ctx, conn.WithRegion("us-east-1"))
+    if err != nil {
+        log.Error("failed to build AWS config", slog.Any("error", err))
+        return
+    }
+
+    sqsClient := sqs.NewFromConfig(cfg)
+    schedulerClient := scheduler.NewFromConfig(cfg)
+
+    handler := func(ctx context.Context, msg middleware.Message) error {
+        // Return an error (or call msg.Backoff) to exercise the scheduled-retry path.
+        return errors.New("transient failure")
+    }
+
+    route, err := router.New("orders.fifo", handler,
+        router.WithRunMode(router.PerGroupID),
+        router.WithScheduledRetry(
+            router.WithSchedulerIdentity(
+                "arn:aws:sqs:us-east-1:000000000000:orders.fifo",       // target Entry_Queue ARN
+                "arn:aws:iam::000000000000:role/loafer-scheduler-role", // execution role ARN
+            ),
+            router.WithScheduledDLQ("https://sqs.us-east-1.amazonaws.com/000000000000/orders-dlq.fifo"),
+            router.WithMaxRetryCount(5),
+            router.WithBackoff(1*time.Second, 15*time.Minute),
+        ),
+    )
+    if err != nil {
+        log.Error("failed to build route", slog.Any("error", err))
+        return
+    }
+
+    // The Scheduled model is wired through consumer.New directly, not broker.New:
+    // the scheduler client and metric hooks are consumer options.
+    c, err := consumer.New(sqsClient, route,
+        consumer.WithLogger(log),
+        consumer.WithSchedulerClient(schedulerClient),
+        consumer.WithSuccessMetric(func(routeName string) { log.Info("success", slog.String("route", routeName)) }),
+        consumer.WithRetryMetric(func(routeName string) { log.Info("retry", slog.String("route", routeName)) }),
+        consumer.WithDeadLetterMetric(func(routeName string) { log.Info("dead-letter", slog.String("route", routeName)) }),
+    )
+    if err != nil {
+        log.Error("failed to build consumer", slog.Any("error", err))
+        return
+    }
+
+    if err := c.Run(ctx); err != nil {
+        log.Error("consumer stopped", slog.Any("error", err))
+    }
+}
+```
+
+### Required AWS resources and IAM permissions
+
+The Scheduled model creates one-time schedules and publishes to a DLQ, so the
+identities involved need these permissions:
+
+- **The consumer's credentials** need `scheduler:CreateSchedule` to create retry
+  schedules and `iam:PassRole` on the execution role passed via
+  `WithSchedulerIdentity` (EventBridge Scheduler requires the caller to be
+  allowed to pass the role it will assume). They also need `sqs:SendMessage` to
+  the DLQ so exhausted messages can be published.
+- **The execution role** (the second argument to `WithSchedulerIdentity`) is the
+  role EventBridge Scheduler assumes when a schedule fires. It needs
+  `sqs:SendMessage` to the Entry_Queue so the re-published retry can be
+  delivered, and its trust policy must allow `scheduler.amazonaws.com` to assume
+  it.
+
+Each one-time schedule is created with `ActionAfterCompletion = DELETE` and a
+disabled flexible time window, so EventBridge Scheduler **self-cleans** the
+schedule after its single invocation. The library never tracks or reaps schedule
+resources.
+
+### Entry_Queue must use explicit deduplication
+
+A scheduled retry re-publishes the message with an unchanged body but an explicit
+`MessageDeduplicationId` distinct from the original. The FIFO Entry_Queue **must
+not** rely on content-based deduplication: it must be configured for explicit
+deduplication (`MessageDeduplicationId` provided per message). If the queue used
+content-based deduplication, the re-published retry would be discarded as a
+duplicate of the original because the body is identical.
+
+### Accepted tradeoffs
+
+The Scheduled model deliberately trades two FIFO guarantees for group liveness:
+
+- **At-least-once delivery.** The retry (schedule or DLQ publish) is created
+  before the original is deleted. If the delete step fails after a successful
+  schedule or publish, both the original and the re-published copy can be in
+  play. Handlers must be **idempotent**.
+- **In-group ordering is not preserved for retried messages.** Because a failed
+  message is deleted and re-published later while the next message in the same
+  `MessageGroupId` is processed immediately, strict ordering within a group does
+  not hold for messages that are retried.
+- **Handler-owned success publishing.** On success the library only deletes the
+  message and emits the success metric. Any success-side publishing (to a topic,
+  an API, or elsewhere) is the handler's responsibility.
 
 ---
 
