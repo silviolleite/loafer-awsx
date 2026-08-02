@@ -34,6 +34,7 @@ func TestSentinels(t *testing.T) {
 		{"ErrRetryScheduleCreate", liberrors.ErrRetryScheduleCreate, "failed to create retry schedule"},
 		{"ErrDLQPublish", liberrors.ErrDLQPublish, "failed to publish to dead-letter queue"},
 		{"ErrScheduledRetryConfig", liberrors.ErrScheduledRetryConfig, "invalid scheduled retry configuration"},
+		{"ErrPingFailed", liberrors.ErrPingFailed, "connectivity ping failed"},
 	}
 
 	for _, tt := range tests {
@@ -63,6 +64,7 @@ func TestSentinelsAreDistinct(t *testing.T) {
 		liberrors.ErrRetryScheduleCreate,
 		liberrors.ErrDLQPublish,
 		liberrors.ErrScheduledRetryConfig,
+		liberrors.ErrPingFailed,
 	}
 
 	for i := range all {

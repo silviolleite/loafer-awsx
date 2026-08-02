@@ -45,6 +45,9 @@ var (
 	// consumer without an EventBridge Scheduler client, so scheduled retries
 	// cannot be created; the consumer must not begin consuming.
 	ErrNoSchedulerClient = New("scheduler client is nil")
+	// ErrPingFailed indicates that a client connectivity validation (Ping) did not
+	// succeed within its timeout and retry budget during construction.
+	ErrPingFailed = New("connectivity ping failed")
 )
 
 // New returns a new error that formats as the given text. It is a thin wrapper
