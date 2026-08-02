@@ -18,7 +18,7 @@ functional options, and every component accepts the standard library
 
 - **Module:** `github.com/silviolleite/loafer-awsx`
 - **Minimum Go version:** Go 1.26 or later
-- **AWS SDK:** `aws-sdk-go-v2` (SQS + SNS)
+- **AWS SDK:** `aws-sdk-go-v2` (SQS + SNS + EventBridge Scheduler)
 
 ---
 
@@ -31,10 +31,12 @@ functional options, and every component accepts the standard library
 3. [Quickstart](#quickstart)
 4. [Examples](#examples)
 5. [Configuration Reference](#configuration-reference)
-6. [Scheduled Retry (FIFO)](#scheduled-retry-fifo)
-7. [Benchmarks](#benchmarks)
-8. [Acknowledgements](#acknowledgements)
-9. [License](#license)
+6. [Client constructors](#client-constructors)
+7. [IAM permissions](#iam-permissions)
+8. [Scheduled Retry (FIFO)](#scheduled-retry-fifo)
+9. [Benchmarks](#benchmarks)
+10. [Acknowledgements](#acknowledgements)
+11. [License](#license)
 
 ---
 
@@ -53,12 +55,15 @@ flowchart LR
     loafer[loafer-awsx]
     sqs[(AWS SQS)]
     sns[(AWS SNS)]
+    ebs((AWS EventBridge<br/>Scheduler))
     prom[Prometheus]
     otel[OpenTelemetry]
 
     dev --> loafer
     loafer --> sqs
     loafer --> sns
+    loafer -->|FIFO scheduled retry:<br/>create schedule| ebs
+    ebs -.->|fire: re-publish retry| sqs
     loafer --> prom
     loafer --> otel
 ```
@@ -73,34 +78,31 @@ Publishing runs alongside through the `producer`.
 flowchart TB
     app([Application])
     broker[Broker]
-
-    subgraph routeA[Route A]
-        consumerA[Consumer / Workers]
-    end
-    subgraph routeB[Route B]
-        consumerB[Consumer / Workers]
-    end
-    subgraph routeN[Route N]
-        consumerN[Consumer / Workers]
-    end
-
-    sqsA[(SQS Queue A)]
-    sqsB[(SQS Queue B)]
-    sqsN[(SQS Queue N)]
-
     producer[Producer]
+
+    subgraph routeStd[Route - Visibility retry]
+        consumerStd[Consumer / Workers]
+    end
+    subgraph routeFifo[Route - FIFO Scheduled retry]
+        consumerFifo[Consumer / Workers]
+    end
+
+    sqsStd[(SQS Queue)]
+    sqsEntry[(SQS FIFO Entry_Queue)]
+    dlq[(SQS FIFO DLQ)]
     sns[(AWS SNS)]
+    ebs((AWS EventBridge<br/>Scheduler))
 
     app --> broker
     app --> producer
+    broker --> routeStd
+    consumerStd --> sqsStd
 
-    broker --> routeA
-    broker --> routeB
-    broker --> routeN
-
-    consumerA --> sqsA
-    consumerB --> sqsB
-    consumerN --> sqsN
+    app -->|scheduled route via consumer.New| routeFifo
+    consumerFifo -->|poll / delete| sqsEntry
+    consumerFifo -->|create one-time schedule| ebs
+    ebs -.->|fire: re-publish with retry_count+1| sqsEntry
+    consumerFifo -->|exhausted: publish| dlq
 
     producer --> sns
 ```
@@ -116,6 +118,7 @@ used throughout.
 | Package | Responsibility |
 | --- | --- |
 | `conn` | Factory for an `aws.Config` (region, credentials, endpoint, profile, retry). |
+| `client` | Constructors that turn an `aws.Config` into SQS/SNS/Scheduler clients with construction-time connectivity validation. |
 | `logger` | Constructors for the standard library `*slog.Logger` (stdout + no-op). |
 | `middleware` | `Handler`, `Middleware`, `Chain`, and built-in Recovery, Logging, Metrics, OTel. |
 | `router` | Immutable `Route` value object binding a queue to a handler and options. |
@@ -184,186 +187,133 @@ with infrastructure provisioned by Terraform. See
 
 ## Configuration Reference
 
-Every component is configured through functional options. Invalid values are
-rejected at construction time (returning a descriptive error) rather than being
-silently accepted.
+Every component is configured through functional options following the same
+pattern: pass `With*` options to each package's `New` constructor, which
+validates them and rejects invalid values at construction time with a
+descriptive error rather than accepting them silently. Option failures wrap
+`errors.ErrInvalidOption`, and each package exposes its own sentinel errors
+(matchable with `errors.Is`) for missing required inputs.
 
-### `conn` — AWS configuration
+For the full, always-current list of options, signatures, defaults, and
+sentinel errors for every package, see the Go Reference linked by the badge at
+the top of this README. The notes below cover the conceptual behaviors that are
+easy to miss from signatures alone.
 
-`conn.New(ctx context.Context, opts ...conn.Option) (aws.Config, error)`
+- **`conn`** builds the shared `aws.Config` (region, credentials, endpoint,
+  profile, retry). Region is required.
+- **`router`** declares an immutable `Route` binding a queue to a handler, with
+  options for worker-pool size, receive batching, long-poll wait, visibility
+  timeout and extension limit, run mode, route middleware, and DLQ
+  observability.
+- **`consumer`** and **`broker`** run the polling loop and orchestrate one
+  consumer per route; both accept a `*slog.Logger`, a retry timeout, and
+  middleware, and the broker adds a shutdown timeout.
+- **`producer`** publishes to SNS (single and batch), with optional
+  auto-generation of FIFO IDs.
+- **`typed`**, **`idgen`**, **`middleware`**, **`logger`**, and **`errors`**
+  provide generic type-safe handlers/producers, FIFO ID generation strategies,
+  the middleware primitives and built-ins, `*slog.Logger` constructors, and the
+  sentinel error set respectively.
 
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithRegion` | `WithRegion(region string)` | — (required) | AWS region. `New` returns `ErrEmptyRegion` when empty. |
-| `WithAccessKey` | `WithAccessKey(key, secret string)` | — | Static credentials; take precedence over a profile. |
-| `WithSessionToken` | `WithSessionToken(token string)` | — | Session token; applied only with static credentials. |
-| `WithProfile` | `WithProfile(profile string)` | — | Shared config profile name. |
-| `WithEndpoint` | `WithEndpoint(url string)` | — | Custom endpoint URL (LocalStack, etc.). |
-| `WithRetryCount` | `WithRetryCount(n uint)` | `10` | Maximum retry attempts. |
+**Run modes** (`router.Mode`): `Parallel` assigns messages to workers randomly;
+`PerGroupID` hashes the `MessageGroupId` plus any custom group fields so a
+group's messages are handled in order.
 
-### `router` — route configuration
+**Middleware ordering:** broker-level (global) middleware is applied outermost
+and route-level middleware innermost (closest to the handler).
 
-`router.New(queueName string, handler middleware.Handler, opts ...router.Option) (*router.Route, error)`
+**DLQ observability** (`router.WithDLQ`) is **observe-only**. It does **not**
+take a target ARN, and the library never moves, publishes, or deletes messages
+for DLQ purposes. AWS SQS performs the actual redrive natively via the source
+queue's redrive policy. The `maxReceiveCount` you pass must mirror that policy;
+it is used only to detect when a message is exhausted so the consumer can emit
+an Error log, the `loafer_messages_dlq_total` metric, and the optional `OnDLQ`
+callback, while leaving the message in the queue.
 
-Returns `ErrEmptyQueueName` for an empty name and `ErrNoHandler` for a nil
-handler. Option failures are wrapped with `ErrInvalidOption`.
+**Logging:** the library uses `*slog.Logger` everywhere and defines **no**
+custom logger interface. A `*slog.Logger` produced by a third-party bridge (for
+example zap via `zapslog`, or zerolog via a slog handler) is accepted directly,
+no adapter required.
 
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithWorkerPoolSize` | `WithWorkerPoolSize(n int)` | `5` | Worker goroutines per route (must be > 0). |
-| `WithMaxMessages` | `WithMaxMessages(n int32)` | `10` | Messages per SQS receive call (range `[1, 10]`). |
-| `WithWaitTimeSeconds` | `WithWaitTimeSeconds(n int32)` | `10` | Long-poll wait in seconds (range `[0, 20]`). |
-| `WithVisibilityTimeout` | `WithVisibilityTimeout(seconds int32)` | `30` | Visibility timeout; values `<= 11` are clamped up to `11`. |
-| `WithExtensionLimit` | `WithExtensionLimit(n int)` | `2` | Max visibility extensions (must not be negative). |
-| `WithRunMode` | `WithRunMode(mode router.Mode)` | `Parallel` | Dispatch strategy: `Parallel` or `PerGroupID`. |
-| `WithCustomGroupFields` | `WithCustomGroupFields(fields ...string)` | — | Fields forming the group key for `PerGroupID`. |
-| `WithMiddleware` | `WithMiddleware(mws ...middleware.Middleware)` | — | Route-level middleware appended in order. |
-| `WithDLQ` | `WithDLQ(maxReceiveCount int, opts ...router.DLQOption)` | — | Enables DLQ observability (must be > 0). See below. |
+---
 
-**Run modes** (`router.Mode`): `Parallel` (random worker assignment) and
-`PerGroupID` (hash of `MessageGroupId` + custom group fields, preserving
-per-group ordering).
+## Client constructors
 
-**DLQ observability** (`router.DLQOption`):
+The `client` package turns an `aws.Config` (produced by `conn.New`) into the
+service clients the rest of the library consumes, so your application never has
+to import the AWS SDK for Go v2 service packages (`sqs`, `sns`, `scheduler`)
+directly:
 
-| Option | Signature | Description |
+- **`client.NewSQS(ctx, cfg, opts...)`** returns a client for the broker and
+  consumer.
+- **`client.NewSNS(ctx, cfg, opts...)`** returns a client for the producer.
+- **`client.NewScheduler(ctx, cfg, opts...)`** returns a client for the
+  Scheduled Retry path (wired through `consumer.WithSchedulerClient`).
+
+Each constructor validates connectivity **during construction**: before
+returning, it issues a lightweight, read-only request (the "Ping") to confirm
+the client can reach its AWS service with valid credentials, failing fast if it
+cannot. The validation uses a dedicated timeout and retry budget that are
+independent of the request retry policy carried by the `aws.Config` (defaults:
+`3s` timeout, `2` retries).
+
+Three functional options tune this behavior:
+
+- **`WithPingTimeout(d)`** overrides the total time budget for connectivity
+  validation (including retries). The duration must be positive.
+- **`WithPingRetryLimit(n)`** overrides the number of retries performed beyond
+  the initial attempt.
+- **`WithoutConnectivityCheck()`** disables the connectivity validation
+  entirely. Use it when the credentials lack the read-only permission the Ping
+  requires, or to construct a client offline.
+
+The existing Go Reference badge at the top of this README covers the full
+signatures, defaults, and sentinel errors.
+
+---
+
+## IAM permissions
+
+Each constructor's connectivity validation (Ping) issues an additional
+read-only request beyond the operations the client uses at runtime, so the
+caller's credentials need the Ping permission too — unless the check is disabled
+with `WithoutConnectivityCheck()`. The tables below list the complete set of
+permissions each client requires.
+
+### SQS client (`client.NewSQS`, used by broker and consumer)
+
+| Action | Required by | Notes |
 | --- | --- | --- |
-| `WithOnDLQ` | `WithOnDLQ(fn func(ctx context.Context, msg middleware.Message))` | Callback invoked when a message is treated as exhausted. |
+| `sqs:ReceiveMessage` | Runtime (consumer poll) | On the Entry_Queue. |
+| `sqs:DeleteMessage` | Runtime | On the Entry_Queue. |
+| `sqs:ChangeMessageVisibility` | Runtime | Visibility extension during processing. |
+| `sqs:GetQueueUrl` | Runtime | Resolve the queue URL from its name. |
+| `sqs:SendMessage` | Runtime (Scheduled Retry only) | On the DLQ, to publish exhausted messages. |
+| `sqs:ListQueues` | Construction (Ping) | Account-level; omit only if the check is disabled. |
 
-> DLQ is **observe-only**. `WithDLQ` does **not** take a target ARN and the
-> library never moves, publishes, or deletes messages for DLQ purposes. AWS SQS
-> performs the actual redrive natively via the source queue's redrive policy.
-> `maxReceiveCount` must mirror that policy; it is used only to detect when a
-> message is exhausted so the consumer can emit an Error log, the
-> `loafer_messages_dlq_total` metric, and the optional `OnDLQ` callback while
-> leaving the message in the queue.
+### SNS client (`client.NewSNS`, used by producer)
 
-### `consumer` — SQS polling
-
-`consumer.New(client consumer.SQSClient, route *router.Route, opts ...consumer.Option) (*consumer.Consumer, error)`
-
-Returns `ErrNoSQSClient` for a nil client and `ErrNoRoute` for a nil route. In
-most applications the broker creates consumers for you; use these options
-directly only when driving a consumer yourself.
-
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithLogger` | `WithLogger(log *slog.Logger)` | no-op | Structured logger (nil is ignored). |
-| `WithRetryTimeout` | `WithRetryTimeout(d time.Duration)` | `5s` | Wait after a failed `ReceiveMessage` (non-positive ignored). |
-| `WithGlobalMiddleware` | `WithGlobalMiddleware(mws ...middleware.Middleware)` | — | Outermost middleware, ahead of route middleware. |
-| `WithDLQMetric` | `WithDLQMetric(inc consumer.DLQMetric)` | — | Increments `loafer_messages_dlq_total`; wire only with Metrics enabled. |
-
-### `broker` — lifecycle orchestration
-
-`broker.New(sqsClient consumer.SQSClient, routes []*router.Route, opts ...broker.Option) (*broker.Broker, error)`
-
-Returns `ErrNoRoute` when no routes are provided. `broker.Run(ctx)` starts one
-consumer per route, blocks until the context is canceled, and drains in-flight
-messages within the shutdown timeout with no goroutine leaks.
-
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithLogger` | `WithLogger(log *slog.Logger)` | `logger.New()` | Structured logger, forwarded to every consumer. |
-| `WithRetryTimeout` | `WithRetryTimeout(d time.Duration)` | `5s` | Per-consumer wait after a failed receive. |
-| `WithShutdownTimeout` | `WithShutdownTimeout(d time.Duration)` | unbounded | Max wait for in-flight messages on shutdown. Unset waits until consumers finish; set a duration to bound it. |
-| `WithMiddleware` | `WithMiddleware(mws ...middleware.Middleware)` | — | Global middleware applied outermost to all routes. |
-
-> Middleware ordering: broker-level (global) middleware is applied outermost and
-> route-level middleware innermost (closest to the handler).
-
-### `producer` — SNS publishing
-
-`producer.New(client producer.SNSClient, opts ...producer.Option) (*producer.Producer, error)`
-
-Returns `ErrNoSNSClient` for a nil client. `Publish` returns `ErrEmptyInput` for
-a nil/empty input; `PublishBatch` returns `ErrEmptyInput` for an empty batch and
-`ErrMaxBatchSize` for more than 10 entries.
-
-| Option | Signature | Description |
+| Action | Required by | Notes |
 | --- | --- | --- |
-| `WithGroupIDGenerator` | `WithGroupIDGenerator(gen idgen.GroupIDGenerator)` | Auto-generate `MessageGroupId` for FIFO topics when not set. |
-| `WithDeduplicationIDGenerator` | `WithDeduplicationIDGenerator(gen idgen.DeduplicationIDGenerator)` | Auto-generate `MessageDeduplicationId` for FIFO topics when not set. |
+| `sns:Publish` | Runtime | Covers both `Publish` and `PublishBatch`, on the target topic(s). |
+| `sns:ListTopics` | Construction (Ping) | Account-level; omit only if the check is disabled. |
 
-Helpers: `producer.BuildTopicARN(region, accountID, topicName string) string`.
+### EventBridge Scheduler client (`client.NewScheduler`, used by consumer Scheduled Retry)
 
-> Auto-generation only applies to FIFO topics (ARNs ending in `.fifo`) and only
-> when the corresponding ID is empty. Standard topics never receive
-> auto-generated IDs, because SNS rejects them on non-FIFO topics.
-
-### `typed` — generic type-safe handlers
-
-- `typed.Codec[T]` — interface with `Encode(T) ([]byte, error)` and `Decode([]byte) (T, error)`.
-- `typed.JSONCodec[T]` — JSON implementation of `Codec[T]`.
-- `typed.WrapHandler[T](codec Codec[T], fn func(ctx, msg T) error) middleware.Handler` — adapts a typed handler into a standard `Handler`; a decode error is returned to the consumer.
-- `typed.NewProducer[T](p *producer.Producer, codec Codec[T]) *typed.Producer[T]` — a typed producer that encodes before publishing.
-- `typed.Producer[T].Publish(ctx, topicARN, value T, opts ...typed.PublishOption) (string, error)`.
-
-| Publish option | Signature | Description |
+| Action | Required by | Notes |
 | --- | --- | --- |
-| `WithGroupID` | `WithGroupID(id string)` | Sets `MessageGroupId`. |
-| `WithDeduplicationID` | `WithDeduplicationID(id string)` | Sets `MessageDeduplicationId`. |
-| `WithAttributes` | `WithAttributes(attrs map[string]string)` | Sets message attributes. |
+| `scheduler:CreateSchedule` | Runtime | Create the one-time retry schedule. |
+| `iam:PassRole` | Runtime | On the execution role passed via `WithSchedulerIdentity`. |
+| `scheduler:ListSchedules` | Construction (Ping) | Omit only if the check is disabled. |
 
-### `middleware` package
+The **execution role** assumed by EventBridge Scheduler (the second argument to
+`WithSchedulerIdentity`) is separate from the caller's credentials and needs
+`sqs:SendMessage` on the Entry_Queue plus a trust policy allowing
+`scheduler.amazonaws.com` to assume it.
 
-- `middleware.Handler` — `func(ctx context.Context, msg middleware.Message) error`.
-- `middleware.Middleware` — `func(Handler) Handler`.
-- `middleware.Chain(mws ...Middleware) Middleware` — composes middleware; the first is outermost.
-- `middleware.Recovery(log *slog.Logger) Middleware` — recovers panics, logs the stack, returns `ErrPanic`.
-- `middleware.Logging(log *slog.Logger) Middleware` — logs receipt, duration, and outcome.
-- `middleware.Metrics(routeName string, opts ...MetricsOption) Middleware` — Prometheus counters, histogram, and inflight gauge.
-- `middleware.OTel(routeName string, opts ...OTelOption) Middleware` — an OpenTelemetry span per message.
-
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithMetricsRegisterer` | `WithMetricsRegisterer(r prometheus.Registerer)` | `prometheus.DefaultRegisterer` | Custom Prometheus registerer. |
-| `WithTracerProvider` | `WithTracerProvider(tp trace.TracerProvider)` | global provider | Custom OpenTelemetry tracer provider. |
-
-**Metrics emitted:** `loafer_messages_received_total`,
-`loafer_messages_processed_total` (labeled by status), `loafer_messages_errors_total`,
-`loafer_message_processing_duration_seconds` (histogram),
-`loafer_messages_inflight` (gauge), and `loafer_messages_dlq_total` — all
-labeled by route.
-
-### `logger` — standard library slog constructors
-
-- `logger.New() *slog.Logger` — structured, leveled output to stdout via `slog.TextHandler`.
-- `logger.NewNoOp() *slog.Logger` — a discard-backed logger (silent).
-
-> The library uses `*slog.Logger` everywhere and defines **no** custom logger
-> interface. A `*slog.Logger` produced by a third-party bridge (for example zap
-> via `zapslog`, or zerolog via a slog handler) is accepted directly, no adapter
-> required.
-
-### `idgen` — ID generation
-
-Interfaces `idgen.GroupIDGenerator` and `idgen.DeduplicationIDGenerator` both
-expose `Generate(ctx context.Context, fields map[string]string) (string, error)`.
-A single concrete generator satisfies both.
-
-| Constructor | Description |
-| --- | --- |
-| `NewKeyBased(opts ...Option)` | Deterministic ID from sorted field values, hashed with the configured algorithm. Returns `ErrEmptyFields` when no field is selected. |
-| `NewRandom()` | Random UUID v4 on every call; ignores fields. |
-| `NewComposite(opts ...Option)` | Joins selected field values with a separator (no hashing). |
-| `NewCompositeWithSuffix(opts ...Option)` | Like `NewComposite`, plus a random numeric suffix from the configured range to spread load across partitions. |
-
-| Option | Signature | Default | Description |
-| --- | --- | --- | --- |
-| `WithHashAlgorithm` | `WithHashAlgorithm(algorithm idgen.HashAlgorithm)` | `SHA256` | Digest for key-based hashing: `SHA256` or `FNV64`. |
-| `WithSeparator` | `WithSeparator(separator string)` | `":"` | Separator joining key/value pairs. |
-| `WithFields` | `WithFields(fields ...string)` | all fields | Whitelist of fields to include. |
-| `WithSuffixRange` | `WithSuffixRange(min, max int)` | `[1, 20]` | Inclusive suffix range for `NewCompositeWithSuffix`. |
-
-### `errors` — sentinel errors
-
-The `errors` package exports sentinels matchable with `errors.Is`, including
-`ErrNoRoute`, `ErrNoSQSClient`, `ErrNoHandler`, `ErrGetMessage`,
-`ErrQueueResolve`, `ErrNoSNSClient`, `ErrEmptyInput`, `ErrMaxBatchSize`,
-`ErrEmptyRegion`, `ErrEmptyQueueName`, `ErrInvalidOption`, `ErrEmptyFields`, and
-`ErrPanic`. `errors.New(text string) error` and `errors.Wrap(sentinel, err error) error`
-help build and combine errors while preserving `errors.Is` matching against both
-causes.
+> Because the Ping uses account-level `List*` permissions that scoped
+> credentials may not grant, callers with least-privilege policies can either
+> add the `List*` action or construct with `WithoutConnectivityCheck()`.
 
 ---
 
