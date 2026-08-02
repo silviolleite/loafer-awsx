@@ -94,6 +94,12 @@ func main() {
 		log.Fatalf("failed to create AWS config: %v", err)
 	}
 
+	// This helper deliberately keeps the direct AWS SDK clients rather than the
+	// client.NewScheduler / client.NewSQS constructors. It calls Scheduler
+	// operations (ListSchedules, GetSchedule, DeleteSchedule) and SQS operations
+	// (SendMessage) that fall outside the minimal consumer.SchedulerClient and
+	// consumer.SQSClient interfaces those constructors return, so the wrapped
+	// clients could not satisfy this tool's needs.
 	schedClient := scheduler.NewFromConfig(cfg)
 	sqsClient := sqs.NewFromConfig(cfg)
 

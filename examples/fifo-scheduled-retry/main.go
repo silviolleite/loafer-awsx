@@ -13,7 +13,8 @@
 // It shows the full wiring of a FIFO Scheduled Retry consumer application:
 //
 //  1. Building an AWS connection (aws.Config) with the conn package.
-//  2. Creating the SQS and EventBridge Scheduler clients.
+//  2. Creating the SQS and EventBridge Scheduler clients with the client
+//     constructors, which validate connectivity during construction.
 //  3. Declaring a FIFO route that selects the Scheduled Retry model with the
 //     scheduler identity, DLQ destination, max retry count, and backoff bounds.
 //  4. Wiring the scheduler client and the observability hooks into a consumer
@@ -58,9 +59,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/scheduler"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
-
+	"github.com/silviolleite/loafer-awsx/client"
 	"github.com/silviolleite/loafer-awsx/conn"
 	"github.com/silviolleite/loafer-awsx/consumer"
 	"github.com/silviolleite/loafer-awsx/logger"
@@ -108,10 +107,21 @@ func main() {
 	}
 
 	// Step 2: create the SQS client and the EventBridge Scheduler client from
-	// the AWS config. *sqs.Client satisfies consumer.SQSClient and
-	// *scheduler.Client satisfies consumer.SchedulerClient directly.
-	sqsClient := sqs.NewFromConfig(cfg)
-	schedClient := scheduler.NewFromConfig(cfg)
+	// the AWS config with the client constructors. They return interfaces
+	// usable by the consumer without importing the AWS SDK service packages and
+	// validate connectivity during construction (an SQS ListQueues and a
+	// Scheduler ListSchedules ping), so a construction error may also signal a
+	// connectivity failure. Pass client.WithoutConnectivityCheck() to skip that
+	// validation for local runs where the List* endpoints or permissions are
+	// unavailable.
+	sqsClient, err := client.NewSQS(ctx, cfg)
+	if err != nil {
+		log.Fatalf("failed to create SQS client (construction or connectivity): %v", err)
+	}
+	schedClient, err := client.NewScheduler(ctx, cfg)
+	if err != nil {
+		log.Fatalf("failed to create Scheduler client (construction or connectivity): %v", err)
+	}
 
 	// Step 3: declare the FIFO route with the Scheduled Retry model.
 	// WithScheduledRetry switches the route from in-place redelivery to

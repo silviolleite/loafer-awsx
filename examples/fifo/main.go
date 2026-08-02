@@ -29,9 +29,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
-
 	"github.com/silviolleite/loafer-awsx/broker"
+	"github.com/silviolleite/loafer-awsx/client"
 	"github.com/silviolleite/loafer-awsx/conn"
 	"github.com/silviolleite/loafer-awsx/logger"
 	"github.com/silviolleite/loafer-awsx/middleware"
@@ -69,8 +68,17 @@ func main() {
 		log.Fatalf("failed to create AWS config: %v", err)
 	}
 
-	// Step 4 (part 1): create the SQS client from the AWS config.
-	sqsClient := sqs.NewFromConfig(cfg)
+	// Step 4 (part 1): create the SQS client from the AWS config with the client
+	// constructor. It returns a consumer.SQSClient the broker requires without
+	// importing the AWS SDK sqs package, and validates connectivity during
+	// construction (a lightweight ListQueues ping), so a construction error may
+	// also signal a connectivity failure. Pass client.WithoutConnectivityCheck()
+	// to skip that validation for local runs where the ListQueues permission or
+	// endpoint is unavailable.
+	sqsClient, err := client.NewSQS(ctx, cfg)
+	if err != nil {
+		log.Fatalf("failed to create SQS client (construction or connectivity): %v", err)
+	}
 
 	// Step 3: declare the FIFO route. WithRunMode(router.PerGroupID) tells the
 	// consumer to pin each group key to a single worker so ordering is

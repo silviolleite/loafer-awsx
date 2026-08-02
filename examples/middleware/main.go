@@ -34,12 +34,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/silviolleite/loafer-awsx/broker"
+	"github.com/silviolleite/loafer-awsx/client"
 	"github.com/silviolleite/loafer-awsx/conn"
 	"github.com/silviolleite/loafer-awsx/logger"
 	"github.com/silviolleite/loafer-awsx/middleware"
@@ -82,7 +82,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	sqsClient := sqs.NewFromConfig(cfg)
+	// Create the SQS client from the AWS config with the client constructor. It
+	// returns a consumer.SQSClient the broker requires without importing the AWS
+	// SDK sqs package, and validates connectivity during construction (a
+	// lightweight ListQueues ping), so a construction error may also signal a
+	// connectivity failure. Pass client.WithoutConnectivityCheck() to skip that
+	// validation for local runs where the ListQueues permission or endpoint is
+	// unavailable.
+	sqsClient, err := client.NewSQS(ctx, cfg)
+	if err != nil {
+		lg.Error("failed to create SQS client (construction or connectivity)", "error", err)
+		os.Exit(1)
+	}
 
 	// Step 2 (part 1): create a dedicated Prometheus registry. Using a custom
 	// registry (instead of the global default) keeps the example self-contained

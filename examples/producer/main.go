@@ -26,8 +26,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/sns"
-
+	"github.com/silviolleite/loafer-awsx/client"
 	"github.com/silviolleite/loafer-awsx/conn"
 	"github.com/silviolleite/loafer-awsx/idgen"
 	"github.com/silviolleite/loafer-awsx/producer"
@@ -75,8 +74,16 @@ func main() {
 		log.Fatalf("failed to create AWS config: %v", err)
 	}
 
-	// Step 2: create the SNS client. *sns.Client satisfies producer.SNSClient.
-	snsClient := sns.NewFromConfig(cfg)
+	// Step 2: create the SNS client from the AWS config with the client
+	// constructor. It returns a producer.SNSClient without importing the AWS SDK
+	// sns package, and validates connectivity during construction (a lightweight
+	// ListTopics ping), so a construction error may also signal a connectivity
+	// failure. Pass client.WithoutConnectivityCheck() to skip that validation for
+	// local runs where the ListTopics permission or endpoint is unavailable.
+	snsClient, err := client.NewSNS(ctx, cfg)
+	if err != nil {
+		log.Fatalf("failed to create SNS client (construction or connectivity): %v", err)
+	}
 
 	// Step 3: create the producer with FIFO ID generators. The key-based
 	// generator builds a stable MessageGroupId from the "tenant_id" and
