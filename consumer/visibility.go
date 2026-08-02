@@ -39,13 +39,9 @@ type visibilityManager struct {
 	log               *slog.Logger
 	queueURL          string
 	sleepInterval     time.Duration
-	visibilityTimeout int32
 	extensionLimit    int
-	// scheduled selects the scheduled-aware mode. When true the run loop never
-	// reacts to backoff signals so no backoff-driven ChangeMessageVisibility is
-	// issued; visibility is only extended on the ticker until the message is
-	// dispatched or the context is canceled. Used by the Scheduled Retry model.
-	scheduled bool
+	visibilityTimeout int32
+	scheduled         bool
 }
 
 // newVisibilityManager builds a visibilityManager for a queue. visibilityTimeout

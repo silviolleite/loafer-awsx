@@ -269,8 +269,8 @@ func TestVisibilityManagerBackoffStops(t *testing.T) {
 
 func TestVisibilityManagerScheduledIgnoresBackoff(t *testing.T) {
 	tests := []struct {
-		name string
 		stop func(msg *message, cancel context.CancelFunc)
+		name string
 	}{
 		{
 			name: "returns on dispatch",
