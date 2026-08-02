@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [0.5.0](https://github.com/silviolleite/loafer-awsx/compare/v0.4.0...v0.5.0) (2026-08-02)
+
+
+### Features
+
+* **client:** add SQS, SNS, and scheduler client constructors ([3fddc41](https://github.com/silviolleite/loafer-awsx/commit/3fddc41283f7c6fcebee508e6e5376e4aacebbe1))
+* **errors:** add ErrPingFailed sentinel error ([f1fe041](https://github.com/silviolleite/loafer-awsx/commit/f1fe0413f7f0ce84133f11c0454d2c17acff5537))
+
 ## [0.4.0](https://github.com/silviolleite/loafer-awsx/compare/v0.3.0...v0.4.0) (2026-07-28)
 
 
