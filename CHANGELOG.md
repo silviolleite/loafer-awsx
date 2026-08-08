@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [0.6.0](https://github.com/silviolleite/loafer-awsx/compare/v0.5.0...v0.6.0) (2026-08-08)
+
+
+### Features
+
+* **examples:** add OTel Collector and Jaeger tracing backend for middleware example ([6212392](https://github.com/silviolleite/loafer-awsx/commit/6212392031132a0a7630daf5a5c64eeb26b928f0))
+
+
+### Bug Fixes
+
+* **deps:** update dependencies to resolve vulnerabilities ([92f4565](https://github.com/silviolleite/loafer-awsx/commit/92f4565382b55cc5be67c57ffbf71e1a2d3e9aff))
+* **middleware:** use loafer-awsx as the OTel tracer scope name ([3820147](https://github.com/silviolleite/loafer-awsx/commit/38201472fea0b89a252039d53874e524873912c8))
+
 ## [0.5.0](https://github.com/silviolleite/loafer-awsx/compare/v0.4.0...v0.5.0) (2026-08-02)
 
 
