@@ -13,7 +13,7 @@ Each example is a standalone `package main` under this directory:
 | FIFO Scheduled Retry | [`fifo-scheduled-retry/`](./fifo-scheduled-retry) | FIFO route using `WithScheduledRetry` (scheduler identity, DLQ, max retry count, backoff) wired with `WithSchedulerClient` and a failing handler. |
 | Local Scheduler Simulator | [`localscheduler/`](./localscheduler) | LocalStack-only helper that fires the retry schedules EventBridge Scheduler would fire, closing the scheduled-retry loop locally. |
 | Typed | [`typed/`](./typed) | Generic, type-safe message handling via `typed.WrapHandler` + `typed.JSONCodec`. |
-| Middleware | [`middleware/`](./middleware) | Recovery, logging, Prometheus metrics, and OpenTelemetry tracing middleware. |
+| Middleware | [`middleware/`](./middleware) | Recovery, logging, Prometheus metrics, and OpenTelemetry tracing middleware (OTLP → OTel Collector → Jaeger). |
 | Producer | [`producer/`](./producer) | Single and batch publishing to standard and FIFO SNS topics. |
 
 ## Prerequisites
@@ -317,13 +317,68 @@ make run-middleware
 ```
 
 Consumes `example-middleware-queue` with a full middleware stack (recovery,
-logging, Prometheus metrics, OpenTelemetry tracing) and serves Prometheus
-metrics at <http://localhost:9090/metrics>.
+logging, Prometheus metrics, OpenTelemetry tracing). It serves Prometheus
+metrics at <http://localhost:9090/metrics> and exports OpenTelemetry spans over
+OTLP to an OpenTelemetry Collector, which forwards them to Jaeger for viewing at
+<http://localhost:16686>.
 
 > **Note:** `example-middleware-queue` is **not** created by the current
 > Terraform config. Create it, add it to the Terraform config, or point
 > `queueName` in [`middleware/main.go`](./middleware/main.go) at an existing
 > queue before running.
+
+#### Tracing backend: OpenTelemetry Collector + Jaeger
+
+The example exports one span per message over **OTLP HTTP** to an
+[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/), which
+forwards the traces to [Jaeger](https://www.jaegertracing.io/). Both run as
+containers defined in
+[`middleware/docker-compose.yml`](./middleware/docker-compose.yml), with the
+collector pipeline configured in
+[`middleware/otel-collector-config.yaml`](./middleware/otel-collector-config.yaml).
+
+The data flows as follows:
+
+```
+middleware example (host)  --OTLP HTTP :4318-->  otel-collector
+                                                     |
+                                         --OTLP gRPC jaeger:4317-->  jaeger
+                                                                       |
+                                                       Jaeger UI  http://localhost:16686
+```
+
+> The Collector's native Jaeger exporter was
+> [removed in 2023](https://opentelemetry.io/blog/2023/jaeger-exporter-collector-migration/)
+> because Jaeger ingests OTLP directly, so the collector forwards spans to
+> Jaeger over OTLP (`COLLECTOR_OTLP_ENABLED=true`) rather than the legacy
+> Jaeger protocol.
+
+Bring the tracing backend up before running the example:
+
+```bash
+make observability-up   # start the OTel Collector + Jaeger
+make run-middleware      # run the consumer; spans are exported as messages are processed
+```
+
+Then open the Jaeger UI at <http://localhost:16686> and select the
+`loafer-awsx-middleware-example` service to inspect the spans. Publish messages
+to `example-middleware-queue` (for example with a producer) so the handler runs
+and emits spans.
+
+Tear the backend down with `make observability-down` (or
+`make observability-down-clean` to also remove volumes).
+
+The exporter connects lazily and retries in the background, so the example still
+runs if the collector is not up — you simply will not see spans in Jaeger until
+the backend is running.
+
+Ports used by the stack:
+
+| Port | Component | Purpose |
+| --- | --- | --- |
+| `4317` | OTel Collector | OTLP gRPC receiver |
+| `4318` | OTel Collector | OTLP HTTP receiver (used by the example) |
+| `16686` | Jaeger | Jaeger web UI |
 
 ### Producer
 
@@ -362,6 +417,9 @@ to watch messages arrive.
 | `up` | Start LocalStack and wait for SQS + SNS to be ready. |
 | `down` | Stop LocalStack (keeps the data volume). |
 | `down-clean` | Stop LocalStack and remove its data volume (`down -v`). |
+| `observability-up` | Start the OTel Collector + Jaeger tracing backend (middleware example). |
+| `observability-down` | Stop the OTel Collector + Jaeger tracing backend. |
+| `observability-down-clean` | Stop the tracing backend and remove its volumes. |
 | `provision` | `terraform init` then `terraform apply -auto-approve`. |
 | `destroy` | `terraform destroy -auto-approve`. |
 | `run-basic` | Run the basic consumer example. |

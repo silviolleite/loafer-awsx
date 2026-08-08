@@ -20,7 +20,12 @@ COMPOSE_FILE   := $(TERRAFORM_DIR)/docker-compose.yml
 # in terraform/docker-compose.yml and terraform/variables.tf).
 LOCALSTACK_URL := http://localhost:4566
 
+# Observability stack (OTel Collector + Jaeger) used by the middleware example.
+OBSERVABILITY_COMPOSE_FILE := middleware/docker-compose.yml
+JAEGER_UI                  := http://localhost:16686
+
 .PHONY: help up down down-clean provision destroy \
+        observability-up observability-down observability-down-clean \
         run-basic run-fifo run-fifo-scheduled-retry run-localscheduler run-typed run-middleware run-producer run-all
 
 # help is the default goal: it parses the `##` comments after each target name
@@ -53,6 +58,23 @@ down: ## Stop LocalStack (keeps the data volume)
 down-clean: ## Stop LocalStack and remove its data volume
 	@echo "Stopping LocalStack and removing volumes..."
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down -v
+
+# --- Observability (OTel Collector + Jaeger) --------------------------------
+# Tracing backend for the middleware example. Independent of LocalStack; bring
+# it up alongside `make up` when you want to view spans in the Jaeger UI.
+
+observability-up: ## Start the OTel Collector + Jaeger tracing backend for the middleware example
+	@echo "Starting OTel Collector + Jaeger..."
+	@$(DOCKER_COMPOSE) -f $(OBSERVABILITY_COMPOSE_FILE) up -d
+	@echo "Jaeger UI available at $(JAEGER_UI)"
+
+observability-down: ## Stop the OTel Collector + Jaeger tracing backend
+	@echo "Stopping OTel Collector + Jaeger..."
+	@$(DOCKER_COMPOSE) -f $(OBSERVABILITY_COMPOSE_FILE) down
+
+observability-down-clean: ## Stop the tracing backend and remove its volumes
+	@echo "Stopping OTel Collector + Jaeger and removing volumes..."
+	@$(DOCKER_COMPOSE) -f $(OBSERVABILITY_COMPOSE_FILE) down -v
 
 # --- Terraform --------------------------------------------------------------
 
@@ -89,8 +111,9 @@ run-typed: ## Run the typed handler consumer example
 	@echo "Running typed example (Ctrl+C to stop)..."
 	@$(GO) run ./typed
 
-run-middleware: ## Run the observability middleware consumer example (metrics on :9090)
-	@echo "Running middleware example (Ctrl+C to stop; metrics on :9090/metrics)..."
+run-middleware: ## Run the observability middleware consumer example (metrics on :9090, traces to Jaeger)
+	@echo "Running middleware example (Ctrl+C to stop; metrics on :9090/metrics, traces at $(JAEGER_UI))..."
+	@echo "Tip: run 'make observability-up' first to view spans in the Jaeger UI."
 	@$(GO) run ./middleware
 
 run-producer: ## Run the SNS producer example (publishes then exits)

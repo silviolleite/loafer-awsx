@@ -1,4 +1,4 @@
-// Command middleware demonstrates observability middleware with loafer-go v3.
+// Command middleware demonstrates observability middleware with loafer-awsx.
 //
 // It wires a consumer with a full middleware stack applied globally by the
 // broker (outermost first):
@@ -8,17 +8,22 @@
 //   - Logging records message receipt, processing duration, and outcome.
 //   - Metrics instruments processing with Prometheus collectors, exposed here
 //     on an HTTP /metrics endpoint backed by a dedicated registry.
-//   - OTel creates an OpenTelemetry span per message, reporting to a
-//     TracerProvider from the OTel SDK.
+//   - OTel creates an OpenTelemetry span per message, exported over OTLP to an
+//     OpenTelemetry Collector, which forwards the traces to Jaeger.
 //
 // It shows the full wiring of an observable consumer application:
 //
 //  1. Building an AWS connection (aws.Config) with the conn package.
-//  2. Setting up a Prometheus registry and an OTel TracerProvider.
+//  2. Setting up a Prometheus registry and an OTLP-backed OTel TracerProvider.
 //  3. Serving the Prometheus /metrics endpoint over HTTP.
 //  4. Declaring a route and a broker with the middleware stack.
 //  5. Running the broker with graceful shutdown driven by OS signals, then
 //     cleanly shutting down the metrics server and tracer provider.
+//
+// The tracing backend (OTel Collector + Jaeger) is provided by
+// docker-compose.yml in this directory. Bring it up before running the example
+// to view spans in the Jaeger UI at http://localhost:16686; if it is not
+// running the example still works, and the exporter retries in the background.
 //
 // Run it against a real queue or a local AWS-compatible endpoint (for example
 // LocalStack) by adjusting the region, credentials, endpoint, and queue name
@@ -36,6 +41,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/silviolleite/loafer-awsx/broker"
@@ -53,6 +61,15 @@ const (
 
 	// metricsAddr is the address the Prometheus /metrics endpoint listens on.
 	metricsAddr = ":9090"
+
+	// otlpEndpoint is the OTLP HTTP endpoint of the OpenTelemetry Collector
+	// started by docker-compose.yml in this directory. The collector forwards
+	// the received spans to Jaeger.
+	otlpEndpoint = "localhost:4318"
+
+	// serviceName identifies this program in the tracing backend. It is the
+	// service name shown in the Jaeger UI.
+	serviceName = "loafer-awsx-middleware-example"
 
 	// shutdownGracePeriod bounds how long the metrics server and tracer
 	// provider are given to shut down cleanly.
@@ -100,11 +117,15 @@ func main() {
 	// and lets the Metrics middleware register its collectors in isolation.
 	registry := prometheus.NewRegistry()
 
-	// Step 2 (part 2): create an OTel TracerProvider from the SDK. In a real
-	// deployment you would attach a span exporter (OTLP, Jaeger, etc.); here the
-	// provider is created without an exporter so the example stays dependency
-	// free while still exercising the OTel middleware.
-	tracerProvider := sdktrace.NewTracerProvider()
+	// Step 2 (part 2): create an OTel TracerProvider backed by an OTLP HTTP
+	// exporter that ships spans to the OpenTelemetry Collector (which forwards
+	// them to Jaeger). The exporter connects lazily and retries in the
+	// background, so the example still runs if the collector is not up yet.
+	tracerProvider, err := newTracerProvider(ctx)
+	if err != nil {
+		lg.Error("failed to create tracer provider", "error", err)
+		os.Exit(1)
+	}
 
 	// Step 3: serve the Prometheus metrics over HTTP in the background.
 	metricsServer := &http.Server{
@@ -167,6 +188,34 @@ func main() {
 	}
 
 	lg.Info("broker stopped gracefully")
+}
+
+// newTracerProvider builds an OTel TracerProvider that exports spans over OTLP
+// HTTP to the collector at otlpEndpoint using a batch span processor. The
+// resource carries the service name so traces are grouped under serviceName in
+// the Jaeger UI. WithInsecure disables TLS, which is appropriate for the local
+// collector; use TLS credentials against a real endpoint.
+func newTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(otlpEndpoint),
+		otlptracehttp.WithInsecure(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewSchemaless(attribute.String("service.name", serviceName)),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	), nil
 }
 
 // handleMessage is a simple handler used to exercise the middleware stack. It

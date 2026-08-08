@@ -1,0 +1,37 @@
+# OpenTelemetry Collector configuration for the middleware example.
+#
+# The collector receives OTLP spans from the example program (over gRPC on
+# 4317 and HTTP on 4318), batches them, and forwards them to Jaeger using OTLP.
+# The native Jaeger exporter was removed from the Collector in 2023 because
+# Jaeger ingests OTLP out of the box, so the pipeline exports over OTLP to the
+# Jaeger all-in-one container (COLLECTOR_OTLP_ENABLED=true) on jaeger:4317.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch spans before export to reduce the number of outbound requests.
+  batch:
+
+exporters:
+  # Forward spans to Jaeger over OTLP gRPC. tls.insecure is fine for local
+  # development against the bundled all-in-one container. The exporter type is
+  # otlp_grpc; the bare "otlp" alias is deprecated in recent Collector releases.
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  # Log a summary of exported spans to the collector's stdout for debugging.
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/jaeger, debug]

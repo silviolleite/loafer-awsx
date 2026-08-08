@@ -1,0 +1,41 @@
+# docker-compose.yml brings up the tracing backend for the middleware example:
+# an OpenTelemetry Collector and a Jaeger all-in-one instance.
+#
+# Data flow:
+#
+#   middleware example (host)  --OTLP HTTP :4318-->  otel-collector
+#                                                        |
+#                                            --OTLP gRPC jaeger:4317-->  jaeger
+#                                                                          |
+#                                                          Jaeger UI  http://localhost:16686
+#
+# Usage (from examples/):
+#   docker compose -f middleware/docker-compose.yml up -d
+#   make run-middleware
+#   open http://localhost:16686  (service: loafer-awsx-middleware-example)
+#
+# This stack is independent of the LocalStack/Terraform stack; run both when you
+# want the example to consume real messages while exporting traces.
+services:
+  otel-collector:
+    container_name: "loafer-awsx-otel-collector"
+    image: otel/opentelemetry-collector:0.158.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      # Relative paths resolve against this compose file's directory
+      # (examples/middleware), so the config sits next to this file.
+      - "./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro"
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC receiver
+      - "127.0.0.1:4318:4318" # OTLP HTTP receiver (used by the example)
+    depends_on:
+      - jaeger
+
+  jaeger:
+    container_name: "loafer-awsx-jaeger"
+    # Jaeger all-in-one ingests OTLP natively when COLLECTOR_OTLP_ENABLED=true.
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "127.0.0.1:16686:16686" # Jaeger UI
