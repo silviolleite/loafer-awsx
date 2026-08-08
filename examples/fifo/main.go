@@ -1,5 +1,5 @@
 // Command fifo demonstrates ordered consumption from an SQS FIFO queue with
-// loafer-go v3.
+// loafer-awsx.
 //
 // FIFO queues guarantee ordering within a message group. To preserve that
 // ordering while still processing multiple groups concurrently, the route runs

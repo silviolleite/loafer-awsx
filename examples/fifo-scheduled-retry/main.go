@@ -1,5 +1,5 @@
 // Command fifo-scheduled-retry demonstrates the Scheduled Retry model for an
-// SQS FIFO queue with loafer-go v3.
+// SQS FIFO queue with loafer-awsx.
 //
 // FIFO queues preserve ordering within a message group, which makes the default
 // "leave the message on the queue and retry in place" behavior problematic: a

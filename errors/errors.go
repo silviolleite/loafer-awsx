@@ -2,7 +2,7 @@ package errors
 
 import "fmt"
 
-// Sentinel errors returned across loafer-go v3. They are comparable with the
+// Sentinel errors returned across loafer-awsx. They are comparable with the
 // standard library errors.Is so callers can branch on specific failure modes
 // without depending on error message strings.
 var (
@@ -51,7 +51,7 @@ var (
 )
 
 // New returns a new error that formats as the given text. It is a thin wrapper
-// around the standard library so callers within loafer-go do not need to import
+// around the standard library so callers within loafer-awsx do not need to import
 // both this package and the standard errors package.
 func New(text string) error {
 	return &sentinelError{msg: text}

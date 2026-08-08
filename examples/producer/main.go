@@ -1,5 +1,5 @@
 // Command producer demonstrates publishing messages to SNS topics with
-// loafer-go v3.
+// loafer-awsx.
 //
 // It covers the four common publishing shapes:
 //

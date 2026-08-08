@@ -1,4 +1,4 @@
-// Command typed demonstrates strongly-typed message handling with loafer-go v3.
+// Command typed demonstrates strongly-typed message handling with loafer-awsx.
 //
 // Instead of decoding the raw message body by hand inside the handler, the
 // typed package adapts a strongly-typed handler function into the standard

@@ -1,4 +1,4 @@
-// Command basic demonstrates standard SQS queue consumption with loafer-go v3.
+// Command basic demonstrates standard SQS queue consumption with loafer-awsx.
 //
 // It shows the full wiring of a consumer application:
 //

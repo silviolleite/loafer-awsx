@@ -1,4 +1,4 @@
-// Package fake provides configurable test doubles for the core loafer-go v3
+// Package fake provides configurable test doubles for the core loafer-awsx
 // interfaces used across package tests: Message (consumer.Message and
 // middleware.Message), SQSClient (consumer.SQSClient), and SNSClient
 // (producer.SNSClient). It also provides LogHandler, a capturing slog.Handler
