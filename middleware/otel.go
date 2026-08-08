@@ -12,7 +12,7 @@ import (
 const (
 	// tracerName is the instrumentation scope name used when acquiring a
 	// Tracer from the configured TracerProvider.
-	tracerName = "loafer-go"
+	tracerName = "loafer-awsx"
 
 	// spanNamePrefix is prepended to the route name to form the span name
 	// following the "loafer.process/<route>" pattern.
