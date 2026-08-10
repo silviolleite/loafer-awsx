@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [0.7.0](https://github.com/silviolleite/loafer-awsx/compare/v0.6.0...v0.7.0) (2026-08-10)
+
+
+### Features
+
+* **middleware:** add WithLinkFromContext option to OTel middleware ([2ef45f8](https://github.com/silviolleite/loafer-awsx/commit/2ef45f8a845be888764981d9cb3c52bff5651c6b))
+
 ## [0.6.0](https://github.com/silviolleite/loafer-awsx/compare/v0.5.0...v0.6.0) (2026-08-08)
 
 
