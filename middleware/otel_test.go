@@ -162,6 +162,105 @@ func TestOTelDefaultsToGlobalProvider(t *testing.T) {
 	assert.Equal(t, "loafer.process/global", spans[0].Name())
 }
 
+func TestOTelWithLinkFromContextCreatesRootAndLink(t *testing.T) {
+	tp, sr := newRecordingProvider()
+
+	parentTracer := tp.Tracer("parent")
+	parentCtx, parentSpan := parentTracer.Start(context.Background(), "producer")
+	parentSC := parentSpan.SpanContext()
+	parentSpan.End()
+
+	handler := func(context.Context, middleware.Message) error {
+		return nil
+	}
+
+	wrapped := middleware.OTel("linked",
+		middleware.WithTracerProvider(tp),
+		middleware.WithLinkFromContext(),
+	)(handler)
+
+	err := wrapped(parentCtx, stubMessage{id: "msg-link"})
+
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 2)
+
+	var processing sdktrace.ReadOnlySpan
+	for _, s := range spans {
+		if s.Name() == "loafer.process/linked" {
+			processing = s
+		}
+	}
+	require.NotNil(t, processing)
+
+	assert.NotEqual(t, parentSC.TraceID(), processing.SpanContext().TraceID())
+	assert.False(t, processing.Parent().IsValid())
+
+	links := processing.Links()
+	require.Len(t, links, 1)
+	assert.Equal(t, parentSC.TraceID(), links[0].SpanContext.TraceID())
+	assert.Equal(t, parentSC.SpanID(), links[0].SpanContext.SpanID())
+}
+
+func TestOTelWithLinkFromContextWithoutParentStartsRootWithoutLink(t *testing.T) {
+	tp, sr := newRecordingProvider()
+
+	handler := func(context.Context, middleware.Message) error {
+		return nil
+	}
+
+	wrapped := middleware.OTel("rootless",
+		middleware.WithTracerProvider(tp),
+		middleware.WithLinkFromContext(),
+	)(handler)
+
+	err := wrapped(context.Background(), stubMessage{id: "msg-noparent"})
+
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+
+	assert.Equal(t, "loafer.process/rootless", spans[0].Name())
+	assert.False(t, spans[0].Parent().IsValid())
+	assert.Empty(t, spans[0].Links())
+}
+
+func TestOTelDefaultInheritsParentTrace(t *testing.T) {
+	tp, sr := newRecordingProvider()
+
+	parentTracer := tp.Tracer("parent")
+	parentCtx, parentSpan := parentTracer.Start(context.Background(), "producer")
+	parentSC := parentSpan.SpanContext()
+	parentSpan.End()
+
+	handler := func(context.Context, middleware.Message) error {
+		return nil
+	}
+
+	wrapped := middleware.OTel("inherited", middleware.WithTracerProvider(tp))(handler)
+
+	err := wrapped(parentCtx, stubMessage{id: "msg-inherit"})
+
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 2)
+
+	var processing sdktrace.ReadOnlySpan
+	for _, s := range spans {
+		if s.Name() == "loafer.process/inherited" {
+			processing = s
+		}
+	}
+	require.NotNil(t, processing)
+
+	assert.Equal(t, parentSC.TraceID(), processing.SpanContext().TraceID())
+	assert.Equal(t, parentSC.SpanID(), processing.Parent().SpanID())
+	assert.Empty(t, processing.Links())
+}
+
 func TestOTelWithNilTracerProviderFallsBack(t *testing.T) {
 	previous := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(previous) })
