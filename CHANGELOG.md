@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [1.0.0](https://github.com/silviolleite/loafer-awsx/compare/v0.7.1...v1.0.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* broker.Option and consumer.Option now return an error; broker.WithMiddleware is renamed to broker.WithGlobalMiddleware; and the consumer metric-hook options (WithDLQMetric, WithSuccessMetric, WithRetryMetric, WithDeadLetterMetric) are replaced by the consumer.MetricsRecorder interface and consumer.WithMetrics.
+
+### Features
+
+* freeze public API for v1.0.0 ([9ddf008](https://github.com/silviolleite/loafer-awsx/commit/9ddf00852134f49effa8f1396ab6c792dba8ef2f))
+
+
+### Bug Fixes
+
+* **deps:** release pending dependency updates ([7302dc1](https://github.com/silviolleite/loafer-awsx/commit/7302dc10d06391c4427e455723dd8ca833ce4ebc))
+
 ## [0.7.1](https://github.com/silviolleite/loafer-awsx/compare/v0.7.0...v0.7.1) (2026-08-14)
 
 
