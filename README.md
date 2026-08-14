@@ -230,10 +230,33 @@ it is used only to detect when a message is exhausted so the consumer can emit
 an Error log, the `loafer_messages_dlq_total` metric, and the optional `OnDLQ`
 callback, while leaving the message in the queue.
 
-**Logging:** the library uses `*slog.Logger` everywhere and defines **no**
-custom logger interface. A `*slog.Logger` produced by a third-party bridge (for
-example zap via `zapslog`, or zerolog via a slog handler) is accepted directly,
-no adapter required.
+**Logging:** the library uses the concrete `*slog.Logger` type everywhere and
+defines **no** custom logger interface. This works without any adapter because
+the extension point in `slog` is not the `*slog.Logger` type but the
+`slog.Handler` interface it wraps. A `*slog.Logger` is just a thin struct that
+delegates every record to its `slog.Handler`, and you build one with
+`slog.New(handler)`. Any handler that implements `slog.Handler` therefore plugs
+in directly:
+
+```go
+import (
+    "log/slog"
+
+    "go.uber.org/zap"
+    "go.uber.org/zap/exp/zapslog" // zap's official slog bridge
+)
+
+zapLogger, _ := zap.NewProduction()
+handler := zapslog.NewHandler(zapLogger.Core()) // implements slog.Handler
+log := slog.New(handler)                        // -> *slog.Logger
+
+broker.WithLogger(log) // accepted directly, no adapter
+```
+
+For backends without an official `slog` bridge (for example zerolog), any
+third-party or hand-written `slog.Handler` works the same way. The translation
+to the underlying backend happens inside the handler, so the library never needs
+a logger adapter of its own.
 
 ---
 
