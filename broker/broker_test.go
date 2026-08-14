@@ -316,7 +316,7 @@ func TestRunAppliesGlobalMiddleware(t *testing.T) {
 	b, err := broker.New(client,
 		[]*router.Route{newRoute(t, "orders", nilHandler)},
 		broker.WithLogger(noopLogger()),
-		broker.WithMiddleware(mw),
+		broker.WithGlobalMiddleware(mw),
 	)
 	require.NoError(t, err)
 
@@ -336,7 +336,7 @@ func TestRunAppliesGlobalMiddleware(t *testing.T) {
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&invoked), int32(1))
 }
 
-func TestNewIgnoresNilAndNonPositiveOptions(t *testing.T) {
+func TestNewIgnoresNilOptionAndNilLogger(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	client := newFakeClient()
@@ -344,10 +344,6 @@ func TestNewIgnoresNilAndNonPositiveOptions(t *testing.T) {
 		[]*router.Route{newRoute(t, "orders", nilHandler)},
 		nil,
 		broker.WithLogger(nil),
-		broker.WithRetryTimeout(0),
-		broker.WithRetryTimeout(-time.Second),
-		broker.WithShutdownTimeout(0),
-		broker.WithShutdownTimeout(-time.Second),
 		broker.WithLogger(noopLogger()),
 	)
 	require.NoError(t, err)
@@ -363,6 +359,30 @@ func TestNewIgnoresNilAndNonPositiveOptions(t *testing.T) {
 		assert.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+func TestNewRejectsNonPositiveDurations(t *testing.T) {
+	tests := []struct {
+		opt  broker.Option
+		name string
+	}{
+		{name: "zero retry timeout", opt: broker.WithRetryTimeout(0)},
+		{name: "negative retry timeout", opt: broker.WithRetryTimeout(-time.Second)},
+		{name: "zero shutdown timeout", opt: broker.WithShutdownTimeout(0)},
+		{name: "negative shutdown timeout", opt: broker.WithShutdownTimeout(-time.Second)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := broker.New(newFakeClient(),
+				[]*router.Route{newRoute(t, "orders", nilHandler)},
+				tt.opt,
+			)
+
+			assert.Nil(t, b)
+			assert.ErrorIs(t, err, verrors.ErrInvalidOption)
+		})
 	}
 }
 

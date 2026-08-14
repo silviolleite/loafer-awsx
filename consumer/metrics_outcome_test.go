@@ -42,17 +42,19 @@ func TestScheduledPerOutcomeMetrics(t *testing.T) {
 		var successCount, retryCount, deadCount int
 		var successName, retryName, deadName string
 		if enabled {
-			d.successMetric = func(routeName string) {
-				successCount++
-				successName = routeName
-			}
-			d.retryMetric = func(routeName string) {
-				retryCount++
-				retryName = routeName
-			}
-			d.deadLetterMetric = func(routeName string) {
-				deadCount++
-				deadName = routeName
+			d.metrics = stubRecorder{
+				success: func(routeName string) {
+					successCount++
+					successName = routeName
+				},
+				retry: func(routeName string) {
+					retryCount++
+					retryName = routeName
+				},
+				deadLetter: func(routeName string) {
+					deadCount++
+					deadName = routeName
+				},
 			}
 		}
 

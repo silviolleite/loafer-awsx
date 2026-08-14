@@ -153,7 +153,7 @@ func main() {
 	// then Logging, then Metrics, then OTel closest to the handler.
 	b, err := broker.New(sqsClient, []*router.Route{route},
 		broker.WithLogger(lg),
-		broker.WithMiddleware(
+		broker.WithGlobalMiddleware(
 			middleware.Recovery(lg),
 			middleware.Logging(lg),
 			middleware.Metrics(queueName, middleware.WithMetricsRegisterer(registry)),

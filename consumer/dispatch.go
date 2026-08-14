@@ -52,13 +52,10 @@ type dispatcher struct {
 	visibility        *visibilityManager
 	log               *slog.Logger
 	dlq               *router.DLQConfig
-	dlqMetric         DLQMetric
+	metrics           MetricsRecorder
 	retryScheduler    *retryScheduler
 	dlqPublisher      *dlqPublisher
 	scheduledRetry    *router.ScheduledRetryConfig
-	successMetric     SuccessMetric
-	retryMetric       RetryMetric
-	deadLetterMetric  DeadLetterMetric
 	queueURL          string
 	queueName         string
 	channels          []chan *message
@@ -280,7 +277,9 @@ func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err err
 			}
 
 			d.deleteMessage(ctx, msg)
-			emitMetric(d.log, d.retryMetric, d.queueName)
+			if d.metrics != nil {
+				emitMetric(d.log, d.metrics.IncRetry, d.queueName)
+			}
 			return
 		}
 
@@ -296,12 +295,16 @@ func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err err
 		}
 
 		d.deleteMessage(ctx, msg)
-		emitMetric(d.log, d.deadLetterMetric, d.queueName)
+		if d.metrics != nil {
+			emitMetric(d.log, d.metrics.IncDeadLetter, d.queueName)
+		}
 		return
 	}
 
 	d.deleteMessage(ctx, msg)
-	emitMetric(d.log, d.successMetric, d.queueName)
+	if d.metrics != nil {
+		emitMetric(d.log, d.metrics.IncSuccess, d.queueName)
+	}
 }
 
 // observeDLQ emits observe-only dead-letter signals for a message whose handler
@@ -333,8 +336,8 @@ func (d *dispatcher) observeDLQ(ctx context.Context, msg *message) bool {
 		slog.Int("receive_count", receiveCount),
 	)
 
-	if d.dlqMetric != nil {
-		d.dlqMetric(d.queueName)
+	if d.metrics != nil {
+		emitMetric(d.log, d.metrics.IncDLQ, d.queueName)
 	}
 
 	if d.dlq.OnDLQ != nil {

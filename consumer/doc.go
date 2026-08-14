@@ -15,7 +15,7 @@
 // unblocked without risking message loss.
 //
 // On success the consumer simply deletes the message and records the success
-// metric. It performs no success-side publishing: forwarding a successfully
+// outcome. It performs no success-side publishing: forwarding a successfully
 // handled message onward is the handler's responsibility.
 //
 // # Scheduled Retry dependencies
@@ -25,15 +25,15 @@
 // WithSchedulerClient wires the client for routes that select the Scheduled
 // Retry model. The DLQ publish path reuses the SQSClient SendMessage operation.
 //
-// # Scheduled Retry metrics
+// # Metrics
 //
-// SuccessMetric, RetryMetric, and DeadLetterMetric are observe-only hooks, each
-// taking the route name, that the consumer invokes once per corresponding
-// outcome under the Scheduled Retry model: a handled-and-deleted message, a
-// successfully created retry schedule, and a successful DLQ publish. They are
-// wired through WithSuccessMetric, WithRetryMetric, and WithDeadLetterMetric,
-// are expected to be backed by counters registered by the Metrics middleware,
-// and are supplied only when metrics are enabled. A nil hook is ignored, so
-// callers never have to guard against nil and the corresponding counter is left
-// untouched.
+// MetricsRecorder is a single observe-only interface, wired through WithMetrics,
+// whose methods the consumer invokes once per corresponding outcome: IncDLQ for
+// a message detected as exhausted under the observe-only DLQ path, and
+// IncSuccess, IncRetry, and IncDeadLetter for a handled-and-deleted message, a
+// successfully created retry schedule, and a successful DLQ publish under the
+// Scheduled Retry model. The recorder is expected to be backed by counters
+// registered by the Metrics middleware and is supplied only when metrics are
+// enabled. A nil recorder is ignored, so callers never have to guard against nil
+// and the counters are left untouched.
 package consumer

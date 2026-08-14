@@ -31,10 +31,7 @@ type Consumer struct {
 	client            SQSClient
 	route             *router.Route
 	log               *slog.Logger
-	dlqMetric         DLQMetric
-	successMetric     SuccessMetric
-	retryMetric       RetryMetric
-	deadLetterMetric  DeadLetterMetric
+	metrics           MetricsRecorder
 	schedulerClient   SchedulerClient
 	globalMiddlewares []middleware.Middleware
 	retryTimeout      time.Duration
@@ -46,7 +43,8 @@ type Consumer struct {
 //
 // New returns errors.ErrNoSQSClient when client is nil and errors.ErrNoRoute
 // when route is nil, so a misconfigured consumer fails fast at construction
-// rather than panicking during Run.
+// rather than panicking during Run. Option failures are wrapped with
+// errors.ErrInvalidOption.
 func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, error) {
 	if client == nil {
 		return nil, errors.ErrNoSQSClient
@@ -63,8 +61,11 @@ func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, erro
 	}
 
 	for _, opt := range opts {
-		if opt != nil {
-			opt(c)
+		if opt == nil {
+			continue
+		}
+		if err := opt(c); err != nil {
+			return nil, errors.Wrap(errors.ErrInvalidOption, err)
 		}
 	}
 
@@ -104,15 +105,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 
 	d := newDispatcher(c.client, c.route, queueURL, vm, c.schedulerClient, c.log, c.globalMiddlewares...)
-	d.dlqMetric = c.dlqMetric
 
-	// The Scheduled Retry model reports success, retry, and dead-letter outcomes
-	// through these hooks; the Visibility model never uses them.
-	if scheduled {
-		d.successMetric = c.successMetric
-		d.retryMetric = c.retryMetric
-		d.deadLetterMetric = c.deadLetterMetric
-	}
+	// The recorder serves both models: the Visibility model reports the
+	// observe-only DLQ counter and the Scheduled Retry model reports success,
+	// retry, and dead-letter outcomes. Each code path calls only the methods it
+	// owns, so a single recorder is wired unconditionally.
+	d.metrics = c.metrics
 
 	d.start(ctx)
 	defer d.stop()

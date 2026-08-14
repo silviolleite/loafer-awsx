@@ -468,9 +468,9 @@ route is a configuration error, regardless of option order.
 
 ### Consumer wiring
 
-> The broker does **not** forward the scheduler client or the metric hooks to
-> the consumers it creates. Wire a Scheduled-model route through `consumer.New`
-> directly and run it yourself.
+> The broker does **not** forward the scheduler client or the metrics recorder
+> to the consumers it creates. Wire a Scheduled-model route through
+> `consumer.New` directly and run it yourself.
 
 `consumer.WithSchedulerClient(consumer.SchedulerClient)` supplies the EventBridge
 Scheduler client. A concrete `*scheduler.Client` from
@@ -479,14 +479,17 @@ directly. A Scheduled-model route given to a consumer without a scheduler client
 fails fast at `Run` with `errors.ErrNoSchedulerClient` and never begins
 consuming.
 
-Three optional metric hooks report each outcome, each labeled by route name and
-no-op when nil:
+`consumer.WithMetrics(consumer.MetricsRecorder)` wires a single recorder whose
+methods report each outcome, labeled by route name. The whole recorder is no-op
+when nil, and a panicking method is recovered so the message outcome always
+completes:
 
-| Option | Signature | Emitted when |
-| --- | --- | --- |
-| `WithSuccessMetric` | `WithSuccessMetric(func(routeName string))` | A handler succeeds and the original message is deleted. |
-| `WithRetryMetric` | `WithRetryMetric(func(routeName string))` | A retry schedule is created successfully. |
-| `WithDeadLetterMetric` | `WithDeadLetterMetric(func(routeName string))` | An exhausted message is published to the DLQ successfully. |
+| Method | Emitted when |
+| --- | --- |
+| `IncSuccess(routeName string)` | A handler succeeds and the original message is deleted. |
+| `IncRetry(routeName string)` | A retry schedule is created successfully. |
+| `IncDeadLetter(routeName string)` | An exhausted message is published to the DLQ successfully. |
+| `IncDLQ(routeName string)` | Under the Visibility model, a message is observed as exhausted (observe-only DLQ). |
 
 ### Example
 
@@ -545,13 +548,11 @@ func main() {
     }
 
     // The Scheduled model is wired through consumer.New directly, not broker.New:
-    // the scheduler client and metric hooks are consumer options.
+    // the scheduler client and metrics recorder are consumer options.
     c, err := consumer.New(sqsClient, route,
         consumer.WithLogger(log),
         consumer.WithSchedulerClient(schedulerClient),
-        consumer.WithSuccessMetric(func(routeName string) { log.Info("success", slog.String("route", routeName)) }),
-        consumer.WithRetryMetric(func(routeName string) { log.Info("retry", slog.String("route", routeName)) }),
-        consumer.WithDeadLetterMetric(func(routeName string) { log.Info("dead-letter", slog.String("route", routeName)) }),
+        consumer.WithMetrics(logMetrics{log: log}),
     )
     if err != nil {
         log.Error("failed to build consumer", slog.Any("error", err))
@@ -562,6 +563,16 @@ func main() {
         log.Error("consumer stopped", slog.Any("error", err))
     }
 }
+
+// logMetrics is a consumer.MetricsRecorder that logs each outcome. A production
+// implementation would back these methods with the counters registered by the
+// Metrics middleware.
+type logMetrics struct{ log *slog.Logger }
+
+func (m logMetrics) IncDLQ(route string)        { m.log.Info("dlq", slog.String("route", route)) }
+func (m logMetrics) IncSuccess(route string)    { m.log.Info("success", slog.String("route", route)) }
+func (m logMetrics) IncRetry(route string)      { m.log.Info("retry", slog.String("route", route)) }
+func (m logMetrics) IncDeadLetter(route string) { m.log.Info("dead-letter", slog.String("route", route)) }
 ```
 
 ### Required AWS resources and IAM permissions

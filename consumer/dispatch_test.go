@@ -51,6 +51,37 @@ func buildGroupMessage(tb require.TestingT, receipt, groupID string, custom map[
 	})
 }
 
+type stubRecorder struct {
+	dlq        func(string)
+	success    func(string)
+	retry      func(string)
+	deadLetter func(string)
+}
+
+func (s stubRecorder) IncDLQ(route string) {
+	if s.dlq != nil {
+		s.dlq(route)
+	}
+}
+
+func (s stubRecorder) IncSuccess(route string) {
+	if s.success != nil {
+		s.success(route)
+	}
+}
+
+func (s stubRecorder) IncRetry(route string) {
+	if s.retry != nil {
+		s.retry(route)
+	}
+}
+
+func (s stubRecorder) IncDeadLetter(route string) {
+	if s.deadLetter != nil {
+		s.deadLetter(route)
+	}
+}
+
 func nilHandler(_ context.Context, _ middleware.Message) error { return nil }
 
 func errorHandler(_ context.Context, _ middleware.Message) error { return errors.New("handler boom") }
@@ -354,7 +385,7 @@ func TestDispatcherProcessObservesDLQWhenExhausted(t *testing.T) {
 	d := newTestDispatcher(t, client, slog.New(capture), errorHandler,
 		router.WithDLQ(3, router.WithOnDLQ(onDLQ)),
 	)
-	d.dlqMetric = func(route string) { metricRoute = route }
+	d.metrics = stubRecorder{dlq: func(route string) { metricRoute = route }}
 
 	msg := buildDLQMessage("receipt-dlq", "3")
 	d.process(context.Background(), msg)
@@ -382,7 +413,7 @@ func TestDispatcherProcessDLQBelowThresholdSkipsSignals(t *testing.T) {
 	d := newTestDispatcher(t, client, slog.New(capture), errorHandler,
 		router.WithDLQ(5, router.WithOnDLQ(func(context.Context, middleware.Message) { onDLQCalls++ })),
 	)
-	d.dlqMetric = func(string) { metricCalls++ }
+	d.metrics = stubRecorder{dlq: func(string) { metricCalls++ }}
 
 	msg := buildDLQMessage("receipt-below", "2")
 	d.process(context.Background(), msg)
@@ -404,7 +435,7 @@ func TestDispatcherProcessNoDLQConfiguredSkipsSignals(t *testing.T) {
 	capture := &captureHandler{}
 	client := &fakeSQSClient{}
 	d := newTestDispatcher(t, client, slog.New(capture), errorHandler)
-	d.dlqMetric = func(string) { metricCalls++ }
+	d.metrics = stubRecorder{dlq: func(string) { metricCalls++ }}
 
 	msg := buildDLQMessage("receipt-nodlq", "10")
 	d.process(context.Background(), msg)
@@ -451,7 +482,7 @@ func TestDispatcherProcessDLQReceiveCountParsing(t *testing.T) {
 			capture := &captureHandler{}
 			client := &fakeSQSClient{}
 			d := newTestDispatcher(t, client, slog.New(capture), errorHandler, router.WithDLQ(1))
-			d.dlqMetric = func(string) { metricCalls++ }
+			d.metrics = stubRecorder{dlq: func(string) { metricCalls++ }}
 
 			msg := buildDLQMessage("receipt", tt.receiveCount)
 			d.process(context.Background(), msg)
@@ -474,7 +505,7 @@ func TestDispatcherProcessDLQConfiguredSuccessDeletes(t *testing.T) {
 	d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
 		router.WithDLQ(1, router.WithOnDLQ(func(context.Context, middleware.Message) { onDLQCalls++ })),
 	)
-	d.dlqMetric = func(string) { metricCalls++ }
+	d.metrics = stubRecorder{dlq: func(string) { metricCalls++ }}
 
 	msg := buildDLQMessage("receipt-ok", "9")
 	d.process(context.Background(), msg)
@@ -497,7 +528,7 @@ func TestDispatcherProcessDLQThresholdProperty(t *testing.T) {
 		d := newTestDispatcher(rt, client, slog.New(capture), errorHandler,
 			router.WithDLQ(maxReceive, router.WithOnDLQ(func(context.Context, middleware.Message) { onDLQCalls++ })),
 		)
-		d.dlqMetric = func(string) { metricCalls++ }
+		d.metrics = stubRecorder{dlq: func(string) { metricCalls++ }}
 
 		msg := buildDLQMessage("receipt", strconv.Itoa(receiveCount))
 		d.process(context.Background(), msg)

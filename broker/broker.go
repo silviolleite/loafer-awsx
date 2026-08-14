@@ -33,7 +33,8 @@ type Broker struct {
 // options are ignored.
 //
 // New returns errors.ErrNoSQSClient when sqsClient is nil and
-// errors.ErrNoRoute when routes is nil or empty.
+// errors.ErrNoRoute when routes is nil or empty. Option failures are wrapped
+// with errors.ErrInvalidOption.
 func New(sqsClient consumer.SQSClient, routes []*router.Route, opts ...Option) (*Broker, error) {
 	if sqsClient == nil {
 		return nil, errors.ErrNoSQSClient
@@ -50,8 +51,11 @@ func New(sqsClient consumer.SQSClient, routes []*router.Route, opts ...Option) (
 	}
 
 	for _, opt := range opts {
-		if opt != nil {
-			opt(b)
+		if opt == nil {
+			continue
+		}
+		if err := opt(b); err != nil {
+			return nil, errors.Wrap(errors.ErrInvalidOption, err)
 		}
 	}
 

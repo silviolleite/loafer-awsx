@@ -148,20 +148,13 @@ func main() {
 	// needs the EventBridge Scheduler client and the observability hooks, which
 	// are consumer-level options, so it is run through consumer.New rather than
 	// a broker. WithSchedulerClient supplies the scheduler used to create retry
-	// schedules; the metric hooks log each outcome (success, retry, dead-letter)
-	// so the scheduled-retry path is easy to observe when running the example.
+	// schedules; the MetricsRecorder logs each outcome (success, retry,
+	// dead-letter) so the scheduled-retry path is easy to observe when running
+	// the example.
 	c, err := consumer.New(sqsClient, route,
 		consumer.WithSchedulerClient(schedClient),
 		consumer.WithLogger(logger.New()),
-		consumer.WithSuccessMetric(func(route string) {
-			log.Printf("success: route=%q message processed and deleted", route)
-		}),
-		consumer.WithRetryMetric(func(route string) {
-			log.Printf("retry: route=%q retry schedule created", route)
-		}),
-		consumer.WithDeadLetterMetric(func(route string) {
-			log.Printf("dead-letter: route=%q exhausted message sent to DLQ", route)
-		}),
+		consumer.WithMetrics(loggingMetrics{}),
 	)
 	if err != nil {
 		log.Fatalf("failed to create consumer: %v", err)
@@ -186,4 +179,26 @@ func handleMessage(_ context.Context, msg middleware.Message) error {
 	id := msg.Identifier()
 	log.Printf("received message %q, forcing failure to trigger a scheduled retry", id)
 	return fmt.Errorf("simulated processing failure for message %q", id)
+}
+
+// loggingMetrics is a consumer.MetricsRecorder that logs each Scheduled Retry
+// outcome so the path is easy to observe when running the example. A real
+// application would back these methods with the counters registered by the
+// Metrics middleware.
+type loggingMetrics struct{}
+
+func (loggingMetrics) IncDLQ(route string) {
+	log.Printf("dlq: route=%q message observed as exhausted", route)
+}
+
+func (loggingMetrics) IncSuccess(route string) {
+	log.Printf("success: route=%q message processed and deleted", route)
+}
+
+func (loggingMetrics) IncRetry(route string) {
+	log.Printf("retry: route=%q retry schedule created", route)
+}
+
+func (loggingMetrics) IncDeadLetter(route string) {
+	log.Printf("dead-letter: route=%q exhausted message sent to DLQ", route)
 }

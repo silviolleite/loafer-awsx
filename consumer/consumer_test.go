@@ -195,6 +195,37 @@ func newConsumer(tb require.TestingT, client consumer.SQSClient, route *router.R
 	return c
 }
 
+type recorderFunc struct {
+	dlq        func(string)
+	success    func(string)
+	retry      func(string)
+	deadLetter func(string)
+}
+
+func (r recorderFunc) IncDLQ(route string) {
+	if r.dlq != nil {
+		r.dlq(route)
+	}
+}
+
+func (r recorderFunc) IncSuccess(route string) {
+	if r.success != nil {
+		r.success(route)
+	}
+}
+
+func (r recorderFunc) IncRetry(route string) {
+	if r.retry != nil {
+		r.retry(route)
+	}
+}
+
+func (r recorderFunc) IncDeadLetter(route string) {
+	if r.deadLetter != nil {
+		r.deadLetter(route)
+	}
+}
+
 func messageBatch(handles ...string) *sqs.ReceiveMessageOutput {
 	msgs := make([]types.Message, len(handles))
 	for i, h := range handles {
@@ -503,7 +534,7 @@ func TestRunAppliesGlobalMiddlewareOutermost(t *testing.T) {
 	assert.Equal(t, []string{"global", "route", "handler"}, order)
 }
 
-func TestNewIgnoresNilAndNonPositiveOptions(t *testing.T) {
+func TestNewIgnoresNilOptionAndNilLogger(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -516,11 +547,28 @@ func TestNewIgnoresNilAndNonPositiveOptions(t *testing.T) {
 	c := newConsumer(t, client, newRoute(t, nilHandler),
 		nil,
 		consumer.WithLogger(nil),
-		consumer.WithRetryTimeout(0),
-		consumer.WithRetryTimeout(-time.Second),
 	)
 
 	require.NoError(t, c.Run(ctx))
+}
+
+func TestNewRejectsNonPositiveRetryTimeout(t *testing.T) {
+	tests := []struct {
+		opt  consumer.Option
+		name string
+	}{
+		{name: "zero", opt: consumer.WithRetryTimeout(0)},
+		{name: "negative", opt: consumer.WithRetryTimeout(-time.Second)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := consumer.New(&stubClient{queueURL: "https://sqs/orders"}, newRoute(t, nilHandler), tt.opt)
+
+			assert.Nil(t, c)
+			assert.ErrorIs(t, err, verrors.ErrInvalidOption)
+		})
+	}
 }
 
 func TestRunConsumesStandardQueueRawMessagesInParallel(t *testing.T) {
@@ -605,7 +653,7 @@ func TestRunProcessesEveryReceivedMessageProperty(t *testing.T) {
 	})
 }
 
-func TestWithDLQMetricNilIgnored(t *testing.T) {
+func TestWithMetricsNilIgnored(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -615,7 +663,7 @@ func TestWithDLQMetricNilIgnored(t *testing.T) {
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
 
-	c := newConsumer(t, client, newRoute(t, nilHandler), consumer.WithDLQMetric(nil))
+	c := newConsumer(t, client, newRoute(t, nilHandler), consumer.WithMetrics(nil))
 
 	require.NoError(t, c.Run(ctx))
 }
@@ -649,7 +697,7 @@ func TestRunIncrementsDLQMetricWhenExhausted(t *testing.T) {
 		router.WithDLQ(5),
 	)
 	c := newConsumer(t, client, route,
-		consumer.WithDLQMetric(func(routeName string) { dlqCounter.WithLabelValues(routeName).Inc() }),
+		consumer.WithMetrics(recorderFunc{dlq: func(routeName string) { dlqCounter.WithLabelValues(routeName).Inc() }}),
 	)
 
 	require.NoError(t, c.Run(ctx))
