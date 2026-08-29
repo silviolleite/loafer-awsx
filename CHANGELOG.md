@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [1.0.1](https://github.com/silviolleite/loafer-awsx/compare/v1.0.0...v1.0.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **consumer:** preserve FIFO group order on failure in PerGroupID mode ([cf90d0d](https://github.com/silviolleite/loafer-awsx/commit/cf90d0d686e0edbcd96dd574217bdba01b0bc582))
+
 ## [1.0.0](https://github.com/silviolleite/loafer-awsx/compare/v0.7.1...v1.0.0) (2026-08-14)
 
 
