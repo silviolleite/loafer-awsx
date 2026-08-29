@@ -184,25 +184,37 @@ func (d *dispatcher) worker(ctx context.Context, ch <-chan *message) {
 	}
 }
 
-// process runs the full lifecycle for a single message. It starts a visibility
-// extension goroutine, invokes the middleware-wrapped handler, and then applies
-// the outcome:
+// process runs the full lifecycle for a single message. In PerGroupID mode under
+// the Visibility retry model, when an earlier message of this message's FIFO
+// group has already failed in the same batch, the message is held back before
+// any work starts: its handler never runs and it is left in the queue so the
+// group is redelivered in order. Otherwise it starts a visibility extension
+// goroutine, invokes the middleware-wrapped handler, and then applies the
+// outcome:
 //   - backoff: the message is left in the queue; the visibility manager
 //     consumes the backoff signal and changes visibility to the backoff
-//     duration. The message is not deleted.
+//     duration. The message is not deleted. In PerGroupID mode the group is
+//     marked failed so the rest of the group in the batch is held back.
 //   - error, message exhausted: when a DLQ route option is configured and the
 //     message's ApproximateReceiveCount has reached MaxReceiveCount, the message
 //     is treated as exhausted. Observability signals are emitted and the message
 //     is left in the source queue so AWS SQS performs the redrive natively; the
 //     library never publishes or deletes it for DLQ purposes.
 //   - error: the error is logged with message body, group ID, and receipt
-//     handle, and the message is left in the queue for redelivery.
+//     handle, and the message is left in the queue for redelivery. In PerGroupID
+//     mode the group is marked failed so the rest of the group in the batch is
+//     held back.
 //   - success: the message is deleted from the queue.
 //
 // The visibility goroutine is tracked by the dispatcher wait group and always
 // terminates: on backoff it stops after reading the backoff signal, otherwise
 // Dispatch closes the dispatch signal to stop it immediately.
 func (d *dispatcher) process(ctx context.Context, msg *message) {
+	if d.orderedGroups() && msg.barrier.failed(msg.groupKey) {
+		d.holdForOrder(msg)
+		return
+	}
+
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
@@ -217,12 +229,15 @@ func (d *dispatcher) process(ctx context.Context, msg *message) {
 	}
 
 	if msg.BackedOff() {
+		d.failGroup(msg)
 		return
 	}
 
 	msg.Dispatch()
 
 	if err != nil {
+		d.failGroup(msg)
+
 		if d.observeDLQ(ctx, msg) {
 			return
 		}
@@ -238,6 +253,29 @@ func (d *dispatcher) process(ctx context.Context, msg *message) {
 	}
 
 	d.deleteMessage(ctx, msg)
+}
+
+// failGroup records the message's group as failed on the batch barrier so that,
+// in PerGroupID mode, every later message of the same group in the batch is held
+// back to preserve order. It is a no-op unless per-group ordering is active.
+func (d *dispatcher) failGroup(msg *message) {
+	if d.orderedGroups() {
+		msg.barrier.fail(msg.groupKey)
+	}
+}
+
+// holdForOrder handles a message whose FIFO group already failed earlier in the
+// batch. To preserve group order the message must not run its handler and must
+// not be deleted: it is left in the queue with its receive-time visibility
+// timeout so AWS SQS redelivers the whole group in order once the failed head
+// becomes visible again. No visibility goroutine is started for a held message,
+// so nothing is leaked.
+func (d *dispatcher) holdForOrder(msg *message) {
+	d.log.Warn("holding message to preserve FIFO group order; earlier message in group failed",
+		slog.String("queue_url", d.queueURL),
+		slog.String("receipt_handle", msg.Identifier()),
+		slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+	)
 }
 
 // processScheduled applies the Scheduled Retry model outcome for a message after
@@ -376,12 +414,37 @@ func (d *dispatcher) deleteMessage(ctx context.Context, msg *message) {
 
 // workerIndex selects the worker that will process msg. In Parallel mode the
 // worker is chosen at random; in PerGroupID mode it is chosen by hashing the
-// message group key so equal keys always map to the same worker.
+// message group key so equal keys always map to the same worker. In PerGroupID
+// mode the computed group key is also cached on the message so the group
+// barrier can key on it without recomputing.
 func (d *dispatcher) workerIndex(msg *message) int {
 	if d.mode == router.PerGroupID {
-		return d.groupIndex(d.groupKey(msg))
+		key := d.groupKey(msg)
+		msg.groupKey = key
+		return d.groupIndex(key)
 	}
 	return d.randIntN(d.workerPoolSize)
+}
+
+// orderedGroups reports whether per-group FIFO ordering must be preserved on
+// failure. PerGroupID dispatch exists to keep each message group in order, so
+// under the Visibility retry model the group barrier is always engaged: a failed
+// message holds back the rest of its group. The Scheduled Retry model unblocks
+// groups by design and is therefore excluded.
+func (d *dispatcher) orderedGroups() bool {
+	return d.mode == router.PerGroupID &&
+		d.retryModel == router.VisibilityRetryModel
+}
+
+// newBatchBarrier returns the group barrier shared by a received batch, or nil
+// when per-group ordering is not preserved (any mode other than PerGroupID, or
+// the Scheduled Retry model). A nil barrier disables all hold-back behavior, so
+// the fast path pays nothing.
+func (d *dispatcher) newBatchBarrier() *groupBarrier {
+	if !d.orderedGroups() {
+		return nil
+	}
+	return newGroupBarrier()
 }
 
 // groupIndex maps a group key to a worker index using a stable 32-bit FNV-1a

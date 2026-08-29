@@ -143,6 +143,11 @@ func (c *Consumer) resolveQueueURL(ctx context.Context) (string, error) {
 // wait; the loop returns as soon as ctx is canceled, whether at the top of the
 // loop, during the retry wait, or while dispatching.
 //
+// Each batch shares one group barrier, attached to every message before
+// dispatch. The barrier is nil unless the route uses PerGroupID dispatch with
+// the Visibility retry model; when non-nil it lets the dispatcher hold back the
+// tail of a FIFO group whose head failed, preserving order.
+//
 // The receive request sets VisibilityTimeout to the route value so each message
 // starts hidden for the configured duration. This lets the visibility manager
 // skip the initial ChangeMessageVisibility call — it only extends after the
@@ -171,8 +176,11 @@ func (c *Consumer) poll(ctx context.Context, queueURL string, d *dispatcher) {
 			continue
 		}
 
+		barrier := d.newBatchBarrier()
 		for i := range out.Messages {
-			d.dispatch(ctx, newMessage(out.Messages[i]))
+			msg := newMessage(out.Messages[i])
+			msg.barrier = barrier
+			d.dispatch(ctx, msg)
 		}
 	}
 }

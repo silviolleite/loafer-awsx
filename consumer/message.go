@@ -65,7 +65,9 @@ type snsEnvelope struct {
 type message struct {
 	backoffChannel chan time.Duration
 	dispatched     chan struct{}
+	barrier        *groupBarrier
 	original       types.Message
+	groupKey       string
 	envelope       snsEnvelope
 	dispatchOnce   sync.Once
 	backedOff      atomic.Bool
