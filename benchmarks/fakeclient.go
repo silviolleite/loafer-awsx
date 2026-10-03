@@ -7,6 +7,11 @@
 // prebuilt messages and reports completion once every message has been deleted.
 // This isolates the libraries' own dispatch, worker-pool, and bookkeeping cost
 // from AWS/network latency, so the comparison reflects library overhead only.
+//
+// The delete benchmarks additionally set a per-call delete latency on the
+// client to simulate the SQS round trip, and read its delete counters to report
+// how many delete requests (DeleteMessage and DeleteMessageBatch) each message
+// cost and how many entries each batch request carried.
 package benchmarks
 
 import (
@@ -30,18 +35,32 @@ const receiveBatch = 10
 
 // benchClient is an in-memory SQS client shared by both libraries. Its method
 // set matches both loafergo.SQSClient and consumer.SQSClient, so a single value
-// drives either library. It hands out exactly total messages across
-// ReceiveMessage calls and closes done once total messages have been deleted.
+// drives either library. It also implements DeleteMessageBatch, so it satisfies
+// consumer.BatchDeleteClient. It hands out exactly total messages across
+// ReceiveMessage calls and closes done once total messages have been deleted
+// through either delete API.
+//
+// deleteLatency, when non-zero, is slept by every DeleteMessage and
+// DeleteMessageBatch call to simulate the SQS round trip. deleteCalls counts
+// requests across both delete APIs, while batchCalls and batchEntries count
+// DeleteMessageBatch requests and the entries they carried. All counters are
+// accessed atomically.
 type benchClient struct {
-	body   []byte
-	groups int64 // when > 0, messages carry a cycling MessageGroupId (FIFO mode)
-	total  int64
+	done chan struct{}
+	body []byte
+
+	groups        int64 // when > 0, messages carry a cycling MessageGroupId (FIFO mode)
+	total         int64
+	deleteLatency time.Duration
 
 	remaining int64 // messages left to hand out
 	seq       int64 // unique receipt-handle sequence
 	delivered int64 // messages deleted (fully processed)
 
-	done      chan struct{}
+	deleteCalls  int64 // DeleteMessage plus DeleteMessageBatch requests
+	batchCalls   int64 // DeleteMessageBatch requests
+	batchEntries int64 // entries across all DeleteMessageBatch requests
+
 	closeOnce sync.Once
 }
 
@@ -107,13 +126,66 @@ func (c *benchClient) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageI
 	return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
 }
 
-// DeleteMessage records a fully processed message and signals completion once
-// every seeded message has been deleted.
-func (c *benchClient) DeleteMessage(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
-	if atomic.AddInt64(&c.delivered, 1) == c.total {
+// DeleteMessage waits deleteLatency, records a fully processed message, and
+// signals completion once every seeded message has been deleted. It returns the
+// context error without deleting when ctx ends during the simulated latency.
+func (c *benchClient) DeleteMessage(ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+	if err := c.simulateDeleteLatency(ctx); err != nil {
+		return nil, err
+	}
+	atomic.AddInt64(&c.deleteCalls, 1)
+	c.markDelivered(1)
+	return &sqs.DeleteMessageOutput{}, nil
+}
+
+// DeleteMessageBatch waits deleteLatency, records every entry as a fully
+// processed message, and signals completion once every seeded message has been
+// deleted. Every entry is reported as successful. It returns the context error
+// without deleting when ctx ends during the simulated latency.
+func (c *benchClient) DeleteMessageBatch(
+	ctx context.Context, params *sqs.DeleteMessageBatchInput, _ ...func(*sqs.Options),
+) (*sqs.DeleteMessageBatchOutput, error) {
+	if err := c.simulateDeleteLatency(ctx); err != nil {
+		return nil, err
+	}
+
+	n := int64(len(params.Entries))
+	atomic.AddInt64(&c.deleteCalls, 1)
+	atomic.AddInt64(&c.batchCalls, 1)
+	atomic.AddInt64(&c.batchEntries, n)
+
+	successful := make([]types.DeleteMessageBatchResultEntry, len(params.Entries))
+	for i, e := range params.Entries {
+		successful[i] = types.DeleteMessageBatchResultEntry{Id: e.Id}
+	}
+
+	c.markDelivered(n)
+	return &sqs.DeleteMessageBatchOutput{Successful: successful}, nil
+}
+
+// simulateDeleteLatency blocks for deleteLatency, returning early with the
+// context error when ctx ends first. It returns immediately when no latency is
+// configured.
+func (c *benchClient) simulateDeleteLatency(ctx context.Context) error {
+	if c.deleteLatency <= 0 {
+		return nil
+	}
+	t := time.NewTimer(c.deleteLatency)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// markDelivered adds n deleted messages to delivered and closes done the first
+// time delivered reaches total.
+func (c *benchClient) markDelivered(n int64) {
+	if atomic.AddInt64(&c.delivered, n) >= c.total {
 		c.closeOnce.Do(func() { close(c.done) })
 	}
-	return &sqs.DeleteMessageOutput{}, nil
 }
 
 // ChangeMessageVisibility is a no-op; the benchmarks complete well within the

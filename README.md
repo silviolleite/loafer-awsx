@@ -778,6 +778,54 @@ cd benchmarks
 go test -run '^$' -bench . -benchtime=2s -count=6
 ```
 
+### Batched-delete benchmarks
+
+These benchmarks compare the synchronous `DeleteMessage` path with
+[`WithDeleteBatch()`](#batched-deletes) for standard and FIFO (`PerGroupID`, 64
+message groups) routes. They use the same in-memory SQS client, no-op handler,
+and 8-worker pool as above. With `latency=2ms`, every delete request
+(`DeleteMessage` or `DeleteMessageBatch`) is delayed by 2 ms to stand in for a
+network round trip. `delete-calls/msg` is the number of delete requests per
+message; `entries/batch` is the average number of entries per
+`DeleteMessageBatch` request.
+
+| Benchmark | Delete latency | Time/op | Throughput | delete-calls/msg | entries/batch |
+| --- | --- | ---: | ---: | ---: | ---: |
+| StandardSync | 0 | 5.36 µs | 186,576 msg/s | 1.000 | – |
+| StandardBatch | 0 | 3.86 µs | 259,312 msg/s | 0.747 | 1.34 |
+| FIFOSync | 0 | 6.65 µs | 150,328 msg/s | 1.000 | – |
+| FIFOBatch | 0 | 5.33 µs | 187,490 msg/s | 0.861 | 1.16 |
+| StandardSync | 2 ms | 344.8 µs | 2,900 msg/s | 1.000 | – |
+| StandardBatch | 2 ms | 34.6 µs | 28,944 msg/s | 0.100 | 9.99 |
+| FIFOSync | 2 ms | 342.7 µs | 2,918 msg/s | 1.000 | – |
+| FIFOBatch | 2 ms | 34.2 µs | 29,209 msg/s | 0.100 | 9.99 |
+
+Medians of 24 samples (four runs of `-benchtime=2s -count=6`) on an Intel Core
+i5-8265U (4 cores / 8 threads, laptop), Go 1.26.6, `linux/amd64`.
+
+- **With 2 ms delete latency:** batches were almost always full (9.99 entries),
+  so delete requests dropped by 90% and throughput rose about 10x on both
+  standard and FIFO routes. The synchronous path is bound by 8 workers each
+  blocking on one delete. Batching also used about 170 B and 4 allocations less
+  per message. Run-to-run spread was 11% or less.
+- **With zero delete latency:** the result is not stable, so the medians in
+  the table hide a split. In three of four runs, batches held 1.16–1.37
+  entries and batching took 20–47% less time per message than the
+  synchronous path. In the fourth run, batches barely formed (1.06–1.13
+  entries) and batching took 13–25% more time. Either way it costs about
+  295–380 B and 5–7 allocations more per message. Do not expect a speedup
+  from batching when deletes are this cheap.
+
+In short, `WithDeleteBatch()` pays off most when delete round trips are real,
+as with any networked SQS endpoint, and volume is high. With in-memory,
+zero-latency deletes it can be faster or slower per message, and it always
+uses slightly more memory and allocations. To reproduce:
+
+```bash
+cd benchmarks
+go test -run '^$' -bench 'Delete' -benchtime=2s -count=6
+```
+
 ---
 
 ## Acknowledgements
