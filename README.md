@@ -48,25 +48,32 @@ routes and a broker, and processes messages from AWS SQS while optionally
 publishing to AWS SNS. The library also exposes Prometheus metrics and
 OpenTelemetry spans for observability.
 
+Diagram conventions, shared by every diagram in this README: rounded boxes are
+your application code, rectangles are `loafer-awsx` components, cylinders are SQS
+queues, hexagons are other AWS services, and parallelograms are observability
+backends. Solid arrows are calls made by your code or the library; dashed arrows
+are calls AWS makes on its own.
+
 ### Context Diagram
 
 ```mermaid
+%%{init: {"theme": "neutral"}}%%
 flowchart LR
-    dev([Developer])
+    app([Your application])
     loafer[loafer-awsx]
-    sqs[(AWS SQS)]
-    sns[(AWS SNS)]
-    ebs((AWS EventBridge<br/>Scheduler))
-    prom[Prometheus]
-    otel[OpenTelemetry]
+    sqs[(SQS queues)]
+    sns{{SNS topics}}
+    ebs{{EventBridge Scheduler}}
+    prom[/Prometheus/]
+    otel[/OpenTelemetry/]
 
-    dev --> loafer
-    loafer --> sqs
-    loafer --> sns
-    loafer -->|FIFO scheduled retry:<br/>create schedule| ebs
-    ebs -.->|fire: re-publish retry| sqs
-    loafer --> prom
-    loafer --> otel
+    app -->|routes, handlers, publish| loafer
+    loafer -->|poll / delete / change visibility| sqs
+    loafer -->|publish| sns
+    loafer -->|Scheduled retry: create schedule| ebs
+    ebs -.->|fire: re-publish| sqs
+    loafer -->|metrics| prom
+    loafer -->|spans| otel
 ```
 
 ### Container Diagram
@@ -76,36 +83,37 @@ handler, and its `Consumer` runs a worker pool that polls the matching SQS queue
 Publishing runs alongside through the `producer`.
 
 ```mermaid
+%%{init: {"theme": "neutral"}}%%
 flowchart TB
-    app([Application])
+    app([Your application])
     broker[Broker]
     producer[Producer]
 
-    subgraph routeStd[Route - Visibility retry]
-        consumerStd[Consumer / Workers]
+    subgraph routeVis[Route: Visibility retry model]
+        consumerVis[Consumer + workers]
     end
-    subgraph routeFifo[Route - FIFO Scheduled retry]
-        consumerFifo[Consumer / Workers]
+    subgraph routeSched[Route: Scheduled retry model]
+        consumerSched[Consumer + workers]
     end
 
-    sqsStd[(SQS Queue)]
+    sqsVis[(SQS queue<br/>standard or FIFO)]
     sqsEntry[(SQS FIFO Entry_Queue)]
-    dlq[(SQS FIFO DLQ)]
-    sns[(AWS SNS)]
-    ebs((AWS EventBridge<br/>Scheduler))
+    dlq[(SQS DLQ)]
+    sns{{SNS topic}}
+    ebs{{EventBridge Scheduler}}
 
-    app --> broker
-    app --> producer
-    broker --> routeStd
-    consumerStd --> sqsStd
+    app -->|broker.New| broker
+    app -->|consumer.New| routeSched
+    app -->|producer.New| producer
+    broker -->|one consumer per route| routeVis
 
-    app -->|scheduled route via consumer.New| routeFifo
-    consumerFifo -->|poll / delete| sqsEntry
-    consumerFifo -->|create one-time schedule| ebs
-    ebs -.->|fire: re-publish with retry_count+1| sqsEntry
-    consumerFifo -->|exhausted: publish| dlq
+    consumerVis -->|poll / delete / change visibility| sqsVis
+    consumerSched -->|poll / delete| sqsEntry
+    consumerSched -->|retry: create one-time schedule| ebs
+    ebs -.->|fire: re-publish with retry_count + 1| sqsEntry
+    consumerSched -->|exhausted: publish| dlq
 
-    producer --> sns
+    producer -->|publish / publish batch| sns
 ```
 
 Cross-cutting packages support this pipeline: `conn` builds the shared
@@ -374,32 +382,23 @@ nothing is the handler's responsibility.
 ### Architecture
 
 ```mermaid
-graph TD
-    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#232F3E;
-    classDef compute fill:#232F3E,stroke:#FF9900,stroke-width:2px,color:#FFFFFF;
-    classDef queue fill:#E2E3E5,stroke:#6C757D,stroke-width:2px,color:#232F3E;
-    classDef dlq fill:#F8D7DA,stroke:#DC3545,stroke-width:2px,color:#721C24;
-    classDef action fill:#D1E7DD,stroke:#0F5132,stroke-width:2px,color:#0F5132;
+%%{init: {"theme": "neutral"}}%%
+flowchart TB
+    prod([Producer service<br/>e.g. Checkout])
+    sns{{SNS FIFO topic<br/>order_created.fifo}}
+    entry[(Entry_Queue: SQS FIFO<br/>inventory_order_created.fifo)]
+    worker[loafer-awsx consumer]
+    ebs{{EventBridge Scheduler}}
+    dlq[(DLQ: SQS FIFO<br/>inventory_order_created_dlq.fifo)]
 
-    PROD[Producer service<br/>e.g. Checkout]:::compute
-    SNS{{SNS FIFO topic<br/>order_created.fifo}}:::aws
-    SQS[(Entry_Queue &mdash; SQS FIFO<br/>inventory_order_created.fifo)]:::queue
-    DLQ[(DLQ &mdash; SQS FIFO<br/>inventory_order_created_dlq.fifo)]:::dlq
-    WORKER[Consumer service<br/>loafer-awsx worker]:::compute
-    EBS((Amazon EventBridge<br/>Scheduler)):::aws
-    DEL{{Delete from Entry_Queue<br/>frees the MessageGroupId}}:::action
+    prod -->|1. publish event| sns
+    sns -->|2. deliver, raw delivery| entry
+    entry -->|3. poll batch| worker
 
-    PROD -->|1. Publish event| SNS
-    SNS -->|2. Route, raw delivery| SQS
-    SQS -->|3. Poll / read batch| WORKER
-
-    WORKER -->|4a. Success| DEL
-
-    WORKER -->|4b. Transient error:<br/>compute backoff, create schedule,<br/>retry_count + 1| EBS
-    EBS -.->|5. Fire time reached:<br/>re-publish to the queue| SQS
-    WORKER -.->|Delete original now<br/>to free the MessageGroupId| DEL
-
-    WORKER -->|4c. retry_count &gt; MaxRetryCount:<br/>publish directly to the DLQ| DLQ
+    worker -->|4a. error or backoff,<br/>retry_count + 1 &le; MaxRetryCount:<br/>create one-time schedule| ebs
+    worker -->|4b. error or backoff,<br/>retry_count + 1 &gt; MaxRetryCount:<br/>publish to the DLQ| dlq
+    worker -->|5. delete original on success,<br/>or after 4a / 4b succeeds:<br/>frees the MessageGroupId| entry
+    ebs -.->|6. fire time reached:<br/>re-publish with retry_count + 1| entry
 ```
 
 **Why this architecture.** A FIFO queue guarantees ordering within a
@@ -412,13 +411,15 @@ message can stall a whole stream of otherwise healthy work.
 
 The Scheduled Retry model breaks that coupling by moving the wait *out of the
 queue*. On failure the consumer hands the retry to EventBridge Scheduler (step
-4b) and immediately deletes the original message (step 5, the dashed
-delete-to-free edge). The `MessageGroupId` is unblocked right away, so the next
-message in the group is processed while the failed one waits — off-queue — for its
-backoff to elapse. When the schedule fires, EventBridge Scheduler re-publishes the
-message to the same Entry_Queue with an incremented `retry_count`, and the cycle
-repeats until the message either succeeds or exceeds `MaxRetryCount` and is routed
-straight to the DLQ (step 4c).
+4a) and, once the schedule exists, deletes the original message (step 5). The
+`MessageGroupId` is unblocked right away, so the next message in the group is
+processed while the failed one waits — off-queue — for its backoff to elapse.
+When the schedule fires, EventBridge Scheduler re-publishes the message to the
+same Entry_Queue with an incremented `retry_count` (step 6), and the cycle
+repeats until the message either succeeds or exceeds `MaxRetryCount` and is
+routed straight to the DLQ (step 4b). If creating the schedule or publishing to
+the DLQ fails, the original is not deleted and is redelivered after its
+visibility timeout.
 
 **Why it is efficient.**
 
@@ -753,21 +754,25 @@ treat these figures as a measure of framework cost, not real-world throughput.
 
 | Mode | Library | Time/op | Throughput | Allocs/op | Bytes/op |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Standard | `loafer-awsx` | ~5.4 µs | ~184k msg/s | 19 | 1,175 B |
-| Standard | `loafer-go` | ~9.3 µs | ~105k msg/s | 19 | 1,245 B |
-| FIFO | `loafer-awsx` | ~6.1 µs | ~165k msg/s | 22 | 1,518 B |
-| FIFO | `loafer-go` | ~9.9 µs | ~100k msg/s | 22 | 1,589 B |
+| Standard | `loafer-awsx` | ~5.6 µs | ~178k msg/s | 19 | 1,207 B |
+| Standard | `loafer-go` | ~8.5 µs | ~117k msg/s | 19 | 1,245 B |
+| FIFO | `loafer-awsx` | ~6.5 µs | ~154k msg/s | 22 | 1,557 B |
+| FIFO | `loafer-go` | ~8.7 µs | ~114k msg/s | 22 | 1,589 B |
 
-Medians of `-benchtime=2s -count=6` on an Intel Core i5-8265U (Go 1.26,
-`linux/amd64`). Absolute numbers are machine-specific; the relative gap is what
-matters, and both the code and methodology are reproducible.
+Medians of 24 samples (four runs of `-benchtime=2s -count=6`) on an Intel Core
+i5-8265U (Go 1.26, `linux/amd64`). Absolute numbers are machine-specific; the
+relative gap is what matters, and both the code and methodology are
+reproducible.
 
-Relative to `loafer-go`, on this run:
+Relative to `loafer-go`:
 
-- **Standard queue:** ~41% lower latency, ~70% higher throughput, ~6% less
+- **Standard queue:** ~34% lower latency, ~52% higher throughput, ~3% less
   memory per message, and the same number of allocations.
-- **FIFO queue:** ~38% lower latency, ~62% higher throughput, ~5% less memory
+- **FIFO queue:** ~26% lower latency, ~35% higher throughput, ~2% less memory
   per message, and the same number of allocations.
+
+The gap moved between runs (32–48% lower latency for standard, 25–36% for
+FIFO), but `loafer-awsx` was faster in every run.
 
 The benchmarks live in their own module under [`benchmarks/`](benchmarks) (kept
 separate so the competitor dependency never touches the library's `go.mod`). To
