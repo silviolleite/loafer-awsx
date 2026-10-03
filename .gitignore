@@ -123,9 +123,11 @@ Thumbs.db
 Desktop.ini
 
 # ---------------------------------------------------------------------------
-# Kiro (keep specs, ignore local steering/workflow config)
+# AI tooling (Claude config and specs are shared; personal overrides are not)
 # ---------------------------------------------------------------------------
-.kiro/steering/
+.claude/settings.local.json
+CLAUDE.local.md
+.kiro/
 
 # ---------------------------------------------------------------------------
 # Node (dev-only tooling: commitlint)
