@@ -25,6 +25,40 @@
 // WithSchedulerClient wires the client for routes that select the Scheduled
 // Retry model. The DLQ publish path reuses the SQSClient SendMessage operation.
 //
+// # Batched deletes
+//
+// By default every committed message is removed with its own synchronous
+// DeleteMessage call. A route configured with [router.WithDeleteBatch] instead
+// hands each committed receipt handle to a per-consumer Delete_Batcher, which
+// removes messages through DeleteMessageBatch requests. The committing worker
+// does not wait for the request to complete.
+//
+// Batches form opportunistically. The Delete_Batcher runs one sender goroutine
+// per worker; each sender blocks until a receipt handle arrives, takes whatever
+// other handles are already pending, up to the AWS limit of ten, without
+// waiting, and sends one request. No timer is used and no delay is ever added
+// to fill a batch, so batches grow only while earlier requests are in flight.
+// The pending-delete queue is bounded; when it is full, committing workers
+// block until a sender frees space, which applies backpressure to consumption.
+//
+// Each request is bounded by its own timeout. A failed request or a failed
+// entry is logged once per affected message and never retried: the message
+// becomes visible again after its visibility timeout and is redelivered.
+//
+// Batched deletes require an SQS client that also implements the optional
+// [BatchDeleteClient] interface; a concrete *sqs.Client does. The interface is
+// kept separate from [SQSClient] so existing implementations remain valid. When
+// the route enables batched deletes but the client does not implement it,
+// [Consumer.Run] fails fast with [errors.ErrDeleteBatchUnsupported] before
+// resolving the queue URL or starting any goroutine.
+//
+// On shutdown the pending deletes are flushed, not dropped. After ctx is
+// canceled and every worker has exited, the Delete_Batcher sends every
+// remaining receipt handle and waits for its senders to exit before
+// [Consumer.Run] returns. These final requests are not canceled by ctx; each
+// is still bounded by its own timeout, so a stalled request cannot block
+// shutdown indefinitely.
+//
 // # Metrics
 //
 // MetricsRecorder is a single observe-only interface, wired through WithMetrics,

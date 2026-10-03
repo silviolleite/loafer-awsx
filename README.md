@@ -34,9 +34,10 @@ functional options, and every component accepts the standard library
 6. [Client constructors](#client-constructors)
 7. [IAM permissions](#iam-permissions)
 8. [Scheduled Retry (FIFO)](#scheduled-retry-fifo)
-9. [Benchmarks](#benchmarks)
-10. [Acknowledgements](#acknowledgements)
-11. [License](#license)
+9. [Batched deletes](#batched-deletes)
+10. [Benchmarks](#benchmarks)
+11. [Acknowledgements](#acknowledgements)
+12. [License](#license)
 
 ---
 
@@ -203,8 +204,9 @@ easy to miss from signatures alone.
   profile, retry). Region is required.
 - **`router`** declares an immutable `Route` binding a queue to a handler, with
   options for worker-pool size, receive batching, long-poll wait, visibility
-  timeout and extension limit, run mode, route middleware, and DLQ
-  observability.
+  timeout and extension limit, run mode, route middleware, DLQ
+  observability, and batched deletes (`WithDeleteBatch()`, see
+  [Batched deletes](#batched-deletes)).
 - **`consumer`** and **`broker`** run the polling loop and orchestrate one
   consumer per route; both accept a `*slog.Logger`, a retry timeout, and
   middleware, and the broker adds a shutdown timeout.
@@ -308,7 +310,7 @@ permissions each client requires.
 | Action | Required by | Notes |
 | --- | --- | --- |
 | `sqs:ReceiveMessage` | Runtime (consumer poll) | On the Entry_Queue. |
-| `sqs:DeleteMessage` | Runtime | On the Entry_Queue. |
+| `sqs:DeleteMessage` | Runtime | On the Entry_Queue. Also authorizes `DeleteMessageBatch` (used by `router.WithDeleteBatch()`); no extra permission is needed. |
 | `sqs:ChangeMessageVisibility` | Runtime | Visibility extension during processing. |
 | `sqs:GetQueueUrl` | Runtime | Resolve the queue URL from its name. |
 | `sqs:SendMessage` | Runtime (Scheduled Retry only) | On the DLQ, to publish exhausted messages. |
@@ -620,6 +622,120 @@ The Scheduled model deliberately trades two FIFO guarantees for group liveness:
 - **Handler-owned success publishing.** On success the library only deletes the
   message and emits the success metric. Any success-side publishing (to a topic,
   an API, or elsewhere) is the handler's responsibility.
+
+---
+
+## Batched deletes
+
+By default the consumer removes each committed message with its own
+`DeleteMessage` call, issued by the worker that processed it. A route can opt in
+to removing committed messages through the SQS `DeleteMessageBatch` API instead:
+
+```go
+route, err := router.New("orders", handler,
+    router.WithDeleteBatch(),
+)
+```
+
+The option takes no arguments and combines with every run mode and both retry
+models. Routes without it keep the synchronous `DeleteMessage` path unchanged.
+
+### How batches form
+
+Batching is **opportunistic** and adds no delay. On a batched-delete route,
+every Commit (handler success, or under the Scheduled model a successful retry
+schedule or DLQ publish) hands the message's receipt handle to a per-route
+queue and the worker moves on to its next message. A set of Sender goroutines
+reads that queue. Each Sender blocks until a handle arrives, then takes
+whatever other handles are **already** queued, without waiting, up to the AWS
+limit of 10, and sends one `DeleteMessageBatch` request immediately.
+
+There is no linger timer and no receive-cycle flush. A batch grows only while
+earlier requests are in flight, so the only extra wait a delete can see is the
+duration of a request already in progress. Under light load most requests carry
+a single entry; as the delete rate rises, batches fill up.
+
+The set of messages that get deleted is identical with and without the option:
+handler errors, backoffs, held FIFO messages, and failed schedules or DLQ
+publishes are never committed. Success, retry, dead-letter, and observe-only DLQ
+signals are emitted under the same conditions on both paths. A failed delete
+(request error or a failed entry in the response) is logged once per message
+with `"failed to delete message"`, and the message reappears after its
+visibility timeout, as with `DeleteMessage`.
+
+Because the delete is asynchronous, the worker does not wait for it and cannot
+react to its failure. On a FIFO `PerGroupID` route, if the delete of message A
+fails, the next message B of the same group may already be processed, and A is
+delivered again after B. The synchronous path only logs a failed delete too, so
+the observable behavior is the same, but on a batched-delete route the library
+can never hold or fail the group in response to a failed delete.
+
+### When it pays off
+
+A batch request is billed as one request regardless of how many entries it
+carries, so the option cuts the number of delete requests by up to 10x. The
+savings depend on volume:
+
+- **High-volume queues.** At roughly $0.40 per million standard requests, the
+  best case saves about $36 per 100M messages per month. At low volume, batches
+  stay small and the savings are negligible. A route runs one Sender per worker,
+  and each Sender sends about one request per round trip, so batches start to
+  fill only when the delete rate exceeds `workers / RTT`. For example, 8 workers
+  with a 5 ms round trip reach about 1,600 deletes per second before batches
+  carry more than one entry. Below that rate, the option mainly takes the delete
+  round trip off the worker and does not reduce the number of requests.
+- **FIFO queues outside high-throughput mode.** These allow 300 API calls per
+  second per action. With synchronous deletes, `DeleteMessage` caps you near 300
+  messages per second; with batches of 10 the same quota covers up to 3,000.
+  Enable the option when a FIFO route's delete rate approaches that quota.
+
+Standard queues have nearly unlimited per-action throughput, so on them the
+option is a request-cost optimization only. See the
+[batched-delete benchmarks](#batched-delete-benchmarks) for measured request
+counts and throughput.
+
+### FIFO latency
+
+On FIFO queues SQS does not deliver the next message of a `MessageGroupId`
+until the in-flight one is deleted, so any delay before a delete adds directly
+to per-group latency. Opportunistic batching never waits for a fuller batch,
+and one group's delete never waits on another group's handler. The delete of a
+committed message is sent as soon as a Sender is free; the most it can wait is
+one delete request already in flight.
+
+### Client requirement
+
+`consumer.SQSClient` is unchanged. Batched deletes need a client that also
+implements `consumer.BatchDeleteClient` (the `DeleteMessageBatch` method).
+`*sqs.Client`, as returned by `client.NewSQS`, and `fake.SQSClient` already do.
+If a batched-delete route runs with a client that does not, `Consumer.Run` (and
+therefore the broker) fails fast with an error matching
+`errors.ErrDeleteBatchUnsupported`, before resolving the queue URL or starting
+any goroutine. It never falls back silently to single deletes.
+
+### Senders and backpressure
+
+Each batched-delete route runs one Sender per worker (`WithWorkerPoolSize`), so
+delete parallelism never drops below the synchronous path, where each worker
+issues its own delete. The pending-delete queue holds `WorkerPoolSize ×
+MaxMessages` receipt handles (50 with the defaults of 5 workers and 10
+messages). When it is full, a committing worker blocks until a Sender takes an
+entry, which keeps memory bounded and mirrors a worker blocking on its own
+`DeleteMessage`.
+
+### Shutdown and delivery guarantees
+
+On graceful shutdown the consumer keeps accepting deletes until every worker has
+exited, then sends every remaining pending delete before `Consumer.Run`
+returns. Delete requests use a context that is not canceled by the run context,
+and each request is bounded by a 5s timeout, so a stalled request cannot hang
+shutdown. No Sender goroutine survives `Run`.
+
+Because the delete is asynchronous to the worker, a message counts as handled
+before it is removed from the queue. If the process stops **without** a
+graceful shutdown (crash, `SIGKILL`), queued and in-flight deletes are lost and
+those messages are redelivered after their visibility timeout. This stays
+within the library's at-least-once contract: handlers must be **idempotent**.
 
 ---
 

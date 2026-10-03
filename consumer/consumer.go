@@ -75,13 +75,21 @@ func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, erro
 // Run resolves the queue URL, starts the worker pool, and enters the polling
 // loop until ctx is canceled.
 //
-// It fails fast: if the queue URL cannot be resolved Run returns immediately
-// with an error wrapping errors.ErrQueueResolve and never starts any goroutine.
+// It fails fast, before resolving the queue URL and without starting any
+// goroutine, with errors.ErrNoSchedulerClient when a Scheduled-model route has
+// no scheduler client, and with errors.ErrDeleteBatchUnsupported when the route
+// enables router.WithDeleteBatch but the SQS client does not implement
+// BatchDeleteClient. If the queue URL cannot be resolved Run returns
+// immediately with an error wrapping errors.ErrQueueResolve and never starts
+// any goroutine.
+//
 // Once polling starts, a receive error is logged and retried after the
 // configured retry timeout, with the wait honoring ctx cancellation. On ctx
 // cancellation Run stops polling, tears down the dispatcher (closing the worker
 // channels and waiting for all in-flight messages and visibility goroutines to
-// finish), and returns nil for a clean shutdown.
+// finish), and returns nil for a clean shutdown. On a batched-delete route the
+// teardown also sends every pending delete, each request bounded by its own
+// timeout and unaffected by ctx cancellation, before Run returns.
 func (c *Consumer) Run(ctx context.Context) error {
 	scheduled := c.route.RetryModel() == router.ScheduledRetryModel
 
@@ -90,6 +98,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 	// goroutine: consumption must never begin in this misconfiguration.
 	if scheduled && c.schedulerClient == nil {
 		return errors.ErrNoSchedulerClient
+	}
+
+	batchClient, err := c.batchDeleteClient()
+	if err != nil {
+		return err
 	}
 
 	queueURL, err := c.resolveQueueURL(ctx)
@@ -112,12 +125,37 @@ func (c *Consumer) Run(ctx context.Context) error {
 	// owns, so a single recorder is wired unconditionally.
 	d.metrics = c.metrics
 
+	// Senders get a context detached from ctx so deletes committed while the
+	// workers drain during shutdown are still sent; dispatcher.stop closes the
+	// batcher only after every worker has exited.
+	if batchClient != nil {
+		d.batcher = newDeleteBatcher(batchClient, queueURL, d.workerPoolSize*d.bufferSize, c.log)
+		d.batcher.start(context.WithoutCancel(ctx), d.workerPoolSize)
+	}
+
 	d.start(ctx)
 	defer d.stop()
 
 	c.poll(ctx, queueURL, d)
 
 	return nil
+}
+
+// batchDeleteClient returns the SQS client as a BatchDeleteClient when the route
+// enables batched deletes, and nil when it does not. It returns
+// errors.ErrDeleteBatchUnsupported when the route enables batched deletes but
+// the client does not implement DeleteMessageBatch.
+func (c *Consumer) batchDeleteClient() (BatchDeleteClient, error) {
+	if !c.route.DeleteBatch() {
+		return nil, nil
+	}
+
+	bc, ok := c.client.(BatchDeleteClient)
+	if !ok {
+		return nil, errors.ErrDeleteBatchUnsupported
+	}
+
+	return bc, nil
 }
 
 // resolveQueueURL looks up the route queue URL by name. Any failure, including a

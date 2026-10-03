@@ -31,10 +31,11 @@ type Route struct {
 	workerPoolSize    int
 	extensionLimit    int
 	runMode           Mode
+	retryModel        RetryModel
 	maxMessages       int32
 	waitTimeSeconds   int32
 	visibilityTimeout int32
-	retryModel        RetryModel
+	deleteBatch       bool
 }
 
 // Option configures a Route. Options are applied in order and may return an
@@ -149,4 +150,9 @@ func (r *Route) RetryModel() RetryModel {
 // route uses the Visibility model.
 func (r *Route) ScheduledRetry() *ScheduledRetryConfig {
 	return r.scheduledRetry
+}
+
+// DeleteBatch reports whether batched deletes are enabled for the route.
+func (r *Route) DeleteBatch() bool {
+	return r.deleteBatch
 }

@@ -42,6 +42,12 @@ const (
 // the outcome (delete on success, leave on error, change visibility on
 // backoff).
 //
+// On a route without batched deletes, batcher is nil and every Commit is a
+// synchronous DeleteMessage issued from the worker. On a route configured with
+// router.WithDeleteBatch, batcher is set before start and every Commit hands the
+// receipt handle to the deleteBatcher, whose Senders remove it through
+// DeleteMessageBatch.
+//
 // A dispatcher is created with newDispatcher, started with start, fed with
 // dispatch, and torn down with stop. start, dispatch, and stop must be called
 // from a single goroutine (the polling loop); the worker and visibility
@@ -55,6 +61,7 @@ type dispatcher struct {
 	metrics           MetricsRecorder
 	retryScheduler    *retryScheduler
 	dlqPublisher      *dlqPublisher
+	batcher           *deleteBatcher
 	scheduledRetry    *router.ScheduledRetryConfig
 	queueURL          string
 	queueName         string
@@ -166,14 +173,23 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *message) {
 }
 
 // stop closes every worker channel and waits for all worker and visibility
-// goroutines to finish. After stop returns no goroutine started by the
-// dispatcher remains, satisfying the leak-free guarantee. stop must be called
-// exactly once after the polling loop stops feeding dispatch.
+// goroutines to finish. When batched deletes are enabled it then closes the
+// deleteBatcher, which sends every remaining Pending_Delete and waits for its
+// Senders to exit. The batcher is closed only after every worker has exited, so
+// commits made while workers drain their channels during shutdown are still
+// accepted and no enqueue can happen after the close. After stop returns no
+// goroutine started by the dispatcher or its batcher remains, satisfying the
+// leak-free guarantee. stop must be called exactly once after the polling loop
+// stops feeding dispatch.
 func (d *dispatcher) stop() {
 	for _, ch := range d.channels {
 		close(ch)
 	}
 	d.wg.Wait()
+
+	if d.batcher != nil {
+		d.batcher.close()
+	}
 }
 
 // worker drains ch, processing each message in turn until the channel is closed.
@@ -396,9 +412,20 @@ func receiveCount(msg *message) int {
 	return n
 }
 
-// deleteMessage removes msg from the queue. A failure is logged at Error level
-// and swallowed so a transient API error never crashes the worker.
+// deleteMessage commits msg, removing it from the queue. When batched deletes
+// are enabled it hands the receipt handle to the deleteBatcher and returns
+// without waiting for the delete to complete; it blocks only while the
+// Pending_Delete queue is full. Delete failures on that path are logged by the
+// batcher. Otherwise it issues a synchronous DeleteMessage; a failure is logged
+// at Error level and swallowed so a transient API error never crashes the
+// worker. Either way a failed delete leaves the message in the queue for
+// redelivery after its visibility timeout.
 func (d *dispatcher) deleteMessage(ctx context.Context, msg *message) {
+	if d.batcher != nil {
+		d.batcher.enqueue(msg.Identifier())
+		return
+	}
+
 	_, err := d.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(d.queueURL),
 		ReceiptHandle: aws.String(msg.Identifier()),

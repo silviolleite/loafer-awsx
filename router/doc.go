@@ -42,4 +42,14 @@
 // routes using the Visibility model. Selecting WithScheduledRetry together with
 // the observe-only WithDLQ on the same route is a configuration error,
 // regardless of the order the options are applied.
+//
+// # Batched deletes
+//
+// WithDeleteBatch enables batched deletes for a route: committed messages are
+// removed through SQS DeleteMessageBatch requests formed opportunistically from
+// the deletes already pending, without adding any delay to wait for a fuller
+// batch. The option is off by default. The route's SQS client must implement
+// consumer.BatchDeleteClient, as *sqs.Client does; otherwise the consumer fails
+// fast with errors.ErrDeleteBatchUnsupported. See the consumer package
+// documentation for how batches form, failure handling, and the shutdown flush.
 package router

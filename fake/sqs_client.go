@@ -5,19 +5,25 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/silviolleite/loafer-awsx/consumer"
 )
 
-// Compile-time assertion that SQSClient satisfies the consumer.SQSClient
-// interface.
-var _ consumer.SQSClient = (*SQSClient)(nil)
+// Compile-time assertions that SQSClient satisfies the consumer.SQSClient and
+// consumer.BatchDeleteClient interfaces.
+var (
+	_ consumer.SQSClient         = (*SQSClient)(nil)
+	_ consumer.BatchDeleteClient = (*SQSClient)(nil)
+)
 
-// SQSClient is a configurable test double for the consumer.SQSClient interface.
-// Each method delegates to a corresponding function field, letting tests
-// program the response (or error) for every call. When a function field is nil
-// the method returns a nil output and a nil error. Every call is recorded so
-// tests can assert on the parameters the code under test sent.
+// SQSClient is a configurable test double for the consumer.SQSClient and
+// consumer.BatchDeleteClient interfaces. Each method delegates to a
+// corresponding function field, letting tests program the response (or error)
+// for every call. When a function field is nil the method returns a nil output
+// and a nil error, except DeleteMessageBatch, which reports every entry as
+// successful. Every call is recorded so tests can assert on the parameters the
+// code under test sent.
 //
 // SQSClient is safe for concurrent use; the recorded call slices are guarded by
 // an internal mutex.
@@ -27,11 +33,13 @@ type SQSClient struct {
 	ChangeMessageVisibilityFunc  func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
 	GetQueueUrlFunc              func(ctx context.Context, params *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
 	SendMessageFunc              func(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+	DeleteMessageBatchFunc       func(ctx context.Context, params *sqs.DeleteMessageBatchInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error)
 	receiveMessageCalls          []*sqs.ReceiveMessageInput
 	deleteMessageCalls           []*sqs.DeleteMessageInput
 	changeMessageVisibilityCalls []*sqs.ChangeMessageVisibilityInput
 	getQueueURLCalls             []*sqs.GetQueueUrlInput
 	sendMessageCalls             []*sqs.SendMessageInput
+	deleteMessageBatchCalls      []*sqs.DeleteMessageBatchInput
 	mu                           sync.Mutex
 }
 
@@ -101,6 +109,33 @@ func (c *SQSClient) SendMessage(ctx context.Context, params *sqs.SendMessageInpu
 	return nil, nil
 }
 
+// DeleteMessageBatch records the call and delegates to DeleteMessageBatchFunc.
+// When the function is not set it returns an output that lists the Id of every
+// entry in Successful, and a nil error.
+func (c *SQSClient) DeleteMessageBatch(
+	ctx context.Context,
+	params *sqs.DeleteMessageBatchInput,
+	optFns ...func(*sqs.Options),
+) (*sqs.DeleteMessageBatchOutput, error) {
+	c.mu.Lock()
+	c.deleteMessageBatchCalls = append(c.deleteMessageBatchCalls, params)
+	c.mu.Unlock()
+
+	if c.DeleteMessageBatchFunc != nil {
+		return c.DeleteMessageBatchFunc(ctx, params, optFns...)
+	}
+
+	out := &sqs.DeleteMessageBatchOutput{}
+	if params == nil {
+		return out, nil
+	}
+	out.Successful = make([]types.DeleteMessageBatchResultEntry, 0, len(params.Entries))
+	for _, entry := range params.Entries {
+		out.Successful = append(out.Successful, types.DeleteMessageBatchResultEntry{Id: entry.Id})
+	}
+	return out, nil
+}
+
 // ReceiveMessageCalls returns a copy of the inputs passed to ReceiveMessage, in
 // call order.
 func (c *SQSClient) ReceiveMessageCalls() []*sqs.ReceiveMessageInput {
@@ -148,5 +183,15 @@ func (c *SQSClient) SendMessageCalls() []*sqs.SendMessageInput {
 	defer c.mu.Unlock()
 	out := make([]*sqs.SendMessageInput, len(c.sendMessageCalls))
 	copy(out, c.sendMessageCalls)
+	return out
+}
+
+// DeleteMessageBatchCalls returns a copy of the inputs passed to
+// DeleteMessageBatch, in call order.
+func (c *SQSClient) DeleteMessageBatchCalls() []*sqs.DeleteMessageBatchInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*sqs.DeleteMessageBatchInput, len(c.deleteMessageBatchCalls))
+	copy(out, c.deleteMessageBatchCalls)
 	return out
 }

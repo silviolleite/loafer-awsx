@@ -193,6 +193,41 @@ func TestWithOnDLQNilKeepsCallbackUnset(t *testing.T) {
 	assert.Nil(t, r.DLQ().OnDLQ)
 }
 
+func TestWithDeleteBatch(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []router.Option
+		want bool
+	}{
+		{name: "default disabled", opts: nil, want: false},
+		{name: "option enables", opts: []router.Option{router.WithDeleteBatch()}, want: true},
+		{name: "with scheduled retry", opts: []router.Option{router.WithDeleteBatch(), validScheduledRetry()}, want: true},
+		{name: "scheduled retry first", opts: []router.Option{validScheduledRetry(), router.WithDeleteBatch()}, want: true},
+		{name: "with dlq", opts: []router.Option{router.WithDeleteBatch(), router.WithDLQ(3)}, want: true},
+		{name: "with per group id", opts: []router.Option{router.WithRunMode(router.PerGroupID), router.WithDeleteBatch()}, want: true},
+		{name: "with parallel", opts: []router.Option{router.WithRunMode(router.Parallel), router.WithDeleteBatch()}, want: true},
+		{
+			name: "with visibility retry model",
+			opts: []router.Option{router.WithRetryModel(router.VisibilityRetryModel), router.WithDeleteBatch()},
+			want: true,
+		},
+		{
+			name: "with per group id and scheduled retry",
+			opts: []router.Option{router.WithRunMode(router.PerGroupID), validScheduledRetry(), router.WithDeleteBatch()},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := router.New("orders", noopHandler, tt.opts...)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, r.DeleteBatch())
+		})
+	}
+}
+
 func TestModeString(t *testing.T) {
 	tests := []struct {
 		name string

@@ -175,6 +175,17 @@ Consumes `example-basic-queue` with a simple handler that JSON-decodes each
 message body and logs it. Publish messages to it via the standard topic with
 `make run-producer`.
 
+> **High-volume routes:** add `router.WithDeleteBatch()` to the route options
+> (a commented-out line is already in `basic/main.go`) to delete committed
+> messages with opportunistic `DeleteMessageBatch` requests instead of one
+> `DeleteMessage` call per message. Deletes that queue up while earlier requests
+> are in flight are sent together, and no delay is added to wait for a fuller
+> batch. The option works on standard and FIFO routes and requires an SQS client
+> that implements `consumer.BatchDeleteClient`; `*sqs.Client` (and the client
+> returned by `client.NewSQS`) does. Otherwise the consumer fails at startup
+> with `errors.ErrDeleteBatchUnsupported`. No new IAM permission is needed:
+> `DeleteMessageBatch` is authorized by `sqs:DeleteMessage`.
+
 ### FIFO
 
 ```bash

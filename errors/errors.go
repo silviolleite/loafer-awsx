@@ -48,6 +48,10 @@ var (
 	// ErrPingFailed indicates that a client connectivity validation (Ping) did not
 	// succeed within its timeout and retry budget during construction.
 	ErrPingFailed = New("connectivity ping failed")
+	// ErrDeleteBatchUnsupported indicates that a route enabled batched deletes
+	// but its SQS client does not implement DeleteMessageBatch; the consumer
+	// must not begin consuming.
+	ErrDeleteBatchUnsupported = New("sqs client does not support DeleteMessageBatch")
 )
 
 // New returns a new error that formats as the given text. It is a thin wrapper

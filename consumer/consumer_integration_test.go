@@ -471,3 +471,129 @@ func TestIntegrationScheduledExhaustedGoesToDLQ(t *testing.T) {
 	stopConsumer(t, cancel, done)
 	assert.Empty(t, sched.CreateScheduleCalls())
 }
+
+type countingSQSClient struct {
+	*sqs.Client
+	deletes      atomic.Int64
+	batches      atomic.Int64
+	batchEntries atomic.Int64
+}
+
+func (c *countingSQSClient) DeleteMessage(
+	ctx context.Context,
+	params *sqs.DeleteMessageInput,
+	optFns ...func(*sqs.Options),
+) (*sqs.DeleteMessageOutput, error) {
+	c.deletes.Add(1)
+	return c.Client.DeleteMessage(ctx, params, optFns...)
+}
+
+func (c *countingSQSClient) DeleteMessageBatch(
+	ctx context.Context,
+	params *sqs.DeleteMessageBatchInput,
+	optFns ...func(*sqs.Options),
+) (*sqs.DeleteMessageBatchOutput, error) {
+	c.batches.Add(1)
+	c.batchEntries.Add(int64(len(params.Entries)))
+	return c.Client.DeleteMessageBatch(ctx, params, optFns...)
+}
+
+func TestIntegrationDeleteBatchRemovesMessages(t *testing.T) {
+	const (
+		total  = 25
+		groups = 5
+	)
+
+	tests := []struct {
+		create    func(*testing.T, *sqs.Client) string
+		group     func(int) string
+		routeOpts []router.Option
+		name      string
+		fifo      bool
+	}{
+		{
+			name:   "standard queue",
+			create: createStandardQueue,
+			group:  func(int) string { return "" },
+		},
+		{
+			name:      "fifo queue",
+			create:    createFIFOQueue,
+			group:     func(seq int) string { return fmt.Sprintf("group-%d", seq%groups) },
+			routeOpts: []router.Option{router.WithRunMode(router.PerGroupID)},
+			fifo:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newSQSClient(t)
+			url := tt.create(t, client)
+			name := queueNameFromURL(t, client, url)
+
+			var mu sync.Mutex
+			seen := map[int]int{}
+			order := map[string][]int{}
+			handler := func(_ context.Context, msg middleware.Message) error {
+				var payload struct {
+					Seq int `json:"seq"`
+				}
+				if err := msg.Decode(&payload); err != nil {
+					return err
+				}
+				mu.Lock()
+				seen[payload.Seq]++
+				group := tt.group(payload.Seq)
+				order[group] = append(order[group], payload.Seq)
+				mu.Unlock()
+				return nil
+			}
+
+			for seq := range total {
+				sendMessage(t, client, url, map[string]int{"seq": seq}, tt.group(seq))
+			}
+
+			opts := append([]router.Option{
+				router.WithWaitTimeSeconds(1),
+				router.WithVisibilityTimeout(30),
+				router.WithWorkerPoolSize(5),
+				router.WithMaxMessages(10),
+				router.WithDeleteBatch(),
+			}, tt.routeOpts...)
+			route := itNewRoute(t, name, handler, opts...)
+			counting := &countingSQSClient{Client: client}
+			cancel, done := runConsumer(t, counting, route)
+
+			require.Eventually(t, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(seen) == total
+			}, 45*time.Second, 250*time.Millisecond)
+			waitQueueDrained(t, client, url)
+
+			stopConsumer(t, cancel, done)
+
+			assert.Zero(t, counting.deletes.Load())
+			assert.GreaterOrEqual(t, counting.batches.Load(), int64(1))
+
+			mu.Lock()
+			defer mu.Unlock()
+			require.Len(t, seen, total)
+			if !tt.fifo {
+				assert.GreaterOrEqual(t, counting.batchEntries.Load(), int64(total))
+				for seq := range total {
+					assert.GreaterOrEqual(t, seen[seq], 1, "seq %d", seq)
+				}
+				return
+			}
+			assert.Equal(t, int64(total), counting.batchEntries.Load())
+			for seq := range total {
+				assert.Equal(t, 1, seen[seq], "seq %d", seq)
+			}
+			require.Len(t, order, groups)
+			for group, seqs := range order {
+				assert.IsIncreasing(t, seqs, "group %s", group)
+			}
+		})
+	}
+}

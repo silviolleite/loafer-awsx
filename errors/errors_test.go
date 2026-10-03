@@ -35,6 +35,7 @@ func TestSentinels(t *testing.T) {
 		{"ErrDLQPublish", liberrors.ErrDLQPublish, "failed to publish to dead-letter queue"},
 		{"ErrScheduledRetryConfig", liberrors.ErrScheduledRetryConfig, "invalid scheduled retry configuration"},
 		{"ErrPingFailed", liberrors.ErrPingFailed, "connectivity ping failed"},
+		{"ErrDeleteBatchUnsupported", liberrors.ErrDeleteBatchUnsupported, "sqs client does not support DeleteMessageBatch"},
 	}
 
 	for _, tt := range tests {
@@ -65,6 +66,7 @@ func TestSentinelsAreDistinct(t *testing.T) {
 		liberrors.ErrDLQPublish,
 		liberrors.ErrScheduledRetryConfig,
 		liberrors.ErrPingFailed,
+		liberrors.ErrDeleteBatchUnsupported,
 	}
 
 	for i := range all {
@@ -77,13 +79,14 @@ func TestSentinelsAreDistinct(t *testing.T) {
 	}
 }
 
-func TestScheduledRetrySentinelsMatchThroughWrap(t *testing.T) {
+func TestSentinelsMatchThroughWrap(t *testing.T) {
 	cause := stderrors.New("boom")
 
 	sentinels := []error{
 		liberrors.ErrRetryScheduleCreate,
 		liberrors.ErrDLQPublish,
 		liberrors.ErrScheduledRetryConfig,
+		liberrors.ErrDeleteBatchUnsupported,
 	}
 
 	for _, sentinel := range sentinels {

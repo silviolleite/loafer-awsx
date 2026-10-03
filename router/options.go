@@ -168,6 +168,18 @@ func WithDLQ(maxReceiveCount int, opts ...DLQOption) Option {
 	}
 }
 
+// WithDeleteBatch enables batched deletes for the route. Committed messages are
+// removed through DeleteMessageBatch requests formed opportunistically: deletes
+// that queue up while earlier requests are in flight are sent together, and no
+// delay is ever added to wait for a fuller batch. The SQS client must implement
+// consumer.BatchDeleteClient; *sqs.Client does.
+func WithDeleteBatch() Option {
+	return func(r *Route) error {
+		r.deleteBatch = true
+		return nil
+	}
+}
+
 // WithRetryModel sets the per-route retry model. The value must be exactly one
 // of VisibilityRetryModel or ScheduledRetryModel; any other value is rejected at
 // construction with an error wrapping errors.ErrScheduledRetryConfig that

@@ -28,6 +28,19 @@ type SQSClient interface {
 	SendMessage(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
 }
 
+// BatchDeleteClient is implemented by SQS clients that support DeleteMessageBatch.
+// It is required only by routes configured with router.WithDeleteBatch; a
+// concrete *sqs.Client satisfies it. It is kept separate from SQSClient so that
+// existing SQSClient implementations remain valid.
+type BatchDeleteClient interface {
+	// DeleteMessageBatch deletes up to ten messages from the specified queue.
+	DeleteMessageBatch(
+		ctx context.Context,
+		params *sqs.DeleteMessageBatchInput,
+		optFns ...func(*sqs.Options),
+	) (*sqs.DeleteMessageBatchOutput, error)
+}
+
 // SchedulerClient defines the minimal EventBridge Scheduler surface the
 // consumer relies on for the Scheduled Retry model. It mirrors the
 // aws-sdk-go-v2 scheduler.Client method signatures so a concrete
@@ -45,6 +58,7 @@ type SchedulerClient interface {
 // Compile-time assertions that the concrete aws-sdk-go-v2 clients satisfy the
 // consumer's client interfaces.
 var (
-	_ SQSClient       = (*sqs.Client)(nil)
-	_ SchedulerClient = (*scheduler.Client)(nil)
+	_ SQSClient         = (*sqs.Client)(nil)
+	_ BatchDeleteClient = (*sqs.Client)(nil)
+	_ SchedulerClient   = (*scheduler.Client)(nil)
 )

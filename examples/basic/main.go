@@ -70,6 +70,13 @@ func main() {
 	// Step 3: declare the route. router.New binds a queue name to a handler and
 	// seeds sensible defaults (worker pool size, batch size, long-poll wait,
 	// and visibility timeout), so a route needs no extra options to work.
+	//
+	// For high-volume routes, add router.WithDeleteBatch() (swap in the
+	// commented-out line below) to remove committed messages with opportunistic
+	// DeleteMessageBatch requests instead of one DeleteMessage call per message.
+	// The client from client.NewSQS supports it.
+	//
+	// route, err := router.New(queueName, handleMessage, router.WithDeleteBatch())
 	route, err := router.New(queueName, handleMessage)
 	if err != nil {
 		log.Fatalf("failed to create route: %v", err)
