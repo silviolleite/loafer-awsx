@@ -157,8 +157,8 @@ you interrupt them with `Ctrl+C`; the producer runs once and exits.
 | `make run-fifo` | FIFO queue `example-fifo-queue.fifo` | ✅ yes |
 | `make run-fifo-scheduled-retry` | FIFO queue `example-scheduled.fifo` (+ DLQ) | ✅ yes — but EventBridge Scheduler is mock-only on LocalStack; see note below |
 | `make run-localscheduler` | fires schedules → SQS `example-scheduled.fifo` | ✅ yes — LocalStack demo helper; see note below |
-| `make run-typed` | queue `example-typed-queue` | ⚠️ **no** — see note below |
-| `make run-middleware` | queue `example-middleware-queue` | ⚠️ **no** — see note below |
+| `make run-typed` | queue `example-typed-queue` | ✅ yes |
+| `make run-middleware` | queue `example-middleware-queue` | ✅ yes |
 | `make run-producer` | topics `example-standard-topic`, `example-fifo-topic.fifo`, `example-scheduled-topic.fifo` | ✅ yes |
 
 Equivalent manual commands (from `examples/`): `go run ./basic`, `go run ./fifo`,
@@ -314,12 +314,8 @@ make run-typed
 Consumes `example-typed-queue` and decodes each body into an `OrderPlaced`
 struct via `typed.JSONCodec`.
 
-> **Note:** `example-typed-queue` is **not** created by the current Terraform
-> config. Create it yourself (for example
-> `aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name example-typed-queue`),
-> add it to the Terraform config, or change `queueName` in
-> [`typed/main.go`](./typed/main.go) to an existing queue such as
-> `example-basic-queue` before running.
+`make provision` creates `example-typed-queue` and subscribes it to
+`example-orders-topic`, so `make run-producer` delivers an order to it.
 
 ### Middleware
 
@@ -333,10 +329,8 @@ metrics at <http://localhost:9090/metrics> and exports OpenTelemetry spans over
 OTLP to an OpenTelemetry Collector, which forwards them to Jaeger for viewing at
 <http://localhost:16686>.
 
-> **Note:** `example-middleware-queue` is **not** created by the current
-> Terraform config. Create it, add it to the Terraform config, or point
-> `queueName` in [`middleware/main.go`](./middleware/main.go) at an existing
-> queue before running.
+`make provision` creates `example-middleware-queue` and subscribes it to
+`example-standard-topic`, so `make run-producer` delivers messages to it.
 
 #### Tracing backend: OpenTelemetry Collector + Jaeger
 
