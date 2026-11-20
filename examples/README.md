@@ -1,8 +1,8 @@
 # loafer-awsx Examples
 
 Runnable examples for the loafer-awsx library, wired to run locally against
-[LocalStack](https://www.localstack.cloud/) with infrastructure provisioned by
-the Terraform config in [`terraform/`](./terraform).
+[MiniStack](https://ministack.org) (a free, MIT-licensed AWS emulator) with
+infrastructure provisioned by the Terraform config in [`terraform/`](./terraform).
 
 Each example is a standalone `package main` under this directory:
 
@@ -11,24 +11,23 @@ Each example is a standalone `package main` under this directory:
 | Basic | [`basic/`](./basic) | Standard SQS queue consumption with a simple handler. |
 | FIFO | [`fifo/`](./fifo) | Ordered consumption in `PerGroupID` mode with custom group fields. |
 | FIFO Scheduled Retry | [`fifo-scheduled-retry/`](./fifo-scheduled-retry) | FIFO route using `WithScheduledRetry` (scheduler identity, DLQ, max retry count, backoff) wired with `WithSchedulerClient` and a failing handler. |
-| Local Scheduler Simulator | [`localscheduler/`](./localscheduler) | LocalStack-only helper that fires the retry schedules EventBridge Scheduler would fire, closing the scheduled-retry loop locally. |
+| Local Scheduler Simulator | [`localscheduler/`](./localscheduler) | Local-only helper that fires the retry schedules MiniStack's Scheduler cannot invoke (universal `sqs:sendMessage` target), closing the scheduled-retry loop locally. |
 | Typed | [`typed/`](./typed) | Generic, type-safe message handling via `typed.WrapHandler` + `typed.JSONCodec`. |
 | Middleware | [`middleware/`](./middleware) | Recovery, logging, Prometheus metrics, and OpenTelemetry tracing middleware (OTLP → OTel Collector → Jaeger). |
 | Producer | [`producer/`](./producer) | Single and batch publishing to standard and FIFO SNS topics. |
 
 ## Prerequisites
 
-- **Docker** (with the `docker compose` plugin) — runs LocalStack.
+- **Docker** (with the `docker compose` plugin) — runs MiniStack.
 - **Terraform** `>= 1.3` — provisions the SQS queues, SNS topics, and subscriptions.
 - **Go** `1.26+` — builds and runs the example programs.
-- **curl** — used by the `make up` health check.
 
 ## Quick start
 
 From this `examples/` directory:
 
 ```bash
-make up          # start LocalStack and wait until SQS + SNS are ready
+make up          # start MiniStack and wait until its healthcheck passes
 make provision   # terraform init + apply (creates queues, topics, subscriptions)
 make run-basic   # run an example (Ctrl+C to stop a consumer)
 ```
@@ -37,19 +36,20 @@ When you are done:
 
 ```bash
 make destroy     # tear down the Terraform-managed resources
-make down        # stop LocalStack (use `make down-clean` to also drop its volume)
+make down        # stop MiniStack (use `make down-clean` to also drop its state volume)
 ```
 
 Run `make help` to see every available target.
 
-## 1. Bring up LocalStack
+## 1. Bring up MiniStack
 
-The examples use the existing Docker Compose file at
+The examples use the Docker Compose file at
 [`terraform/docker-compose.yml`](./terraform/docker-compose.yml), which starts a
-LocalStack container named `loafer-awsx-localstack` exposing SQS and SNS on
-`127.0.0.1:4566`.
+MiniStack container named `loafer-awsx-ministack` emulating SQS, SNS, IAM and
+EventBridge Scheduler on `127.0.0.1:4566`.
 
-Using the Makefile (recommended — it waits for the services to become healthy):
+Using the Makefile (recommended — it blocks until the image healthcheck passes
+and fails after 60 seconds otherwise):
 
 ```bash
 make up
@@ -58,13 +58,15 @@ make up
 Or manually:
 
 ```bash
-docker compose -f terraform/docker-compose.yml up -d
-# wait until SQS + SNS report "available":
-curl -s http://localhost:4566/_localstack/health
+docker compose -f terraform/docker-compose.yml up -d --wait
+curl -s http://localhost:4566/_ministack/health   # version, edition, services
 ```
 
-Stop it with `make down` (keeps the data volume) or `make down-clean`
-(`docker compose ... down -v`, which also removes the LocalStack data volume).
+MiniStack persists its state (`PERSIST_STATE=1`) to the `ministack-data` volume,
+so the resources Terraform provisioned survive `make down` followed by
+`make up`. `make down-clean` (`docker compose ... down -v`) removes the volume
+and starts the next `make up` empty; run `make provision` again after it (Terraform
+recreates whatever is missing).
 
 ## 2. Provision resources with Terraform
 
@@ -82,18 +84,26 @@ consumer and producer examples expect:
 - IAM execution role `example-scheduler-role` (assumed by EventBridge Scheduler)
   — gated behind `enable_scheduler_resources`, which defaults to `true`
 
-> The bundled [`docker-compose.yml`](./terraform/docker-compose.yml) enables the
-> `iam` and `scheduler` services (`SERVICES=sqs,sns,iam,scheduler`), so
-> `make provision` creates the IAM role too. If you run against a LocalStack
-> instance that does not expose IAM (an older `SERVICES=sqs,sns` setup returns a
-> 501 on `CreateRole`), disable the role with
+> MiniStack implements IAM, so `make provision` creates the IAM role too. If you
+> point the config at an endpoint that does not expose IAM, disable the role with
 > `TF_VAR_enable_scheduler_resources=false make provision`.
 >
-> **LocalStack's EventBridge Scheduler is mock-only:** `CreateSchedule` succeeds
-> but the schedule never actually fires to re-publish the message to the target
-> SQS queue. Against LocalStack you can observe the schedule-created,
-> delete-original, and retry-metric path, but the real re-delivery and DLQ loop
-> only happen against real AWS.
+> **MiniStack's EventBridge Scheduler fires schedules, with one gap:** it
+> invokes templated targets (an SQS queue ARN, an SNS topic ARN, …) but not the
+> universal `arn:aws:scheduler:::aws-sdk:sqs:sendMessage` target the library uses
+> for retry schedules. It drops that invocation and, since retry schedules use
+> `ActionAfterCompletion = DELETE`, deletes the schedule. Run the
+> [local scheduler simulator](#local-scheduler-simulator) to close the retry
+> loop locally; against real AWS the loop closes by itself.
+>
+> This is a gap in MiniStack only, not in loafer-awsx, and it can be fixed
+> upstream with an issue or a pull request to
+> [ministackorg/ministack](https://github.com/ministackorg/ministack). Once
+> MiniStack invokes the universal `sqs:sendMessage` target, loafer-awsx
+> reproduces the full scheduled-retry behavior locally, and
+> `make run-localscheduler` is no longer needed. At that point, stop running it,
+> because it disables the retry schedules it claims, which would keep MiniStack
+> from firing them.
 
 Using the Makefile:
 
@@ -114,7 +124,7 @@ Tear it down with `make destroy` (or `cd terraform && terraform destroy -auto-ap
 ## 3. Environment variables and configuration
 
 The example programs **do not read environment variables**. For simplicity they
-hardcode LocalStack-friendly values in each `main.go`:
+hardcode MiniStack-friendly values in each `main.go`:
 
 | Setting | Hardcoded value | Where |
 | --- | --- | --- |
@@ -123,7 +133,7 @@ hardcode LocalStack-friendly values in each `main.go`:
 | Endpoint | `http://localhost:4566` | all examples |
 | Account ID | `000000000000` | producer (used to build topic ARNs) |
 
-These match the LocalStack-friendly defaults in
+These match the MiniStack-friendly defaults in
 [`terraform/variables.tf`](./terraform/variables.tf), so no overrides are needed
 for local development.
 
@@ -134,7 +144,7 @@ real AWS account or a different region, override the variables via `-var`, a
 ```bash
 export TF_VAR_region=eu-west-1
 export TF_VAR_account_id=123456789012
-export TF_VAR_localstack_endpoint=""   # omit the endpoint override for real AWS
+export TF_VAR_endpoint=""   # omit the endpoint override for real AWS
 ```
 
 **To point the example programs at real AWS**, edit the connection options in the
@@ -155,10 +165,10 @@ you interrupt them with `Ctrl+C`; the producer runs once and exits.
 | --- | --- | --- |
 | `make run-basic` | queue `example-basic-queue` | ✅ yes |
 | `make run-fifo` | FIFO queue `example-fifo-queue.fifo` | ✅ yes |
-| `make run-fifo-scheduled-retry` | FIFO queue `example-scheduled.fifo` (+ DLQ) | ✅ yes — but EventBridge Scheduler is mock-only on LocalStack; see note below |
-| `make run-localscheduler` | fires schedules → SQS `example-scheduled.fifo` | ✅ yes — LocalStack demo helper; see note below |
-| `make run-typed` | queue `example-typed-queue` | ⚠️ **no** — see note below |
-| `make run-middleware` | queue `example-middleware-queue` | ⚠️ **no** — see note below |
+| `make run-fifo-scheduled-retry` | FIFO queue `example-scheduled.fifo` (+ DLQ) | ✅ yes — run `make run-localscheduler` alongside it locally; see note below |
+| `make run-localscheduler` | fires schedules → SQS `example-scheduled.fifo` | ✅ yes — local demo helper; see note below |
+| `make run-typed` | queue `example-typed-queue` | ✅ yes |
+| `make run-middleware` | queue `example-middleware-queue` | ✅ yes |
 | `make run-producer` | topics `example-standard-topic`, `example-fifo-topic.fifo`, `example-scheduled-topic.fifo` | ✅ yes |
 
 Equivalent manual commands (from `examples/`): `go run ./basic`, `go run ./fifo`,
@@ -234,10 +244,9 @@ picks each message up, fails it, and drives it through the scheduled-retry and
 > **Note:** the Entry_Queue (`example-scheduled.fifo`), the DLQ
 > (`example-scheduled-dlq.fifo`), and the seed topic
 > (`example-scheduled-topic.fifo`) **are** provisioned by the default
-> `make provision` (they are SQS/SNS resources LocalStack Community supports).
-> The execution role (`example-scheduler-role`) is created **only when
-> `enable_scheduler_resources = true`**, because LocalStack Community does not
-> implement IAM (`CreateRole` returns a 501). Their identifiers are exposed as
+> `make provision`, and so is the execution role (`example-scheduler-role`)
+> while `enable_scheduler_resources` keeps its default `true`. Their identifiers
+> are exposed as
 > Terraform outputs (`scheduled_queue_arn`, `scheduled_dlq_url`,
 > `scheduler_role_arn`, `scheduled_topic_arn`), which you can use to fill in the
 > placeholder ARNs/URLs in
@@ -253,45 +262,41 @@ picks each message up, fails it, and drives it through the scheduled-retry and
 >   identity separately needs `scheduler:CreateSchedule` and `iam:PassRole`).
 >
 > EventBridge Scheduler and IAM are required for the full scheduled-retry path.
-> The bundled docker-compose enables both services, so `make up` +
-> `make provision` create every resource and the consumer's `CreateSchedule`
-> calls succeed. However, **LocalStack's EventBridge Scheduler is mock-only** —
-> it accepts `CreateSchedule` but never fires the schedule, so on its own the
-> message is not re-published to the Entry_Queue and the retry/DLQ loop does not
-> complete locally. You will see the consumer create the schedule, delete the
-> original message, and emit the retry metric, and then nothing further.
+> MiniStack emulates both, so `make up` + `make provision` create every resource
+> and the consumer's `CreateSchedule` calls succeed against the real Scheduler
+> API. MiniStack cannot invoke the universal SQS `sendMessage` target those
+> schedules use, though, so on its own the message is not re-published to the
+> Entry_Queue and the retry/DLQ loop does not complete locally.
 >
-> **To close the loop locally, run the [local scheduler simulator](#local-scheduler-simulator-localstack-only)**
-> (`make run-localscheduler`) alongside the consumer. It emulates what
-> EventBridge Scheduler does when a schedule fires: it polls the schedules the
-> consumer created and, once each one's fire time elapses, performs the SQS
-> `SendMessage` the schedule describes and deletes the schedule. The message
-> then reappears on the Entry_Queue, its `retry_count` climbs on each failure,
-> and once it exceeds `WithMaxRetryCount` the consumer dead-letters it to
+> **To close the loop locally, run the [local scheduler simulator](#local-scheduler-simulator)**
+> (`make run-localscheduler`) alongside the consumer. The message then
+> reappears on the Entry_Queue, its `retry_count` climbs on each failure, and
+> once it exceeds `WithMaxRetryCount` the consumer dead-letters it to
 > `example-scheduled-dlq.fifo`. Against **real AWS you do not run the
 > simulator** — EventBridge Scheduler fires the schedules itself.
->
-> If the consumer instead logs `failed to create retry schedule ... Service
-> 'scheduler' is not enabled`, your running LocalStack container predates this
-> `SERVICES` change — recreate it with `make down-clean && make up` so it picks
-> up `SERVICES=sqs,sns,iam,scheduler`.
 
-### Local scheduler simulator (LocalStack only)
+### Local scheduler simulator
 
 ```bash
 make run-localscheduler
 ```
 
-A development-only helper that emulates AWS EventBridge Scheduler firing its
-schedules, since [LocalStack only mocks the Scheduler](https://docs.localstack.cloud/aws/services/scheduler/)
-and never invokes targets. It polls `scheduler list-schedules`, and for every
-schedule whose one-time `at(...)` fire time has elapsed it decodes the universal
-SQS SendMessage target (`Target.Input`), performs that `SendMessage` against the
-Entry_Queue, and deletes the schedule (mirroring `ActionAfterCompletion = DELETE`).
-`SendMessage` is fully supported by LocalStack, so this is what makes the retry
-re-delivery and eventual DLQ hand-off observable locally.
+A development-only helper that fires the retry schedules MiniStack's Scheduler
+cannot invoke. Every second it lists the schedules, and for each enabled one
+that targets the universal SQS `sendMessage` target it:
 
-To watch the full FIFO Scheduled Retry cycle on LocalStack, use three terminals:
+1. **claims** it by setting its state to `DISABLED`. MiniStack sweeps schedules
+   every ten seconds; left enabled, a due retry schedule would be dropped and
+   deleted by that sweep, losing the retry;
+2. once the one-time `at(...)` fire time has elapsed, decodes the target input
+   (`Target.Input`, the full SQS `SendMessage` request), performs that
+   `SendMessage` against the Entry_Queue, and deletes the schedule (mirroring
+   `ActionAfterCompletion = DELETE`).
+
+Schedules with any other target are left untouched, so MiniStack keeps firing
+them itself.
+
+To watch the full FIFO Scheduled Retry cycle on MiniStack, use three terminals:
 
 ```bash
 make run-fifo-scheduled-retry   # terminal 1: the scheduled-retry consumer
@@ -300,8 +305,9 @@ make run-producer               # terminal 3: seed the Entry_Queue via the topic
 ```
 
 You will see the consumer fail each message, create a schedule, delete the
-original, and emit the retry metric; the simulator re-publish the message when
-its backoff elapses; the consumer's `retry_count` climb on each pass; and,
+original, and emit the retry metric; the simulator claim the schedule, then
+re-publish the message when its backoff elapses; the consumer's `retry_count`
+climb on each pass; and,
 finally, the message land in the DLQ with a `dead-letter:` log once it exceeds
 `WithMaxRetryCount`. This helper is unnecessary against real AWS.
 
@@ -314,12 +320,8 @@ make run-typed
 Consumes `example-typed-queue` and decodes each body into an `OrderPlaced`
 struct via `typed.JSONCodec`.
 
-> **Note:** `example-typed-queue` is **not** created by the current Terraform
-> config. Create it yourself (for example
-> `aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name example-typed-queue`),
-> add it to the Terraform config, or change `queueName` in
-> [`typed/main.go`](./typed/main.go) to an existing queue such as
-> `example-basic-queue` before running.
+`make provision` creates `example-typed-queue` and subscribes it to
+`example-orders-topic`, so `make run-producer` delivers an order to it.
 
 ### Middleware
 
@@ -333,10 +335,8 @@ metrics at <http://localhost:9090/metrics> and exports OpenTelemetry spans over
 OTLP to an OpenTelemetry Collector, which forwards them to Jaeger for viewing at
 <http://localhost:16686>.
 
-> **Note:** `example-middleware-queue` is **not** created by the current
-> Terraform config. Create it, add it to the Terraform config, or point
-> `queueName` in [`middleware/main.go`](./middleware/main.go) at an existing
-> queue before running.
+`make provision` creates `example-middleware-queue` and subscribes it to
+`example-standard-topic`, so `make run-producer` delivers messages to it.
 
 #### Tracing backend: OpenTelemetry Collector + Jaeger
 
@@ -425,9 +425,9 @@ to watch messages arrive.
 | Target | Description |
 | --- | --- |
 | `help` | Show the self-documented target list (default goal). |
-| `up` | Start LocalStack and wait for SQS + SNS to be ready. |
-| `down` | Stop LocalStack (keeps the data volume). |
-| `down-clean` | Stop LocalStack and remove its data volume (`down -v`). |
+| `up` | Start MiniStack and wait until its healthcheck passes. |
+| `down` | Stop MiniStack (keeps the persisted state volume). |
+| `down-clean` | Stop MiniStack and remove its persisted state volume (`down -v`). |
 | `observability-up` | Start the OTel Collector + Jaeger tracing backend (middleware example). |
 | `observability-down` | Stop the OTel Collector + Jaeger tracing backend. |
 | `observability-down-clean` | Stop the tracing backend and remove its volumes. |
@@ -436,7 +436,7 @@ to watch messages arrive.
 | `run-basic` | Run the basic consumer example. |
 | `run-fifo` | Run the FIFO consumer example. |
 | `run-fifo-scheduled-retry` | Run the FIFO Scheduled Retry consumer example. |
-| `run-localscheduler` | Run the local EventBridge Scheduler simulator (LocalStack demo only). |
+| `run-localscheduler` | Run the local EventBridge Scheduler simulator (local demo only). |
 | `run-typed` | Run the typed consumer example. |
 | `run-middleware` | Run the middleware consumer example (metrics on `:9090`). |
 | `run-producer` | Run the producer example (publishes then exits). |

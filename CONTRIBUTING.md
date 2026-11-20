@@ -93,6 +93,8 @@ Additional targets:
 - `make test-chaos` runs the stress suite
   (`GOMAXPROCS=1 go test ./... -race -count=30 -shuffle=on -timeout 15m`) to
   surface race conditions and flakiness.
+- `make test-integration` runs the integration suite against
+  [MiniStack](https://ministack.org) (Docker required).
 
 ## Releases
 

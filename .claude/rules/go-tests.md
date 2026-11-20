@@ -27,4 +27,6 @@ paths:
   rest of the test meaningless, `assert` otherwise). Assert on values and `errors.Is`
   matches, never on error strings.
 - Integration tests use the `integration` build tag, the `Integration` name prefix, and
-  LocalStack (`make test-integration`).
+  MiniStack (`make test-integration`). They read the endpoint from `MINISTACK_ENDPOINT`
+  (default `http://localhost:4566`) and create uniquely named resources they delete in
+  `t.Cleanup`.

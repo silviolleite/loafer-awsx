@@ -1,15 +1,15 @@
 # main.tf provisions all AWS resources the loafer-awsx examples need, targeting
-# a local LocalStack instance. It creates a standard and a FIFO SQS queue, a
+# a local MiniStack instance. It creates a standard and a FIFO SQS queue, a
 # standard and a FIFO SNS topic, wires each topic to its matching queue with an
 # SNS-to-SQS subscription, and attaches the SQS queue policies that allow SNS to
 # deliver messages. It also provisions the FIFO Scheduled Retry example's
 # Entry_Queue, DLQ, FIFO topic + subscription, and the IAM execution role that
 # EventBridge Scheduler assumes.
 #
-# The AWS provider is pointed at LocalStack: credential, metadata, and
-# account-ID lookups are skipped, static test credentials are used, and the SQS,
-# SNS, IAM, and EventBridge Scheduler service endpoints are overridden to the
-# LocalStack gateway.
+# The AWS provider is pointed at MiniStack: credential, metadata, and account-ID
+# lookups are skipped, static test credentials are used, and the SQS, SNS, IAM,
+# and EventBridge Scheduler service endpoints are overridden to the MiniStack
+# gateway. Point var.endpoint at another AWS-compatible endpoint to reuse it.
 
 terraform {
   required_version = ">= 1.3"
@@ -27,21 +27,21 @@ provider "aws" {
   access_key = var.access_key
   secret_key = var.secret_key
 
-  # LocalStack does not implement the credential/metadata/account validation
-  # calls the real AWS provider makes on start-up, so they are skipped here.
+  # The credential, metadata and account-ID validation calls the AWS provider
+  # makes on start-up are meaningless against a local emulator, so they are
+  # skipped here.
   skip_credentials_validation = true
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
 
-  # Route the services this module uses to the LocalStack gateway. The FIFO
-  # Scheduled Retry example adds the IAM execution role and (when the LocalStack
-  # edition supports it) EventBridge Scheduler, so iam and scheduler are pointed
-  # at LocalStack as well for consistency.
+  # Route the services this module uses to the emulator gateway. The FIFO
+  # Scheduled Retry example adds the IAM execution role, and the consumer creates
+  # EventBridge Scheduler schedules, so iam and scheduler are routed there too.
   endpoints {
-    sqs       = var.localstack_endpoint
-    sns       = var.localstack_endpoint
-    iam       = var.localstack_endpoint
-    scheduler = var.localstack_endpoint
+    sqs       = var.endpoint
+    sns       = var.endpoint
+    iam       = var.endpoint
+    scheduler = var.endpoint
   }
 }
 
@@ -316,13 +316,10 @@ resource "aws_sns_topic_subscription" "scheduled" {
 # separately needs scheduler:CreateSchedule and iam:PassRole to create schedules
 # that pass this role; those permissions belong to the caller, not to this role.
 #
-# LocalStack caveat: LocalStack Community does NOT implement IAM or EventBridge
-# Scheduler, so applying this role fails there (CreateRole returns a 501
-# "Service 'iam' is not enabled"). These resources are therefore gated behind
-# the enable_scheduler_resources flag, which defaults to false so the standard
-# `make provision` flow works on LocalStack Community. Set it to true (e.g.
-# `TF_VAR_enable_scheduler_resources=true`) when targeting real AWS or a
-# LocalStack edition that supports IAM and the Scheduler service.
+# MiniStack implements IAM, so these resources are created by default. They are
+# gated behind the enable_scheduler_resources flag (default true) for emulators
+# or accounts where CreateRole is unavailable; set it to false there (e.g.
+# `TF_VAR_enable_scheduler_resources=false`).
 resource "aws_iam_role" "scheduler" {
   count = var.enable_scheduler_resources ? 1 : 0
 

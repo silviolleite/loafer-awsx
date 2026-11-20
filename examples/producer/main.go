@@ -17,7 +17,7 @@
 // ".fifo") and only when the caller does not set the value explicitly.
 //
 // Run it against real SNS topics or a local AWS-compatible endpoint (for
-// example LocalStack) by adjusting the region, credentials, endpoint, account
+// example MiniStack) by adjusting the region, credentials, endpoint, account
 // ID, and topic names below.
 package main
 
@@ -34,7 +34,7 @@ import (
 
 const (
 	// region and accountID are used to build topic ARNs. Replace them with your
-	// AWS region and account ID (LocalStack commonly uses 000000000000).
+	// AWS region and account ID (MiniStack uses 000000000000 by default).
 	region    = "us-east-1"
 	accountID = "000000000000"
 
@@ -63,7 +63,7 @@ func main() {
 	defer cancel()
 
 	// Step 1: build the AWS connection. The static credentials and endpoint are
-	// convenient for local development against LocalStack and can be dropped in
+	// convenient for local development against MiniStack and can be dropped in
 	// favor of the default AWS credential chain in production.
 	cfg, err := conn.New(ctx,
 		conn.WithRegion(region),

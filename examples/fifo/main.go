@@ -18,7 +18,7 @@
 //  5. Running the broker with graceful shutdown driven by OS signals.
 //
 // Run it against a real FIFO queue or a local AWS-compatible endpoint (for
-// example LocalStack) by adjusting the region, credentials, endpoint, and queue
+// example MiniStack) by adjusting the region, credentials, endpoint, and queue
 // name below. Note the required ".fifo" suffix on the queue name.
 package main
 
@@ -57,7 +57,7 @@ func main() {
 	defer stop()
 
 	// Step 1: build the AWS connection. The static credentials and endpoint are
-	// convenient for local development against LocalStack and can be dropped in
+	// convenient for local development against MiniStack and can be dropped in
 	// favor of the default AWS credential chain in production.
 	cfg, err := conn.New(ctx,
 		conn.WithRegion("us-east-1"),

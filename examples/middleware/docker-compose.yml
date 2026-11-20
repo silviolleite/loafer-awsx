@@ -14,7 +14,7 @@
 #   make run-middleware
 #   open http://localhost:16686  (service: loafer-awsx-middleware-example)
 #
-# This stack is independent of the LocalStack/Terraform stack; run both when you
+# This stack is independent of the MiniStack/Terraform stack; run both when you
 # want the example to consume real messages while exporting traces.
 services:
   otel-collector:
