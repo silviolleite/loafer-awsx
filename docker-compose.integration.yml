@@ -1,17 +1,14 @@
 services:
-  localstack:
-    container_name: "loafer-awsx-integration-localstack"
-    # Pin to the 3.x community line. The unpinned `latest` tag now resolves to a
-    # build that refuses to start without a LocalStack license token (exit 55).
-    image: localstack/localstack:3
+  ministack:
+    container_name: "loafer-awsx-integration-ministack"
+    image: ministackorg/ministack:1.5.40@sha256:a415d58e257931ddfd2678bfba915d6dea9508c3103df74fa90efdd6535c035c
+    user: "100:101"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:4566:4566"
-    environment:
-      - AWS_DEFAULT_REGION=us-east-1
-      - SERVICES=sqs,sns
-      - DEBUG=0
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"\\(running\\|available\\)\"' && curl -sf http://localhost:4566/_localstack/health | grep -q '\"sns\": \"\\(running\\|available\\)\"'"]
-      interval: 5s
-      timeout: 5s
-      retries: 20

@@ -1,5 +1,5 @@
 # variables.tf declares the configurable inputs for the loafer-awsx example
-# infrastructure. Every variable has a LocalStack-friendly default so the module
+# infrastructure. Every variable has a MiniStack-friendly default so the module
 # can be applied with no overrides during local development. Override them (via
 # -var, a *.tfvars file, or TF_VAR_ environment variables) to target a real AWS
 # account or a different region.
@@ -11,25 +11,25 @@ variable "region" {
 }
 
 variable "account_id" {
-  description = "AWS account ID used when building ARNs. LocalStack uses 000000000000."
+  description = "AWS account ID used when building ARNs. MiniStack uses 000000000000 by default."
   type        = string
   default     = "000000000000"
 }
 
-variable "localstack_endpoint" {
-  description = "LocalStack gateway endpoint that the SQS and SNS services are reached through."
+variable "endpoint" {
+  description = "AWS-compatible gateway endpoint (MiniStack by default) that the SQS, SNS, IAM and Scheduler services are reached through."
   type        = string
   default     = "http://localhost:4566"
 }
 
 variable "access_key" {
-  description = "Static access key. Any non-empty value works with LocalStack."
+  description = "Static access key. Any non-empty value works with MiniStack."
   type        = string
   default     = "test"
 }
 
 variable "secret_key" {
-  description = "Static secret key. Any non-empty value works with LocalStack."
+  description = "Static secret key. Any non-empty value works with MiniStack."
   type        = string
   default     = "test"
 }
@@ -95,7 +95,7 @@ variable "scheduled_topic_name" {
 }
 
 variable "enable_scheduler_resources" {
-  description = "Whether to create the IAM execution role EventBridge Scheduler assumes for the FIFO Scheduled Retry example. Defaults to true; the bundled docker-compose enables the iam service so CreateRole succeeds locally. Set it to false if your LocalStack instance does not expose IAM (older SERVICES=sqs,sns setups return a 501 on CreateRole)."
+  description = "Whether to create the IAM execution role EventBridge Scheduler assumes for the FIFO Scheduled Retry example. Defaults to true; MiniStack implements IAM, so CreateRole succeeds locally. Set it to false for an endpoint that does not expose IAM."
   type        = bool
   default     = true
 }

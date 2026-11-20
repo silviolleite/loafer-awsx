@@ -1,32 +1,37 @@
 // Command localscheduler is a local development helper that emulates what AWS
-// EventBridge Scheduler does when a one-time schedule fires. It exists solely to
-// close the FIFO Scheduled Retry loop against LocalStack.
+// EventBridge Scheduler does when a one-time retry schedule fires. It exists
+// solely to close the FIFO Scheduled Retry loop against MiniStack.
 //
-// Why it is needed: LocalStack's EventBridge Scheduler is mock-only. It accepts
-// CreateSchedule but never actually fires the schedule to invoke its target, so
-// the retry message is never re-published to the Entry_Queue and the retry/DLQ
-// loop never completes locally (see
-// https://docs.localstack.cloud/aws/services/scheduler/). This helper fills that
-// gap for demos: it polls the schedules the consumer created, and once a
-// schedule's fire time has elapsed it performs the SQS SendMessage the schedule
-// describes and then deletes the schedule — mirroring EventBridge Scheduler's
-// invoke-then-delete behavior (ActionAfterCompletion = DELETE).
+// Why it is needed: the consumer builds each retry schedule with the
+// EventBridge Scheduler universal SQS SendMessage target
+// (arn:aws:scheduler:::aws-sdk:sqs:sendMessage), so the schedule's Target.Input
+// is the full JSON of an SQS SendMessage request (queue URL, body, FIFO group
+// id, a fresh deduplication id, and the message attributes including the
+// incremented retry_count). MiniStack's Scheduler fires schedules with
+// templated targets, but it does not implement universal targets: it drops the
+// invocation and, because retry schedules use ActionAfterCompletion = DELETE,
+// deletes the schedule. The retry would be lost.
 //
-// The consumer builds each retry schedule with the EventBridge Scheduler
-// universal SQS SendMessage target, so the schedule's Target.Input is the full
-// JSON of an SQS SendMessage request (queue URL, body, FIFO group id, a fresh
-// deduplication id, and the message attributes including the incremented
-// retry_count). This helper simply decodes that JSON and calls SendMessage,
-// which LocalStack supports fully. As the message bounces back through the
+// What it does: every second it lists the schedules, and for each enabled
+// schedule that targets the universal SQS SendMessage target it first claims it
+// by setting its state to DISABLED, so MiniStack's own ten-second sweep skips
+// it. The claim only protects a schedule that is not yet due when the helper
+// sees it, so pair the helper with a base backoff of a few seconds (the
+// fifo-scheduled-retry example uses 3s): a schedule that is already due can still
+// be consumed by a sweep that lands before the claim, losing the retry. Once the
+// schedule's fire time has elapsed, the helper performs the
+// SendMessage the schedule describes and deletes the schedule, mirroring
+// EventBridge Scheduler's invoke-then-delete behavior. Schedules with any other
+// target are left untouched. As the message bounces back through the
 // Entry_Queue its retry_count climbs on each failure until it exceeds the
 // route's Max_Retry_Count, at which point the consumer dead-letters it.
 //
 // This is a demo-only tool. Against real AWS you do NOT run it: EventBridge
 // Scheduler fires the schedules itself. Run it alongside the scheduled-retry
-// consumer only when developing against LocalStack.
+// consumer only when developing against MiniStack.
 //
-// Run it against LocalStack by adjusting the region, credentials, and endpoint
-// below to match the consumer example.
+// Run it against another endpoint by adjusting the region, credentials, and
+// endpoint below to match the consumer example.
 package main
 
 import (
@@ -83,8 +88,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Build the AWS connection pointed at LocalStack, matching the scheduled
-	// retry consumer example.
+	// Build the AWS connection pointed at MiniStack, matching the scheduled retry
+	// consumer example.
 	cfg, err := conn.New(ctx,
 		conn.WithRegion("us-east-1"),
 		conn.WithAccessKey("test", "test"),
@@ -96,7 +101,7 @@ func main() {
 
 	// This helper deliberately keeps the direct AWS SDK clients rather than the
 	// client.NewScheduler / client.NewSQS constructors. It calls Scheduler
-	// operations (ListSchedules, GetSchedule, DeleteSchedule) and SQS operations
+	// operations (ListSchedules, GetSchedule, UpdateSchedule, DeleteSchedule) and SQS operations
 	// (SendMessage) that fall outside the minimal consumer.SchedulerClient and
 	// consumer.SQSClient interfaces those constructors return, so the wrapped
 	// clients could not satisfy this tool's needs.
@@ -124,8 +129,9 @@ func main() {
 	}
 }
 
-// fireDueSchedules lists every schedule, fires the ones whose at() time has
-// elapsed, and deletes each one it fires.
+// fireDueSchedules lists every schedule, claims each retry schedule it has not
+// claimed yet, fires the ones whose at() time has elapsed, and deletes each one it
+// fires.
 func fireDueSchedules(ctx context.Context, schedClient *scheduler.Client, sqsClient *sqs.Client) error {
 	var nextToken *string
 	for {
@@ -145,8 +151,9 @@ func fireDueSchedules(ctx context.Context, schedClient *scheduler.Client, sqsCli
 	}
 }
 
-// fireIfDue loads the full schedule, checks whether its fire time has elapsed,
-// and if so performs the described SendMessage and deletes the schedule.
+// fireIfDue loads the full schedule, claims it if it still targets the universal
+// SQS sendMessage target and is enabled, checks whether its fire time has
+// elapsed, and if so performs the described SendMessage and deletes the schedule.
 func fireIfDue(
 	ctx context.Context,
 	schedClient *scheduler.Client,
@@ -170,6 +177,10 @@ func fireIfDue(
 
 	if sched.Target == nil || aws.ToString(sched.Target.Arn) != universalSQSSendMessageARN {
 		return
+	}
+
+	if sched.State == schedulertypes.ScheduleStateEnabled {
+		claim(ctx, schedClient, sched)
 	}
 
 	fireAt, ok := parseAtExpression(aws.ToString(sched.ScheduleExpression))
@@ -200,6 +211,36 @@ func fireIfDue(
 	}); err != nil {
 		log.Printf("failed to delete fired schedule %q: %v", name, err)
 	}
+}
+
+// claim disables a retry schedule so the emulator's own scheduler skips it.
+// MiniStack sweeps schedules every ten seconds but cannot invoke the universal
+// SQS sendMessage target: it drops the invocation and, because the schedule uses
+// ActionAfterCompletion=DELETE, deletes the schedule, losing the retry. A
+// disabled schedule keeps its target and input, so this helper still fires it
+// when due. UpdateSchedule replaces the whole definition, so every field read
+// from GetSchedule is sent back unchanged apart from the state. A failed claim
+// is only logged: the helper still fires the schedule if it remains.
+func claim(ctx context.Context, schedClient *scheduler.Client, sched *scheduler.GetScheduleOutput) {
+	_, err := schedClient.UpdateSchedule(ctx, &scheduler.UpdateScheduleInput{
+		Name:                       sched.Name,
+		GroupName:                  sched.GroupName,
+		ScheduleExpression:         sched.ScheduleExpression,
+		ScheduleExpressionTimezone: sched.ScheduleExpressionTimezone,
+		FlexibleTimeWindow:         sched.FlexibleTimeWindow,
+		Target:                     sched.Target,
+		ActionAfterCompletion:      sched.ActionAfterCompletion,
+		Description:                sched.Description,
+		StartDate:                  sched.StartDate,
+		EndDate:                    sched.EndDate,
+		KmsKeyArn:                  sched.KmsKeyArn,
+		State:                      schedulertypes.ScheduleStateDisabled,
+	})
+	if err != nil {
+		log.Printf("failed to claim schedule %q: %v", aws.ToString(sched.Name), err)
+		return
+	}
+	log.Printf("claimed schedule %q (disabled so the emulator does not consume it)", aws.ToString(sched.Name))
 }
 
 // buildSendMessageInput converts the decoded universal-target request into an

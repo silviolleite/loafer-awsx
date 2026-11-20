@@ -29,7 +29,7 @@ make format            # goimports -local + fieldalignment -fix
 make lint              # format + golangci-lint (.golangci.yml)
 make test              # race detector + atomic coverage (excludes examples/fake)
 make check             # lint + test + govulncheck — run before declaring work done
-make test-integration  # LocalStack (docker compose) + -tags=integration
+make test-integration  # MiniStack (docker compose, pinned image) + -tags=integration
 make test-chaos        # GOMAXPROCS=1, -race -count=30 -shuffle=on
 make test-bench        # benchmarks
 ```

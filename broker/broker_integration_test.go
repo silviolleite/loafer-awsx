@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 }
 
 func integrationEndpoint() string {
-	if v := os.Getenv("LOCALSTACK_ENDPOINT"); v != "" {
+	if v := os.Getenv("MINISTACK_ENDPOINT"); v != "" {
 		return v
 	}
 	return "http://localhost:4566"

@@ -65,7 +65,7 @@ func WithProfile(profile string) Option {
 }
 
 // WithEndpoint sets a custom endpoint URL for all AWS requests. It is intended
-// for local development against LocalStack or other AWS-compatible endpoints.
+// for local development against MiniStack or other AWS-compatible endpoints.
 func WithEndpoint(url string) Option {
 	return func(o *options) error {
 		o.endpoint = url
