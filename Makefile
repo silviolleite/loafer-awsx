@@ -21,7 +21,7 @@ COMPOSE_FILE  := docker-compose.integration.yml
 LOCALSTACK_URL := http://localhost:4566
 
 # Tool versions
-GOLANGCI_LINT_VERSION := v2.12.2
+GOLANGCI_LINT_VERSION := v2.15.0
 LEFTHOOK_VERSION      := v1.4.8
 
 .PHONY: all clean format lint test cover test-bench test-integration test-chaos configure check \
