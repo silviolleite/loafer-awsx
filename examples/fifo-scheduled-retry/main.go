@@ -38,14 +38,15 @@
 //     and sqs:SendMessage on the Entry_Queue.
 //
 // Run it against a real environment or a local AWS-compatible endpoint (for
-// example LocalStack) by adjusting the region, credentials, endpoint, and the
+// example MiniStack) by adjusting the region, credentials, endpoint, and the
 // placeholder ARNs and URLs below. Note the required ".fifo" suffix on FIFO
 // queue names.
 //
-// LocalStack note: LocalStack only mocks EventBridge Scheduler and never fires
-// the schedules this consumer creates, so the retry re-delivery and DLQ loop
-// does not complete on its own locally. Run the examples/localscheduler helper
-// alongside this consumer to emulate the scheduler firing and close the loop.
+// MiniStack note: MiniStack fires EventBridge Scheduler schedules, but not the
+// universal SQS sendMessage target this consumer uses for retry schedules, so
+// the retry re-delivery and DLQ loop does not complete on its own locally. Run
+// the examples/localscheduler helper alongside this consumer to fire the retry
+// schedules and close the loop.
 // Against real AWS the helper is unnecessary — EventBridge Scheduler fires the
 // schedules itself.
 package main
@@ -95,7 +96,7 @@ func main() {
 	defer stop()
 
 	// Step 1: build the AWS connection. The static credentials and endpoint are
-	// convenient for local development against LocalStack and can be dropped in
+	// convenient for local development against MiniStack and can be dropped in
 	// favor of the default AWS credential chain in production.
 	cfg, err := conn.New(ctx,
 		conn.WithRegion("us-east-1"),
@@ -131,13 +132,15 @@ func main() {
 	//   - WithScheduledDLQ: the DLQ that receives exhausted messages.
 	//   - WithMaxRetryCount: how many retries to attempt before dead-lettering.
 	//   - WithBackoff: the base and maximum delay bounding the exponential
-	//     backoff applied between retries.
+	//     backoff applied between retries. Against MiniStack, keep the base above
+	//     the localscheduler poll interval (one second) so each retry schedule is
+	//     claimed before it is due.
 	route, err := router.New(queueName, handleMessage,
 		router.WithScheduledRetry(
 			router.WithSchedulerIdentity(targetQueueARN, executionRoleARN),
 			router.WithScheduledDLQ(dlqQueueURL),
 			router.WithMaxRetryCount(3),
-			router.WithBackoff(time.Second, 30*time.Second),
+			router.WithBackoff(3*time.Second, 30*time.Second),
 		),
 	)
 	if err != nil {

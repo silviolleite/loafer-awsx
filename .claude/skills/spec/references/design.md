@@ -60,7 +60,7 @@ Property tests use `pgregory.net/rapid`, run a minimum of 100 iterations, live i
 
 ### Example and integration tests (PBT not appropriate)
 
-<Criteria covered by examples or LocalStack integration tests (`-tags=integration`).>
+<Criteria covered by examples or MiniStack integration tests (`-tags=integration`).>
 
 ### Unit tests
 

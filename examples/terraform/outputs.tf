@@ -77,7 +77,7 @@ output "scheduled_dlq_arn" {
 }
 
 output "scheduler_role_arn" {
-  description = "ARN of the IAM execution role EventBridge Scheduler assumes for Scheduled Retry re-publishes. Empty unless enable_scheduler_resources is true (the role is not created on LocalStack Community, which lacks IAM)."
+  description = "ARN of the IAM execution role EventBridge Scheduler assumes for Scheduled Retry re-publishes. Empty when enable_scheduler_resources is false."
   value       = var.enable_scheduler_resources ? aws_iam_role.scheduler[0].arn : ""
 }
 

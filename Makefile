@@ -17,8 +17,9 @@ COVER_FINAL   := cover.out
 COVER_TOTAL   := geral.out
 
 # Integration test settings
-COMPOSE_FILE  := docker-compose.integration.yml
-LOCALSTACK_URL := http://localhost:4566
+COMPOSE_FILE           := docker-compose.integration.yml
+MINISTACK_WAIT_TIMEOUT := 60
+INTEGRATION_PKGS       := ./client/... ./producer/... ./consumer/... ./broker/...
 
 # Tool versions
 GOLANGCI_LINT_VERSION := v2.15.0
@@ -56,14 +57,13 @@ test-bench: clean
 	@$(GO) test -bench=. -benchtime=5s -count=1 -benchmem $(PKGS)
 
 test-integration:
-	@echo "Starting LocalStack..."
-	@docker compose -f $(COMPOSE_FILE) up -d
-	@echo "Waiting for LocalStack (SQS + SNS) to be ready..."
-	@until curl -s $(LOCALSTACK_URL)/_localstack/health | grep -q '"sqs": "\(running\|available\)"'; do sleep 1; done
-	@until curl -s $(LOCALSTACK_URL)/_localstack/health | grep -q '"sns": "\(running\|available\)"'; do sleep 1; done
-	@$(GO) test -tags=integration -race -v ./consumer/... ./broker/... -run Integration \
-		|| (docker compose -f $(COMPOSE_FILE) down -v && exit 1)
-	@docker compose -f $(COMPOSE_FILE) down -v
+	@echo "Starting MiniStack and waiting for its healthcheck..."
+	@docker compose -f $(COMPOSE_FILE) up -d --wait --wait-timeout $(MINISTACK_WAIT_TIMEOUT) \
+		|| (docker compose -f $(COMPOSE_FILE) down -v; exit 1)
+	@$(GO) test -tags=integration -race -count=1 -v $(INTEGRATION_PKGS) -run Integration; \
+		status=$$?; \
+		docker compose -f $(COMPOSE_FILE) down -v; \
+		exit $$status
 
 clean:
 	@echo "Cleaning test cache..."

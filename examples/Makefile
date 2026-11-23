@@ -1,7 +1,7 @@
 # loafer-awsx examples tooling.
 #
 # Convenience targets for running the loafer-awsx examples against a local
-# LocalStack instance provisioned with the Terraform config in ./terraform.
+# MiniStack instance provisioned with the Terraform config in ./terraform.
 #
 # All targets are meant to be run from this directory (examples/). The Go module
 # lives at the repository root, so the example programs are run as relative
@@ -12,13 +12,13 @@ GO             := go
 DOCKER_COMPOSE := docker compose
 
 # Terraform lives in the terraform/ subdirectory and ships the docker-compose.yml
-# used to start LocalStack.
+# used to start MiniStack.
 TERRAFORM_DIR  := terraform
 COMPOSE_FILE   := $(TERRAFORM_DIR)/docker-compose.yml
 
-# LocalStack gateway used for the readiness health check (matches the defaults
-# in terraform/docker-compose.yml and terraform/variables.tf).
-LOCALSTACK_URL := http://localhost:4566
+# MiniStack gateway, and how long `up` waits for its healthcheck (seconds).
+MINISTACK_URL          := http://localhost:4566
+MINISTACK_WAIT_TIMEOUT := 60
 
 # Observability stack (OTel Collector + Jaeger) used by the middleware example.
 OBSERVABILITY_COMPOSE_FILE := middleware/docker-compose.yml
@@ -41,26 +41,23 @@ help: ## Show this help
 	@echo ""
 	@echo "Typical flow: make up && make provision && make run-basic"
 
-# --- LocalStack -------------------------------------------------------------
+# --- MiniStack --------------------------------------------------------------
 
-up: ## Start LocalStack and wait for SQS + SNS to be ready
-	@echo "Starting LocalStack..."
-	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d
-	@echo "Waiting for LocalStack (SQS + SNS) to be ready..."
-	@until curl -s $(LOCALSTACK_URL)/_localstack/health | grep -q '"sqs": "\(running\|available\)"'; do sleep 1; done
-	@until curl -s $(LOCALSTACK_URL)/_localstack/health | grep -q '"sns": "\(running\|available\)"'; do sleep 1; done
-	@echo "LocalStack is ready at $(LOCALSTACK_URL)"
+up: ## Start MiniStack and wait until its healthcheck passes
+	@echo "Starting MiniStack and waiting for its healthcheck..."
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --wait --wait-timeout $(MINISTACK_WAIT_TIMEOUT)
+	@echo "MiniStack is ready at $(MINISTACK_URL)"
 
-down: ## Stop LocalStack (keeps the data volume)
-	@echo "Stopping LocalStack..."
+down: ## Stop MiniStack (keeps the persisted state volume)
+	@echo "Stopping MiniStack..."
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
 
-down-clean: ## Stop LocalStack and remove its data volume
-	@echo "Stopping LocalStack and removing volumes..."
+down-clean: ## Stop MiniStack and remove its persisted state volume
+	@echo "Stopping MiniStack and removing volumes..."
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down -v
 
 # --- Observability (OTel Collector + Jaeger) --------------------------------
-# Tracing backend for the middleware example. Independent of LocalStack; bring
+# Tracing backend for the middleware example. Independent of MiniStack; bring
 # it up alongside `make up` when you want to view spans in the Jaeger UI.
 
 observability-up: ## Start the OTel Collector + Jaeger tracing backend for the middleware example
@@ -103,8 +100,8 @@ run-fifo-scheduled-retry: ## Run the FIFO Scheduled Retry consumer example
 	@echo "Running fifo-scheduled-retry example (Ctrl+C to stop)..."
 	@$(GO) run ./fifo-scheduled-retry
 
-run-localscheduler: ## Run the local EventBridge Scheduler simulator (LocalStack demo only; fires retry schedules)
-	@echo "Running local scheduler simulator (Ctrl+C to stop; LocalStack demo only)..."
+run-localscheduler: ## Run the local EventBridge Scheduler simulator (local demo only; fires retry schedules)
+	@echo "Running local scheduler simulator (Ctrl+C to stop; local demo only)..."
 	@$(GO) run ./localscheduler
 
 run-typed: ## Run the typed handler consumer example

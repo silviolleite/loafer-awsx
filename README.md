@@ -179,7 +179,7 @@ and middleware setups, see the [`examples/`](./examples) directory and its
 ## Examples
 
 Runnable, self-contained programs live in the [`examples/`](./examples)
-directory, wired to run locally against [LocalStack](https://www.localstack.cloud/)
+directory, wired to run locally against [MiniStack](https://ministack.org)
 with infrastructure provisioned by Terraform. See
 [`examples/README.md`](./examples/README.md) for setup and run instructions
 (`make up`, `make provision`, `make run-basic`, and friends).

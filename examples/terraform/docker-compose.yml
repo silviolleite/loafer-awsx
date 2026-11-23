@@ -1,37 +1,41 @@
-# docker-compose.yml starts a LocalStack instance exposing the SQS, SNS, IAM,
-# and EventBridge Scheduler services on the gateway port 4566, ready for the
-# Terraform in this directory to provision resources against.
+# docker-compose.yml starts a MiniStack instance (https://ministack.org) that
+# emulates the SQS, SNS, IAM and EventBridge Scheduler APIs on the gateway port
+# 4566, ready for the Terraform in this directory to provision resources against.
 #
-# Usage:
-#   docker compose up -d
+# Usage (or `make up` from examples/, which waits for the healthcheck):
+#   docker compose up -d --wait
 #   terraform init
 #   terraform apply -auto-approve
 #
 # The default provider endpoint (http://localhost:4566) and region (us-east-1)
 # match the defaults in variables.tf, so no overrides are needed locally.
 #
-# iam and scheduler are enabled for the FIFO Scheduled Retry example. NOTE:
-# LocalStack's EventBridge Scheduler is mock-only — CreateSchedule succeeds but
-# the schedule never actually fires to re-publish the message to the target SQS
-# queue (see https://docs.localstack.cloud/aws/services/scheduler/). So against
-# LocalStack you can observe the schedule-created / delete-original / retry-
-# metric path, but not the real re-delivery or DLQ loop; run the example against
-# real AWS to see the full scheduled-retry lifecycle.
-
+# EventBridge Scheduler: MiniStack fires schedules with templated targets, but
+# not the universal `aws-sdk:sqs:sendMessage` target the library uses for FIFO
+# Scheduled Retry. It drops those invocations (and, because the schedules use
+# ActionAfterCompletion=DELETE, deletes them). Run `make run-localscheduler`
+# alongside the fifo-scheduled-retry example to close the retry loop locally.
 services:
-  localstack:
-    container_name: "loafer-awsx-localstack"
-    # Pin to the 3.x community line. The unpinned `latest` tag now resolves to a
-    # build that refuses to start without a LocalStack license token (exit 55).
-    image: localstack/localstack:3
+  ministack:
+    container_name: "loafer-awsx-ministack"
+    image: ministackorg/ministack:1.5.40@sha256:a415d58e257931ddfd2678bfba915d6dea9508c3103df74fa90efdd6535c035c
+    user: "100:101"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "127.0.0.1:4566:4566" # LocalStack gateway (SQS + SNS + IAM + Scheduler)
+      - "127.0.0.1:4566:4566"
     environment:
-      - SERVICES=sqs,sns,iam,scheduler
-      - AWS_DEFAULT_REGION=us-east-1
-      - DEBUG=${DEBUG-0}
+      - PERSIST_STATE=1
+      - STATE_DIR=/tmp/ministack-data/state
     volumes:
-      - "localstack:/var/lib/localstack"
+      # /tmp/ministack-data is owned by UID 100 in the image, so a new named volume
+      # mounted there inherits that ownership and stays writable.
+      - "ministack-data:/tmp/ministack-data"
 
 volumes:
-  localstack:
+  ministack-data:
