@@ -23,7 +23,10 @@ INTEGRATION_PKGS       := ./client/... ./producer/... ./consumer/... ./broker/..
 
 # Tool versions
 GOLANGCI_LINT_VERSION := v2.15.0
-LEFTHOOK_VERSION      := v1.4.8
+LEFTHOOK_VERSION      := v2.2.4
+MOCKERY_VERSION       := v3.9.2
+GOVULNCHECK_VERSION   := v1.10.0
+XTOOLS_VERSION        := v0.53.0
 
 .PHONY: all clean format lint test cover test-bench test-integration test-chaos configure check \
         check-vuln setup-dev \
@@ -80,11 +83,11 @@ configure: install-goimports install-fieldalignment install-golangci install-lef
 
 install-goimports:
 	@echo "Installing goimports..."
-	@$(GO) install golang.org/x/tools/cmd/goimports@latest
+	@$(GO) install golang.org/x/tools/cmd/goimports@$(XTOOLS_VERSION)
 
 install-fieldalignment:
 	@echo "Installing fieldalignment..."
-	@$(GO) install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
+	@$(GO) install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@$(XTOOLS_VERSION)
 
 install-golangci:
 	@echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."
@@ -92,19 +95,19 @@ install-golangci:
 
 install-lefthook:
 	@echo "Installing lefthook $(LEFTHOOK_VERSION)..."
-	@$(GO) install github.com/evilmartians/lefthook@$(LEFTHOOK_VERSION)
+	@$(GO) install github.com/evilmartians/lefthook/v2@$(LEFTHOOK_VERSION)
 
 install-mockery:
-	@echo "Installing mockery..."
-	@$(GO) install github.com/vektra/mockery/v3@latest
+	@echo "Installing mockery $(MOCKERY_VERSION)..."
+	@$(GO) install github.com/vektra/mockery/v3@$(MOCKERY_VERSION)
 
 install-rapid:
 	@echo "Installing rapid..."
 	@$(GO) get pgregory.net/rapid
 
 install-govulncheck:
-	@echo "Installing govulncheck..."
-	@$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	@echo "Installing govulncheck $(GOVULNCHECK_VERSION)..."
+	@$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
 update-dependencies:
 	@echo "Updating dependencies..."
