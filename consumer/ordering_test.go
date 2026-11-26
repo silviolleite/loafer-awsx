@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 
 	"github.com/silviolleite/loafer-awsx/logger"
 	"github.com/silviolleite/loafer-awsx/middleware"
@@ -84,6 +86,125 @@ func TestDispatcherHoldLogsAndFinishes(t *testing.T) {
 	require.Len(t, warns, 1)
 	assert.Equal(t, "receipt-held", warns[0]["receipt_handle"])
 	assert.Equal(t, "group-1", warns[0]["group_id"])
+}
+
+func newQueueDispatcher(
+	tb require.TestingT, client SQSClient, log *slog.Logger, queueURL string, handler middleware.Handler, opts ...router.Option,
+) *dispatcher {
+	route, err := router.New("queue", handler, opts...)
+	require.NoError(tb, err)
+
+	vm := newVisibilityManager(client, queueURL, route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
+
+	return newDispatcher(client, route, queueURL, vm, nil, log)
+}
+
+func TestDispatcherHoldReleasesOnlyOnFIFOQueue(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		name := rapid.StringMatching(`[A-Za-z0-9_-]{1,75}`).Draw(rt, "queueName")
+		isFIFO := rapid.Bool().Draw(rt, "fifo")
+		queueURL := "https://sqs.us-east-1.amazonaws.com/123456789012/" + name
+		if isFIFO {
+			queueURL += ".fifo"
+		}
+		n := rapid.IntRange(1, 25).Draw(rt, "held")
+
+		capture := &captureHandler{}
+		client := &fakeSQSClient{}
+		d := newQueueDispatcher(rt, client, slog.New(capture), queueURL, nilHandler,
+			router.WithRunMode(router.PerGroupID),
+			router.WithWorkerPoolSize(n),
+		)
+		msgs := make([]*message, n)
+		handles := make([]string, n)
+		for i := range msgs {
+			handles[i] = "held-" + strconv.Itoa(i)
+			msgs[i] = buildGroupMessage(rt, handles[i], "group-"+strconv.Itoa(i%3), nil)
+		}
+		d.visibility.start(context.Background())
+		require.NoError(rt, d.credits.Acquire(context.Background(), n))
+		for _, m := range msgs {
+			d.visibility.track(m)
+		}
+
+		d.hold(msgs)
+		d.visibility.close()
+
+		if isFIFO {
+			assert.Equal(rt, make([]int32, n), client.calls())
+			assert.ElementsMatch(rt, handles, client.handles())
+		} else {
+			assert.Empty(rt, client.calls())
+		}
+		assert.Empty(rt, client.deletes())
+		assert.Zero(rt, trackedCount(d))
+		assert.Equal(rt, d.credits.Capacity(), d.credits.Available())
+
+		warns := capture.warns()
+		require.Len(rt, warns, n)
+		for i, w := range warns {
+			assert.Equal(rt, loggedWarn{
+				message:  holdWarn,
+				queueURL: queueURL,
+				receipt:  handles[i],
+				groupID:  "group-" + strconv.Itoa(i%3),
+			}, w)
+		}
+	})
+}
+
+func TestDispatcherPerGroupIDHeldTailByQueueType(t *testing.T) {
+	tests := []struct {
+		name      string
+		queueURL  string
+		wantCalls []int32
+	}{
+		{name: "standard queue keeps held messages invisible", queueURL: "queue-url"},
+		{name: "fifo queue releases held messages", queueURL: "queue-url.fifo", wantCalls: []int32{0, 0, 0}},
+		{name: "fifo marker before the end is a standard queue", queueURL: "queue.fifo-url"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rec := &handlerRecorder{}
+				handler := func(ctx context.Context, m middleware.Message) error {
+					_ = rec.handle(ctx, m)
+					if m.(*message).Identifier() == "msg-1" {
+						return errors.New("boom")
+					}
+					return nil
+				}
+				capture := &captureHandler{}
+				client := &fakeSQSClient{}
+				d := newQueueDispatcher(t, client, slog.New(capture), tt.queueURL, handler,
+					router.WithRunMode(router.PerGroupID),
+					router.WithWorkerPoolSize(2),
+				)
+
+				runToCompletion(t, d, []*message{
+					buildGroupMessage(t, "msg-1", "g", nil),
+					buildGroupMessage(t, "msg-2", "g", nil),
+					buildGroupMessage(t, "msg-3", "g", nil),
+					buildGroupMessage(t, "msg-4", "g", nil),
+				})
+
+				assert.Equal(t, []string{"msg-1"}, rec.snapshot())
+				assert.Empty(t, client.deletes())
+				assert.Equal(t, tt.wantCalls, nilIfEmptyInt32(client.calls()))
+				if tt.wantCalls != nil {
+					assert.ElementsMatch(t, []string{"msg-2", "msg-3", "msg-4"}, client.handles())
+				}
+				assert.Equal(t, []loggedWarn{
+					{message: holdWarn, queueURL: tt.queueURL, receipt: "msg-2", groupID: "g"},
+					{message: holdWarn, queueURL: tt.queueURL, receipt: "msg-3", groupID: "g"},
+					{message: holdWarn, queueURL: tt.queueURL, receipt: "msg-4", groupID: "g"},
+				}, capture.warns())
+				assert.Zero(t, trackedCount(d))
+				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+			})
+		})
+	}
 }
 
 func TestDispatcherProcessReportsGroupFailure(t *testing.T) {
@@ -461,6 +582,60 @@ func TestDispatcherWorkerSkipsOnlyPastDeadline(t *testing.T) {
 				d := newTestDispatcher(t, client, slog.New(capture), rec.handle,
 					router.WithRunMode(router.PerGroupID),
 					router.WithVisibilityTimeout(30),
+				)
+				msg := buildGroupMessage(t, "m-1", "g", nil)
+				msg.receivedAt = time.Now().Add(-tt.age)
+				ctx, cancel := context.WithCancel(t.Context())
+				require.NoError(t, d.credits.Acquire(ctx, 1))
+				d.admit(msg)
+
+				d.startWorkers(ctx)
+				synctest.Wait()
+				cancel()
+				d.stopWorkers()
+
+				if tt.wantRun {
+					assert.Equal(t, []string{"m-1"}, rec.snapshot())
+					assert.Equal(t, []string{"m-1"}, client.deletes())
+					assert.Empty(t, capture.warns())
+				} else {
+					assert.Empty(t, rec.snapshot())
+					assert.Empty(t, client.deletes())
+					assert.Equal(t, []loggedWarn{
+						{message: skipExpiredWarn, queueURL: "queue-url", receipt: "m-1", groupID: "g"},
+					}, capture.warns())
+				}
+				assert.Empty(t, client.calls())
+				assert.Zero(t, trackedCount(d))
+				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+			})
+		})
+	}
+}
+
+func TestDispatcherWorkerSkipsWithoutExtensionLeft(t *testing.T) {
+	tests := []struct {
+		name    string
+		age     time.Duration
+		limit   int
+		wantRun bool
+	}{
+		{name: "no extension left and half a second remaining is skipped", age: 29*time.Second + 500*time.Millisecond},
+		{name: "no extension left and just under one second remaining is skipped", age: 29*time.Second + time.Nanosecond},
+		{name: "no extension left and one second remaining runs", age: 29 * time.Second, wantRun: true},
+		{name: "extension left and half a second remaining runs", age: 29*time.Second + 500*time.Millisecond, limit: 1, wantRun: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rec := &handlerRecorder{}
+				capture := &captureHandler{}
+				client := &fakeSQSClient{}
+				d := newTestDispatcher(t, client, slog.New(capture), rec.handle,
+					router.WithRunMode(router.PerGroupID),
+					router.WithVisibilityTimeout(30),
+					router.WithExtensionLimit(tt.limit),
 				)
 				msg := buildGroupMessage(t, "m-1", "g", nil)
 				msg.receivedAt = time.Now().Add(-tt.age)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -106,7 +107,7 @@ func TestVisibilitySender_BatchShape(t *testing.T) {
 		rapid.Check(t, func(rt *rapid.T) {
 			queueURL := rapid.StringN(1, 128, -1).Draw(rt, "queueURL")
 			msgs, timeouts := drawVisibilityChanges(rt)
-			client := &fake.SQSClient{}
+			client := &fake.SQSClient{ChangeMessageVisibilityBatchFunc: succeedVisibilityBatch}
 			sender := consumer.NewVisibilitySender(client, queueURL, nil)
 
 			results := sender.Send(context.Background(), msgs, timeouts)
@@ -440,10 +441,13 @@ func TestVisibilitySender_RequestDeadline(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				var mu sync.Mutex
 				var remaining []time.Duration
 				var hasDeadline []bool
 				record := func(ctx context.Context) {
 					d, ok := ctx.Deadline()
+					mu.Lock()
+					defer mu.Unlock()
 					hasDeadline = append(hasDeadline, ok)
 					remaining = append(remaining, time.Until(d))
 				}

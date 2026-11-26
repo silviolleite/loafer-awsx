@@ -88,6 +88,16 @@ func batchCapableClient(c *fake.SQSClient) consumer.SQSClient {
 	return c
 }
 
+func succeedVisibilityBatch(
+	_ context.Context, params *sqs.ChangeMessageVisibilityBatchInput, _ ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+	out := &sqs.ChangeMessageVisibilityBatchOutput{}
+	for _, e := range params.Entries {
+		out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: e.Id})
+	}
+	return out, nil
+}
+
 func drawCommitScenario(t *rapid.T) commitScenario {
 	s := commitScenario{
 		retryModel:    rapid.SampledFrom([]router.RetryModel{router.VisibilityRetryModel, router.ScheduledRetryModel}).Draw(t, "retryModel"),
@@ -822,6 +832,7 @@ func TestRun_PropertyShutdownFlushesAndLeaksNothing(t *testing.T) {
 			headStarted := make(chan struct{})
 			release := make(chan struct{})
 			client.DeleteMessageBatchFunc = rec.deleteBatchFunc(ctx)
+			client.ChangeMessageVisibilityBatchFunc = succeedVisibilityBatch
 
 			routeOpts := append(s.routeOptions(),
 				router.WithDeleteBatch(),

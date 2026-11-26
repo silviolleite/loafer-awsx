@@ -240,7 +240,8 @@ func TestSQSClient_ChangeMessageVisibilityBatchDefaultReportsEverySuccess(t *tes
 		require.NotNil(rt, out)
 		assert.Equal(rt, visibilityEntryIDs(in.Entries), visibilityResultIDs(out.Successful))
 		assert.Empty(rt, out.Failed)
-		assert.Equal(rt, []*sqs.ChangeMessageVisibilityBatchInput{in}, client.ChangeMessageVisibilityBatchCalls())
+		assert.Equal(rt, nilIfEmptyCalls(replayExpectedCalls(in)), nilIfEmptyCalls(client.ChangeMessageVisibilityCalls()))
+		assert.Empty(rt, client.ChangeMessageVisibilityBatchCalls())
 	})
 }
 
@@ -263,7 +264,8 @@ func TestSQSClient_ChangeMessageVisibilityBatchDefaultEdgeInputs(t *testing.T) {
 			require.NotNil(t, out)
 			assert.Empty(t, out.Successful)
 			assert.Empty(t, out.Failed)
-			assert.Equal(t, []*sqs.ChangeMessageVisibilityBatchInput{tt.in}, client.ChangeMessageVisibilityBatchCalls())
+			assert.Empty(t, client.ChangeMessageVisibilityCalls())
+			assert.Empty(t, client.ChangeMessageVisibilityBatchCalls())
 		})
 	}
 }
@@ -328,8 +330,18 @@ func TestSQSClient_ChangeMessageVisibilityBatchFuncOverridesDefault(t *testing.T
 	}
 }
 
+func recordingVisibilityBatchClient() *fake.SQSClient {
+	return &fake.SQSClient{
+		ChangeMessageVisibilityBatchFunc: func(
+			context.Context, *sqs.ChangeMessageVisibilityBatchInput, ...func(*sqs.Options),
+		) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+			return &sqs.ChangeMessageVisibilityBatchOutput{}, nil
+		},
+	}
+}
+
 func TestSQSClient_ChangeMessageVisibilityBatchCallsReturnsCopy(t *testing.T) {
-	client := &fake.SQSClient{}
+	client := recordingVisibilityBatchClient()
 	first := &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String("first")}
 	mutated := &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String("mutated")}
 	second := &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String("second")}
@@ -349,7 +361,7 @@ func TestSQSClient_ChangeMessageVisibilityBatchCallsReturnsCopy(t *testing.T) {
 
 func TestSQSClient_ChangeMessageVisibilityBatchCallsInOrderProperty(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
-		client := &fake.SQSClient{}
+		client := recordingVisibilityBatchClient()
 		inputs := rapid.SliceOfN(rapid.Custom(drawVisibilityBatchInput), 0, 20).Draw(rt, "inputs")
 
 		for _, in := range inputs {
@@ -375,9 +387,10 @@ func TestSQSClient_ChangeMessageVisibilityBatchRecordsConcurrentCalls(t *testing
 		goroutines int
 		withFunc   bool
 	}{
-		{name: "one goroutine", goroutines: 1},
-		{name: "eight goroutines", goroutines: 8},
-		{name: "sixty four goroutines", goroutines: 64},
+		{name: "one goroutine replayed", goroutines: 1},
+		{name: "sixty four goroutines replayed", goroutines: 64},
+		{name: "one goroutine with func", goroutines: 1, withFunc: true},
+		{name: "eight goroutines with func", goroutines: 8, withFunc: true},
 		{name: "sixty four goroutines with func", goroutines: 64, withFunc: true},
 	}
 
@@ -385,11 +398,7 @@ func TestSQSClient_ChangeMessageVisibilityBatchRecordsConcurrentCalls(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			client := &fake.SQSClient{}
 			if tt.withFunc {
-				client.ChangeMessageVisibilityBatchFunc = func(
-					context.Context, *sqs.ChangeMessageVisibilityBatchInput, ...func(*sqs.Options),
-				) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
-					return &sqs.ChangeMessageVisibilityBatchOutput{}, nil
-				}
+				client = recordingVisibilityBatchClient()
 			}
 			inputs := make([]*sqs.ChangeMessageVisibilityBatchInput, tt.goroutines)
 			for i := range inputs {
@@ -407,11 +416,22 @@ func TestSQSClient_ChangeMessageVisibilityBatchRecordsConcurrentCalls(t *testing
 					_, err := client.ChangeMessageVisibilityBatch(context.Background(), in)
 					assert.NoError(t, err)
 					_ = client.ChangeMessageVisibilityBatchCalls()
+					_ = client.ChangeMessageVisibilityCalls()
 				})
 			}
 			wg.Wait()
 
-			assert.ElementsMatch(t, inputs, client.ChangeMessageVisibilityBatchCalls())
+			if tt.withFunc {
+				assert.ElementsMatch(t, inputs, client.ChangeMessageVisibilityBatchCalls())
+				assert.Empty(t, client.ChangeMessageVisibilityCalls())
+				return
+			}
+			var want []*sqs.ChangeMessageVisibilityInput
+			for _, in := range inputs {
+				want = append(want, replayExpectedCalls(in)...)
+			}
+			assert.ElementsMatch(t, want, client.ChangeMessageVisibilityCalls())
+			assert.Empty(t, client.ChangeMessageVisibilityBatchCalls())
 		})
 	}
 }

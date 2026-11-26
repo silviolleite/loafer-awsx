@@ -808,10 +808,6 @@ func TestRunVisibilityModelBackoffExtendsVisibilityAndLeavesMessage(t *testing.T
 
 	handler := func(_ context.Context, m middleware.Message) error {
 		m.(consumer.Message).Backoff(45 * time.Second)
-		deadline := time.Now().Add(2 * time.Second)
-		for len(client.visibilityChanges()) == 0 && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
-		}
 		close(processed)
 		return nil
 	}
@@ -999,7 +995,9 @@ func runBackoffScenario(tb require.TestingT, s backoffScenario) (*fake.SQSClient
 	}
 
 	var sqsClient consumer.SQSClient = client
-	if !s.batch {
+	if s.batch {
+		client.ChangeMessageVisibilityBatchFunc = succeedVisibilityBatch
+	} else {
 		sqsClient = standardClient(client)
 	}
 

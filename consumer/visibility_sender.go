@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -142,14 +143,20 @@ type singleVisibilitySender struct {
 	queueURL string
 }
 
-// send issues one request per change, each bounded by its own timeout.
+// send issues one request per change, all at once, each bounded by its own
+// timeout, so a batch of changes costs one round trip instead of one per
+// change. It returns once every request has finished.
 func (s *singleVisibilitySender) send(ctx context.Context, changes []visibilityChange) []*visibilityFailure {
 	results := make([]*visibilityFailure, len(changes))
+	var wg sync.WaitGroup
 	for i, change := range changes {
-		if err := s.sendOne(ctx, change); err != nil {
-			results[i] = &visibilityFailure{err: err}
-		}
+		wg.Go(func() {
+			if err := s.sendOne(ctx, change); err != nil {
+				results[i] = &visibilityFailure{err: err}
+			}
+		})
 	}
+	wg.Wait()
 	return results
 }
 

@@ -224,6 +224,14 @@ const CoalesceWindow = coalesceWindow
 // Extension.
 const ExtensionRetryDelay = extensionRetryDelay
 
+// StartMargin exposes the least visibility a message with no extension left
+// must have to start.
+const StartMargin = startMargin
+
+// MaxConcurrentVisibilityRequests exposes how many visibility requests the
+// manager keeps in flight at once.
+const MaxConcurrentVisibilityRequests = maxConcurrentVisibilityRequests
+
 // MaxVisibilitySeconds exposes the 12-hour visibility ceiling in seconds.
 const MaxVisibilitySeconds = maxVisibilitySeconds
 

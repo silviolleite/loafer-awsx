@@ -23,9 +23,11 @@ var (
 // consumer.BatchDeleteClient, and consumer.BatchVisibilityClient interfaces.
 // Each method delegates to a corresponding function field, letting tests
 // program the response (or error) for every call. When a function field is nil
-// the method returns a nil output and a nil error, except DeleteMessageBatch
-// and ChangeMessageVisibilityBatch, which report every entry as successful. Every call is recorded so tests can assert on the parameters the
-// code under test sent.
+// the method returns a nil output and a nil error, with two exceptions:
+// DeleteMessageBatch reports every entry as successful, and
+// ChangeMessageVisibilityBatch replays every entry through
+// ChangeMessageVisibility (see its doc). Every call is recorded so tests can
+// assert on the parameters the code under test sent.
 //
 // SQSClient is safe for concurrent use; the recorded call slices are guarded by
 // an internal mutex.
@@ -144,23 +146,25 @@ func (c *SQSClient) DeleteMessageBatch(
 	return out, nil
 }
 
-// ChangeMessageVisibilityBatch records the call and delegates to
-// ChangeMessageVisibilityBatchFunc. When the function is not set it returns an
-// output that lists the Id of every entry in Successful, and a nil error.
+// ChangeMessageVisibilityBatch records the call in
+// ChangeMessageVisibilityBatchCalls and delegates to
+// ChangeMessageVisibilityBatchFunc when that function is set.
 //
-// When only ChangeMessageVisibilityFunc is set, the batch is replayed as one
-// ChangeMessageVisibility call per entry instead, and only those single calls
-// are recorded. Tests written before the consumer used batched visibility
-// changes therefore keep observing every change through
-// ChangeMessageVisibilityFunc and ChangeMessageVisibilityCalls. An entry whose
+// When ChangeMessageVisibilityBatchFunc is not set, the batch is replayed as one
+// ChangeMessageVisibility call per entry: each entry goes through
+// ChangeMessageVisibilityFunc (when set) and is recorded in
+// ChangeMessageVisibilityCalls, and the batch itself is not recorded. Tests
+// written before the consumer used batched visibility changes therefore keep
+// observing every change through ChangeMessageVisibilityCalls. An entry whose
 // single call returns an error is reported in Failed with that error as its
-// Message.
+// Message. Set ChangeMessageVisibilityBatchFunc to observe the batch requests
+// themselves.
 func (c *SQSClient) ChangeMessageVisibilityBatch(
 	ctx context.Context,
 	params *sqs.ChangeMessageVisibilityBatchInput,
 	optFns ...func(*sqs.Options),
 ) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
-	if c.ChangeMessageVisibilityBatchFunc == nil && c.ChangeMessageVisibilityFunc != nil {
+	if c.ChangeMessageVisibilityBatchFunc == nil {
 		return c.replayVisibilityBatch(ctx, params, optFns...), nil
 	}
 
@@ -168,19 +172,7 @@ func (c *SQSClient) ChangeMessageVisibilityBatch(
 	c.changeMessageVisibilityBatchCalls = append(c.changeMessageVisibilityBatchCalls, params)
 	c.mu.Unlock()
 
-	if c.ChangeMessageVisibilityBatchFunc != nil {
-		return c.ChangeMessageVisibilityBatchFunc(ctx, params, optFns...)
-	}
-
-	out := &sqs.ChangeMessageVisibilityBatchOutput{}
-	if params == nil {
-		return out, nil
-	}
-	out.Successful = make([]types.ChangeMessageVisibilityBatchResultEntry, 0, len(params.Entries))
-	for _, entry := range params.Entries {
-		out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: entry.Id})
-	}
-	return out, nil
+	return c.ChangeMessageVisibilityBatchFunc(ctx, params, optFns...)
 }
 
 // replayVisibilityBatch sends every entry of params through

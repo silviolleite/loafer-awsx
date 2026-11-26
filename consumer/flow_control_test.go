@@ -31,6 +31,8 @@ import (
 const (
 	flowQueueName       = "flow-queue"
 	flowQueueURL        = "https://sqs.us-east-1.amazonaws.com/123456789012/flow-queue"
+	flowFIFOQueueName   = "flow-queue.fifo"
+	flowFIFOQueueURL    = "https://sqs.us-east-1.amazonaws.com/123456789012/flow-queue.fifo"
 	flowDLQURL          = "https://sqs.us-east-1.amazonaws.com/123456789012/flow-dlq"
 	holdWarnMessage     = "holding message to preserve FIFO group order; earlier message in group failed"
 	handlerErrorMessage = "handler returned an error"
@@ -101,6 +103,21 @@ type flowScenario struct {
 	batchVisibility    bool
 	deleteBatch        bool
 	gated              bool
+	fifo               bool
+}
+
+func (s flowScenario) queueName() string {
+	if s.fifo {
+		return flowFIFOQueueName
+	}
+	return flowQueueName
+}
+
+func (s flowScenario) queueURL() string {
+	if s.fifo {
+		return flowFIFOQueueURL
+	}
+	return flowQueueURL
 }
 
 func (s flowScenario) receiveBatch() int32 {
@@ -192,6 +209,7 @@ func drawFlowScenario(t *rapid.T) flowScenario {
 		maxMessages:     rapid.Int32Range(1, maxReceiveBatch).Draw(t, "maxMessages"),
 		maxRetryCount:   rapid.IntRange(0, 3).Draw(t, "maxRetryCount"),
 		batchVisibility: rapid.Bool().Draw(t, "batchVisibility"),
+		fifo:            rapid.Bool().Draw(t, "fifo"),
 	}
 	s.deleteBatch = s.batchVisibility && rapid.Bool().Draw(t, "deleteBatch")
 	if s.retryModel == router.VisibilityRetryModel {
@@ -393,7 +411,7 @@ func runFlowScenario(t require.TestingT, s flowScenario) flowRun {
 	}
 	run.sqs = &fake.SQSClient{
 		GetQueueUrlFunc: func(_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
-			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(flowQueueURL)}, nil
+			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(s.queueURL())}, nil
 		},
 		ReceiveMessageFunc: run.probe.receive,
 		SendMessageFunc: func(_ context.Context, params *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
@@ -405,11 +423,13 @@ func runFlowScenario(t require.TestingT, s flowScenario) flowRun {
 	}
 
 	var client consumer.SQSClient = run.sqs
-	if !s.batchVisibility {
+	if s.batchVisibility {
+		run.sqs.ChangeMessageVisibilityBatchFunc = succeedVisibilityBatch
+	} else {
 		client = standardClient(run.sqs)
 	}
 
-	route, err := router.New(flowQueueName, run.probe.handler, s.routeOptions()...)
+	route, err := router.New(s.queueName(), run.probe.handler, s.routeOptions()...)
 	require.NoError(t, err)
 	logger := slog.New(holdSignal{LogHandler: run.logs, onHold: run.probe.hold})
 	c, err := consumer.New(client, route, consumer.WithSchedulerClient(run.sched), consumer.WithLogger(logger))
@@ -498,10 +518,10 @@ func assertFlowClientPaths(t assert.TestingT, s flowScenario, run flowRun) {
 	}
 	assertReceiveRequestSizes(t, s, run.sqs.ReceiveMessageCalls())
 	for _, call := range run.sqs.ChangeMessageVisibilityCalls() {
-		assert.Equal(t, flowQueueURL, aws.ToString(call.QueueUrl))
+		assert.Equal(t, s.queueURL(), aws.ToString(call.QueueUrl))
 	}
 	for _, call := range run.sqs.ChangeMessageVisibilityBatchCalls() {
-		assert.Equal(t, flowQueueURL, aws.ToString(call.QueueUrl))
+		assert.Equal(t, s.queueURL(), aws.ToString(call.QueueUrl))
 		assert.LessOrEqual(t, len(call.Entries), maxReceiveBatch)
 	}
 }
@@ -618,14 +638,18 @@ func assertHeldOutcome(t assert.TestingT, s flowScenario, p *flowProbe, obs flow
 	assert.Equal(t, router.PerGroupID, s.runMode, h)
 	assert.Equal(t, router.VisibilityRetryModel, s.retryModel, h)
 	assert.Zero(t, obs.deletes[h], h)
-	assert.Empty(t, obs.changes[h], h)
+	if s.fifo {
+		assert.Equal(t, []int32{0}, obs.changes[h], h)
+	} else {
+		assert.Empty(t, obs.changes[h], h)
+	}
 	assert.Zero(t, obs.schedules[m.body], h)
 	assert.Zero(t, obs.published[m.body], h)
 	assert.True(t, hasFailedPeer(s, p, m), h)
 
 	if assert.Len(t, obs.holds[h], 1, h) {
 		attrs := obs.holds[h][0].Attrs
-		assert.Equal(t, flowQueueURL, attrs["queue_url"], h)
+		assert.Equal(t, s.queueURL(), attrs["queue_url"], h)
 		assert.Equal(t, m.groupID, attrs["group_id"], h)
 	}
 }
@@ -878,7 +902,7 @@ func TestRun_GroupSchedulingAvoidsHeadOfLineBlocking(t *testing.T) {
 	}
 }
 
-// Feature: consumer-flow-control, Property 9: For any group script under the Visibility_Retry_Model in which message i of a group fails (error or backoff), no Pending_Message of that group submitted before the failure runs its handler, none is deleted, and none receives any visibility change. Each held message produces exactly one Warn record. Under the Scheduled_Retry_Model no message is held.
+// Feature: consumer-flow-control, Property 9: For any group script under the Visibility_Retry_Model in which message i of a group fails (error or backoff), no Pending_Message of that group submitted before the failure runs its handler and none is deleted; on a FIFO queue each held message receives exactly one visibility change with timeout 0, on other queues none. Each held message produces exactly one Warn record. Under the Scheduled_Retry_Model no message is held.
 func TestRun_PropertyHoldOnFailure(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		defer goleak.VerifyNone(rt)
@@ -896,7 +920,13 @@ func TestRun_PropertyHoldOnFailure(t *testing.T) {
 		for _, m := range s.messages {
 			if held[m.handle] {
 				assert.Zero(rt, run.probe.started[m.handle], m.handle)
+				assert.Zero(rt, obs.deletes[m.handle], m.handle)
 				assert.Len(rt, obs.holds[m.handle], 1, m.handle)
+				if s.fifo {
+					assert.Equal(rt, []int32{0}, obs.changes[m.handle], m.handle)
+				} else {
+					assert.Empty(rt, obs.changes[m.handle], m.handle)
+				}
 				continue
 			}
 			assert.Equal(rt, 1, run.probe.started[m.handle], m.handle)
@@ -927,6 +957,7 @@ func TestRun_HoldOnFailureExamples(t *testing.T) {
 		retryModel router.RetryModel
 		wantHeld   []string
 		wantRun    []string
+		fifo       bool
 	}{
 		{
 			name:       "error holds the tail of the group",
@@ -954,6 +985,29 @@ func TestRun_HoldOnFailureExamples(t *testing.T) {
 			retryModel: router.ScheduledRetryModel,
 			wantRun:    []string{"hold-0", "hold-1", "hold-2"},
 		},
+		{
+			name:       "error on a fifo queue releases the tail of the group",
+			messages:   group(flowSuccess, flowError, flowSuccess, flowSuccess),
+			retryModel: router.VisibilityRetryModel,
+			fifo:       true,
+			wantRun:    []string{"hold-0", "hold-1"},
+			wantHeld:   []string{"hold-2", "hold-3"},
+		},
+		{
+			name:       "backoff on a fifo queue releases the tail of the group",
+			messages:   group(flowBackoff, flowSuccess),
+			retryModel: router.VisibilityRetryModel,
+			fifo:       true,
+			wantRun:    []string{"hold-0"},
+			wantHeld:   []string{"hold-1"},
+		},
+		{
+			name:       "scheduled model on a fifo queue never holds",
+			messages:   group(flowError, flowBackoff, flowSuccess),
+			retryModel: router.ScheduledRetryModel,
+			fifo:       true,
+			wantRun:    []string{"hold-0", "hold-1", "hold-2"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -968,6 +1022,7 @@ func TestRun_HoldOnFailureExamples(t *testing.T) {
 				maxMessages:     maxReceiveBatch,
 				maxRetryCount:   3,
 				batchVisibility: true,
+				fifo:            tt.fifo,
 			})
 
 			run := runFlowScenario(t, s)
@@ -979,6 +1034,13 @@ func TestRun_HoldOnFailureExamples(t *testing.T) {
 				held = append(held, h)
 			}
 			assert.ElementsMatch(t, tt.wantHeld, held)
+			for _, h := range tt.wantHeld {
+				if tt.fifo {
+					assert.Equal(t, []int32{0}, obs.changes[h], h)
+				} else {
+					assert.Empty(t, obs.changes[h], h)
+				}
+			}
 		})
 	}
 }

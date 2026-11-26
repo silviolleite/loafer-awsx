@@ -24,6 +24,15 @@ const (
 	// persistent failure does not turn the manager into a busy loop.
 	extensionRetryDelay = time.Second
 
+	// maxConcurrentVisibilityRequests bounds how many visibility requests the
+	// manager has in flight at once.
+	maxConcurrentVisibilityRequests = 8
+
+	// startMargin is the least visibility a message must have left to start
+	// once it has no extension left; with less, it would most likely become
+	// visible again while its handler runs.
+	startMargin = time.Second
+
 	// maxVisibilitySeconds is the AWS SQS ceiling on a visibility timeout. It
 	// also bounds the total time a message can stay invisible, counted from
 	// its receive.
@@ -197,13 +206,22 @@ func (v *visibilityManager) release(msgs ...*message) {
 	v.signal()
 }
 
-// isExpired reports whether msg is tracked and its Visibility_Deadline is not
-// after now, which means SQS may already have made it visible again.
+// isExpired reports whether msg is tracked and should not be started: its
+// Visibility_Deadline is not after now, which means SQS may already have made
+// it visible again, or it has no Extension left and less than startMargin of
+// visibility remains, so it would become visible while its handler runs.
 func (v *visibilityManager) isExpired(msg *message, now time.Time) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	e, ok := v.entries[msg]
-	return ok && !e.deadline.After(now)
+	if !ok {
+		return false
+	}
+	remaining := e.deadline.Sub(now)
+	if remaining <= 0 {
+		return true
+	}
+	return e.extensions >= v.extensionLimit && remaining < startMargin
 }
 
 // untrackLocked removes msg from the entries and the heap. v.mu must be held.
@@ -346,19 +364,31 @@ func (v *visibilityManager) nextTimeout(e *trackedEntry, now time.Time) (int32, 
 }
 
 // dispatch sends batch in requests of up to maxVisibilityBatch changes and
-// applies each result.
+// applies each result. Up to maxConcurrentVisibilityRequests requests run at
+// once, so one slow request does not delay the extensions of other messages
+// past their deadlines. dispatch returns once every request has finished.
 func (v *visibilityManager) dispatch(ctx context.Context, batch []sentChange) {
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, maxConcurrentVisibilityRequests)
+
 	for start := 0; start < len(batch); start += maxVisibilityBatch {
 		chunk := batch[start:min(start+maxVisibilityBatch, len(batch))]
 
-		changes := make([]visibilityChange, len(chunk))
-		for i := range chunk {
-			changes[i] = chunk[i].change
-		}
+		slots <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-slots }()
 
-		failures := v.send.send(ctx, changes)
-		v.apply(chunk, failures)
+			changes := make([]visibilityChange, len(chunk))
+			for i := range chunk {
+				changes[i] = chunk[i].change
+			}
+
+			failures := v.send.send(ctx, changes)
+			v.apply(chunk, failures)
+		})
 	}
+
+	wg.Wait()
 }
 
 // apply records the result of each sent change. A successful Extension moves

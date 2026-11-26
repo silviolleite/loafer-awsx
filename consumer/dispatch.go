@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,9 @@ const (
 
 	// maxReceiveBatch is the AWS SQS limit on messages per ReceiveMessage call.
 	maxReceiveBatch = 10
+
+	// fifoQueueSuffix ends the name, and so the URL, of every SQS FIFO queue.
+	fifoQueueSuffix = ".fifo"
 
 	// outcomeTimeout bounds the outcome requests of a message whose handler
 	// finished after the run context was canceled.
@@ -79,6 +83,7 @@ type dispatcher struct {
 	retryModel     router.RetryModel
 	workerPoolSize int
 	workers        sync.WaitGroup
+	isFIFO         bool
 	receiveBatch   int32
 }
 
@@ -145,6 +150,7 @@ func newDispatcher(
 		retryModel:     route.RetryModel(),
 		workerPoolSize: workers,
 		receiveBatch:   receiveBatch,
+		isFIFO:         strings.HasSuffix(queueURL, fifoQueueSuffix),
 	}
 
 	if cfg := route.ScheduledRetry(); route.RetryModel() == router.ScheduledRetryModel && cfg != nil && schedulerClient != nil {
@@ -316,11 +322,16 @@ func (d *dispatcher) finish(msg *message) {
 	d.credits.release(1)
 }
 
-// hold finishes every message held back because an earlier message of its FIFO
-// group failed. A held message never runs its handler, is not deleted, and gets
-// no visibility change: it stays in the queue with its current visibility so
-// AWS SQS redelivers the whole group in order once the failed message becomes
-// visible again.
+// hold finishes every message held back because an earlier message of its
+// group failed. A held message never runs its handler and is not deleted.
+//
+// On a FIFO queue it is released with a visibility timeout of zero: SQS does
+// not deliver it while the failed message of its group is in flight, and
+// delivers the group in order once that message is visible again, so the group
+// is retried when the failed message's backoff or visibility timeout ends
+// rather than when the latest extension of a held message runs out. On any
+// other queue SQS gives no group ordering, so the held message keeps its
+// current visibility to stay behind the failed one.
 func (d *dispatcher) hold(msgs []*message) {
 	for _, msg := range msgs {
 		d.log.Warn("holding message to preserve FIFO group order; earlier message in group failed",
@@ -328,6 +339,11 @@ func (d *dispatcher) hold(msgs []*message) {
 			slog.String("receipt_handle", msg.Identifier()),
 			slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
 		)
+		if d.isFIFO {
+			d.visibility.release(msg)
+			d.credits.release(1)
+			continue
+		}
 		d.finish(msg)
 	}
 }
