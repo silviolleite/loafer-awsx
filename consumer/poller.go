@@ -30,9 +30,12 @@ func (c *Consumer) runPollers(ctx context.Context, queueURL string, d *dispatche
 }
 
 // poll runs one receive loop until ctx is canceled. Before each receive it
-// acquires one receive batch, min(MaxMessages, Prefetch+1), of credits and
-// asks for exactly that many messages, so the consumer never holds more messages than its credit capacity.
-// Credits not used by the response are returned at once.
+// acquires one receive batch, min(MaxMessages, Prefetch+1), of credits and asks
+// for exactly that many messages, so the consumer never holds more messages
+// than its credit capacity. When a worker is waiting with nothing to run, it
+// receives with the credits already free instead of waiting for a full batch,
+// so a busy FIFO group never leaves the other workers idle. Credits not used by
+// the response are returned at once.
 //
 // The receive request sets VisibilityTimeout to the route value so each message
 // starts hidden for the configured duration, and every message is stamped with
@@ -41,42 +44,48 @@ func (c *Consumer) runPollers(ctx context.Context, queueURL string, d *dispatche
 // followed by a retry-timeout wait that honors ctx cancellation.
 func (c *Consumer) poll(ctx context.Context, queueURL string, d *dispatcher) {
 	for {
-		if err := d.credits.acquire(ctx, int(d.receiveBatch)); err != nil {
+		credits, err := d.credits.acquireUpTo(ctx, int(d.receiveBatch), d.idle)
+		if err != nil {
 			return
 		}
 
 		out, err := c.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:                    aws.String(queueURL),
-			MaxNumberOfMessages:         d.receiveBatch,
+			MaxNumberOfMessages:         int32(credits),
 			WaitTimeSeconds:             c.route.WaitTimeSeconds(),
 			VisibilityTimeout:           c.route.VisibilityTimeout(),
 			MessageAttributeNames:       allAttributes,
 			MessageSystemAttributeNames: allSystemAttributes,
 		})
 		if err != nil {
-			d.credits.release(int(d.receiveBatch))
+			d.credits.release(credits)
 			if !c.retryAfterError(ctx, queueURL, err) {
 				return
 			}
 			continue
 		}
 
-		c.admitReceived(queueURL, d, out, time.Now())
+		c.admitReceived(queueURL, d, out, credits, time.Now())
 	}
 }
 
-// admitReceived admits up to one receive batch of the returned messages and
-// returns the credits the response did not use. Messages beyond the requested
-// batch, which SQS never returns, are logged and left to become visible again.
-func (c *Consumer) admitReceived(queueURL string, d *dispatcher, out *sqs.ReceiveMessageOutput, receivedAt time.Time) {
+// admitReceived admits up to credits of the returned messages and returns the
+// credits the response did not use. Messages beyond the requested count, which
+// SQS never returns, are logged and left to become visible again.
+func (c *Consumer) admitReceived(
+	queueURL string,
+	d *dispatcher,
+	out *sqs.ReceiveMessageOutput,
+	credits int,
+	receivedAt time.Time,
+) {
 	var received []types.Message
 	if out != nil {
 		received = out.Messages
 	}
 
-	batch := int(d.receiveBatch)
-	n := min(len(received), batch)
-	d.credits.release(batch - n)
+	n := min(len(received), credits)
+	d.credits.release(credits - n)
 
 	for i := n; i < len(received); i++ {
 		c.log.Warn("received more messages than requested; leaving message for redelivery",

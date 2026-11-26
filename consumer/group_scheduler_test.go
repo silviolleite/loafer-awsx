@@ -656,3 +656,176 @@ func TestGroupScheduler_DiscardsSettledGroups(t *testing.T) {
 		}
 	})
 }
+
+func TestGroupScheduler_TakeMarksIdleOnlyWhileBlocked(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	tests := []struct {
+		name     string
+		submit   []string
+		preTake  int
+		wakeUp   func(s *consumer.WorkSource, active *consumer.TestMessage, cancel context.CancelFunc)
+		wantOK   bool
+		wantIdle bool
+	}{
+		{
+			name:   "ready group is taken without becoming idle",
+			submit: []string{"A"},
+			wantOK: true,
+		},
+		{
+			name:     "no group marks the worker idle until a message arrives",
+			wantIdle: true,
+			wantOK:   true,
+			wakeUp: func(s *consumer.WorkSource, _ *consumer.TestMessage, _ context.CancelFunc) {
+				s.Submit(consumer.NewTestMessage("late", "B", nil, ""))
+			},
+		},
+		{
+			name:     "no group marks the worker idle until canceled",
+			wantIdle: true,
+			wakeUp: func(_ *consumer.WorkSource, _ *consumer.TestMessage, cancel context.CancelFunc) {
+				cancel()
+			},
+		},
+		{
+			name:     "pending messages of an active group mark the worker idle until it completes",
+			submit:   []string{"A", "A"},
+			preTake:  1,
+			wantIdle: true,
+			wantOK:   true,
+			wakeUp: func(s *consumer.WorkSource, active *consumer.TestMessage, _ context.CancelFunc) {
+				s.Complete(active, false)
+			},
+		},
+		{
+			name:     "held tail of a failed group leaves the worker idle until canceled",
+			submit:   []string{"A", "A"},
+			preTake:  1,
+			wantIdle: true,
+			wakeUp: func(s *consumer.WorkSource, active *consumer.TestMessage, cancel context.CancelFunc) {
+				s.Complete(active, true)
+				synctest.Wait()
+				cancel()
+			},
+		},
+		{
+			name:    "ready group beside an active group is taken without becoming idle",
+			submit:  []string{"A", "A", "B"},
+			preTake: 1,
+			wantOK:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				idle := consumer.NewIdleWorkers()
+				s := consumer.NewGroupSchedulerWithIdle(4, nil, idle)
+				for i, g := range tt.submit {
+					s.Submit(consumer.NewTestMessage(fmt.Sprintf("m-%d", i), g, nil, ""))
+				}
+				var active *consumer.TestMessage
+				for range tt.preTake {
+					msg, ok := s.Take(context.Background())
+					require.True(t, ok)
+					active = msg
+				}
+				require.False(t, idle.IsAny())
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				results := startTake(ctx, s)
+				synctest.Wait()
+
+				assert.Equal(t, tt.wantIdle, idle.IsAny())
+				if tt.wantIdle {
+					require.Empty(t, results)
+					tt.wakeUp(s, active, cancel)
+				}
+				got := <-results
+
+				assert.Equal(t, tt.wantOK, got.ok)
+				if got.ok {
+					assert.NotSame(t, active, got.msg)
+				}
+				assert.False(t, idle.IsAny())
+			})
+		})
+	}
+}
+
+func TestGroupScheduler_TakeWithNilIdle(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	synctest.Test(t, func(t *testing.T) {
+		s := consumer.NewGroupSchedulerWithIdle(1, nil, nil)
+		msg := consumer.NewTestMessage("h", "g", nil, "")
+
+		results := startTake(context.Background(), s)
+		synctest.Wait()
+		require.Empty(t, results)
+		s.Submit(msg)
+		got := <-results
+
+		require.True(t, got.ok)
+		assert.Same(t, msg, got.msg)
+	})
+}
+
+func runGroupSchedulerIdle(c *collectedFailures, msgs []groupedMessage, preTake, workers int) {
+	idle := consumer.NewIdleWorkers()
+	s := consumer.NewGroupSchedulerWithIdle(len(msgs), nil, idle)
+	groups := make(map[string]struct{})
+	for _, gm := range msgs {
+		s.Submit(gm.msg)
+		groups[gm.group] = struct{}{}
+	}
+	active := min(preTake, len(groups))
+	for range active {
+		_, ok := s.Take(context.Background())
+		if !assert.True(c, ok) {
+			return
+		}
+	}
+	ready := len(groups) - active
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	results := make([]<-chan takeResult, workers)
+	for i := range workers {
+		results[i] = startTake(ctx, s)
+	}
+	synctest.Wait()
+
+	assert.Equal(c, workers > ready, idle.IsAny())
+
+	cancel()
+	taken := 0
+	for _, r := range results {
+		if (<-r).ok {
+			taken++
+		}
+	}
+	assert.Equal(c, min(workers, ready), taken)
+	assert.False(c, idle.IsAny())
+}
+
+func TestGroupScheduler_IdleIffMoreWorkersThanReadyGroups(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		msgs := drawGroupedMessages(rt)
+		preTake := rapid.IntRange(0, 8).Draw(rt, "preTake")
+		workers := rapid.IntRange(1, 12).Draw(rt, "workers")
+		failures := &collectedFailures{}
+
+		synctest.Test(t, func(*testing.T) {
+			runGroupSchedulerIdle(failures, msgs, preTake, workers)
+		})
+
+		if len(failures.msgs) > 0 {
+			rt.Fatalf("%s", strings.Join(failures.msgs, "\n"))
+		}
+	})
+}

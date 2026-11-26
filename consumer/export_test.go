@@ -95,7 +95,8 @@ func NewCreditPool(capacity int) *CreditPool {
 
 // Acquire takes n credits, blocking until available or ctx is done.
 func (p *creditPool) Acquire(ctx context.Context, n int) error {
-	return p.acquire(ctx, n)
+	_, err := p.acquireUpTo(ctx, n, nil)
+	return err
 }
 
 // Release returns n credits.
@@ -120,13 +121,13 @@ type WorkSource struct {
 
 // NewSharedQueue builds the Parallel-mode work source with the given capacity.
 func NewSharedQueue(capacity int) *WorkSource {
-	return &WorkSource{ws: newSharedQueue(capacity)}
+	return &WorkSource{ws: newSharedQueue(capacity, nil)}
 }
 
 // NewGroupScheduler builds the PerGroupID-mode work source with the given
 // capacity and custom group fields.
 func NewGroupScheduler(capacity int, fields []string) *WorkSource {
-	return &WorkSource{ws: newGroupScheduler(capacity, fields)}
+	return &WorkSource{ws: newGroupScheduler(capacity, fields, nil)}
 }
 
 // Submit adds a Pending_Message.
@@ -288,4 +289,51 @@ func (v *VisibilityManager) Tracked() int {
 	v.vm.mu.Lock()
 	defer v.vm.mu.Unlock()
 	return len(v.vm.entries)
+}
+
+// IdleWorkers aliases the internal idle-worker tracker for external tests.
+type IdleWorkers = idleWorkers
+
+// NewIdleWorkers builds an idle-worker tracker with no idle worker.
+func NewIdleWorkers() *IdleWorkers {
+	return newIdleWorkers()
+}
+
+// Enter records a worker that starts waiting with nothing to run.
+func (w *idleWorkers) Enter() {
+	w.enter()
+}
+
+// Leave records that a worker stopped waiting.
+func (w *idleWorkers) Leave() {
+	w.leave()
+}
+
+// IsAny reports whether a worker is waiting with nothing to run.
+func (w *idleWorkers) IsAny() bool {
+	return w.isAny()
+}
+
+// AcquireUpTo takes between 1 and n credits, stopping early once it holds a
+// credit and idle reports an idle worker.
+func (p *creditPool) AcquireUpTo(ctx context.Context, n int, idle *IdleWorkers) (int, error) {
+	return p.acquireUpTo(ctx, n, idle)
+}
+
+// NewSharedQueueWithIdle builds the Parallel-mode work source that records idle
+// workers in idle.
+func NewSharedQueueWithIdle(capacity int, idle *IdleWorkers) *WorkSource {
+	return &WorkSource{ws: newSharedQueue(capacity, idle)}
+}
+
+// NewGroupSchedulerWithIdle builds the PerGroupID-mode work source that records
+// idle workers in idle.
+func NewGroupSchedulerWithIdle(capacity int, fields []string, idle *IdleWorkers) *WorkSource {
+	return &WorkSource{ws: newGroupScheduler(capacity, fields, idle)}
+}
+
+// IsExpired reports whether msg is tracked and its visibility deadline is not
+// after now.
+func (v *VisibilityManager) IsExpired(msg *TestMessage, now time.Time) bool {
+	return v.vm.isExpired(msg, now)
 }

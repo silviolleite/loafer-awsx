@@ -496,15 +496,30 @@ func assertFlowClientPaths(t assert.TestingT, s flowScenario, run flowRun) {
 	} else {
 		assert.Empty(t, run.sqs.DeleteMessageBatchCalls())
 	}
-	for _, call := range run.sqs.ReceiveMessageCalls() {
-		assert.Equal(t, s.receiveBatch(), call.MaxNumberOfMessages)
-	}
+	assertReceiveRequestSizes(t, s, run.sqs.ReceiveMessageCalls())
 	for _, call := range run.sqs.ChangeMessageVisibilityCalls() {
 		assert.Equal(t, flowQueueURL, aws.ToString(call.QueueUrl))
 	}
 	for _, call := range run.sqs.ChangeMessageVisibilityBatchCalls() {
 		assert.Equal(t, flowQueueURL, aws.ToString(call.QueueUrl))
 		assert.LessOrEqual(t, len(call.Entries), maxReceiveBatch)
+	}
+}
+
+func assertReceiveRequestSizes(t assert.TestingT, s flowScenario, calls []*sqs.ReceiveMessageInput) {
+	batch := s.receiveBatch()
+	if !assert.NotEmpty(t, calls) {
+		return
+	}
+	assert.True(t, slices.ContainsFunc(calls, func(in *sqs.ReceiveMessageInput) bool {
+		return in.MaxNumberOfMessages == batch
+	}))
+	for _, call := range calls {
+		assert.GreaterOrEqual(t, call.MaxNumberOfMessages, int32(1))
+		assert.LessOrEqual(t, call.MaxNumberOfMessages, batch)
+		if s.gated {
+			assert.Equal(t, batch, call.MaxNumberOfMessages)
+		}
 	}
 }
 

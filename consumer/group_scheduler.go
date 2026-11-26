@@ -29,6 +29,7 @@ type groupState struct {
 type groupScheduler struct {
 	groups       map[string]*groupState
 	ready        chan *groupState
+	idle         *idleWorkers
 	customFields []string
 	mu           sync.Mutex
 }
@@ -37,14 +38,17 @@ var _ workSource = (*groupScheduler)(nil)
 
 // newGroupScheduler builds a groupScheduler for up to capacity admitted
 // messages, deriving Group_Keys from customFields. A capacity below 1 is raised
-// to 1.
-func newGroupScheduler(capacity int, customFields []string) *groupScheduler {
+// to 1. idle, which may be nil, records the workers waiting in take while no
+// group is ready, including when every pending message belongs to a group that
+// is already running.
+func newGroupScheduler(capacity int, customFields []string, idle *idleWorkers) *groupScheduler {
 	if capacity < 1 {
 		capacity = 1
 	}
 	return &groupScheduler{
 		groups:       make(map[string]*groupState),
 		ready:        make(chan *groupState, capacity),
+		idle:         idle,
 		customFields: customFields,
 	}
 }
@@ -78,11 +82,9 @@ func (s *groupScheduler) submit(msgs ...*message) {
 // take waits for a ready group and starts its oldest Pending_Message.
 func (s *groupScheduler) take(ctx context.Context) (*message, bool) {
 	for {
-		var g *groupState
-		select {
-		case <-ctx.Done():
+		g, ok := s.nextReady(ctx)
+		if !ok {
 			return nil, false
-		case g = <-s.ready:
 		}
 
 		s.mu.Lock()
@@ -98,6 +100,26 @@ func (s *groupScheduler) take(ctx context.Context) (*message, bool) {
 		s.mu.Unlock()
 
 		return msg, true
+	}
+}
+
+// nextReady returns the next ready group, counting the worker as idle while it
+// waits for one. It reports false once ctx is done.
+func (s *groupScheduler) nextReady(ctx context.Context) (*groupState, bool) {
+	select {
+	case g := <-s.ready:
+		return g, true
+	default:
+	}
+
+	s.idle.enter()
+	defer s.idle.leave()
+
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case g := <-s.ready:
+		return g, true
 	}
 }
 

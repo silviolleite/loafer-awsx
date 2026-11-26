@@ -1363,3 +1363,99 @@ func TestVisibilityManager_CoalesceWindowEdges(t *testing.T) {
 		})
 	}
 }
+
+func TestVisibilityManager_IsExpired(t *testing.T) {
+	const vt = 30
+	received := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	deadline := received.Add(vmSeconds(vt))
+
+	tests := []struct {
+		now     time.Time
+		name    string
+		track   bool
+		untrack bool
+		want    bool
+	}{
+		{name: "untracked message is never expired", now: deadline.Add(time.Hour)},
+		{name: "untracked after tracking is never expired", track: true, untrack: true, now: deadline.Add(time.Hour)},
+		{name: "at receive time", track: true, now: received},
+		{name: "one nanosecond before the deadline", track: true, now: deadline.Add(-time.Nanosecond)},
+		{name: "at the deadline", track: true, now: deadline, want: true},
+		{name: "after the deadline", track: true, now: deadline.Add(time.Nanosecond), want: true},
+		{name: "long after the deadline", track: true, now: deadline.Add(13 * time.Hour), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vm := consumer.NewVisibilityManager(&fake.SQSClient{}, visibilityQueueURL, vt, 0, nil)
+			msg := visibilityMessages("msg")[0]
+			consumer.SetReceivedAt(msg, received)
+			if tt.track {
+				vm.Track(msg)
+			}
+			if tt.untrack {
+				vm.Untrack(msg)
+			}
+
+			assert.Equal(t, tt.want, vm.IsExpired(msg, tt.now))
+		})
+	}
+}
+
+func TestVisibilityManager_IsExpiredAgainstDeadline(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		vt := rapid.Int32Range(1, 43200).Draw(rt, "vt")
+		offset := time.Duration(rapid.Int64Range(-2*int64(vmSeconds(vt)), 2*int64(vmSeconds(vt))).Draw(rt, "offset"))
+		received := time.Unix(rapid.Int64Range(0, 1<<32).Draw(rt, "received"), 0)
+		vm := consumer.NewVisibilityManager(&fake.SQSClient{}, visibilityQueueURL, vt, 0, nil)
+		msg := visibilityMessages("msg")[0]
+		consumer.SetReceivedAt(msg, received)
+		vm.Track(msg)
+
+		assert.Equal(rt, offset >= vmSeconds(vt), vm.IsExpired(msg, received.Add(offset)))
+	})
+}
+
+func TestVisibilityManager_IsExpiredAfterExtension(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	tests := []struct {
+		respond      vmRespond
+		name         string
+		wantExtended bool
+	}{
+		{name: "successful extension moves the deadline", wantExtended: true},
+		{
+			name: "failed extension keeps the deadline",
+			respond: func(int, *sqs.ChangeMessageVisibilityBatchInput) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+				return nil, errors.New("extension failed")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const vt = 30
+				rec := newVMRecorder(tt.respond)
+				vm := startVM(rec.client, vt, 1, nil)
+				defer vm.Close()
+				msg := visibilityMessages("msg")[0]
+				received := time.Now()
+				consumer.SetReceivedAt(msg, received)
+				deadline := received.Add(vmSeconds(vt))
+				vm.Track(msg)
+
+				vmSleepUntil(deadline.Add(-consumer.RenewalMargin))
+				synctest.Wait()
+				require.NotEmpty(t, rec.sends())
+				sentAt := rec.sends()[0].at
+
+				assert.Equal(t, !tt.wantExtended, vm.IsExpired(msg, deadline))
+				assert.True(t, vm.IsExpired(msg, sentAt.Add(vmSeconds(vt))))
+				assert.False(t, vm.IsExpired(msg, deadline.Add(-time.Nanosecond)))
+				vm.Untrack(msg)
+			})
+		})
+	}
+}

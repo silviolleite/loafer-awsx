@@ -99,23 +99,26 @@ type pollerStep struct {
 }
 
 type admissionModel struct {
-	blocked    map[string]chan struct{}
-	handled    map[string]int
-	deleted    map[string]int
-	script     []pollerStep
-	order      []string
-	violations []string
-	capacity   int
-	batch      int
-	next       int
-	received   int
-	finished   int
-	inflight   int
-	parked     int
-	mu         sync.Mutex
+	blocked       map[string]chan struct{}
+	handled       map[string]int
+	deleted       map[string]int
+	script        []pollerStep
+	order         []string
+	violations    []string
+	capacity      int
+	batch         int
+	pollers       int
+	next          int
+	received      int
+	finished      int
+	inflight      int
+	parked        int
+	parkedCredits int
+	settledParked int
+	mu            sync.Mutex
 }
 
-func newAdmissionModel(capacity, batch int, script []pollerStep) *admissionModel {
+func newAdmissionModel(capacity, batch, pollers int, script []pollerStep) *admissionModel {
 	return &admissionModel{
 		blocked:  make(map[string]chan struct{}),
 		handled:  make(map[string]int),
@@ -123,6 +126,7 @@ func newAdmissionModel(capacity, batch int, script []pollerStep) *admissionModel
 		script:   script,
 		capacity: capacity,
 		batch:    batch,
+		pollers:  pollers,
 	}
 }
 
@@ -132,34 +136,37 @@ func (m *admissionModel) violatef(format string, args ...any) {
 
 func (m *admissionModel) receive(ctx context.Context, in *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error) {
 	m.mu.Lock()
-	if int(in.MaxNumberOfMessages) != m.batch {
-		m.violatef("MaxNumberOfMessages = %d, want %d", in.MaxNumberOfMessages, m.batch)
+	requested := int(in.MaxNumberOfMessages)
+	if requested < 1 || requested > m.batch {
+		m.violatef("MaxNumberOfMessages = %d, want within [1, %d]", requested, m.batch)
 	}
-	if admitted := m.received - m.finished; admitted+m.inflight+m.batch > m.capacity {
-		m.violatef("receive issued with admitted %d + in-flight %d + batch %d > capacity %d", admitted, m.inflight, m.batch, m.capacity)
+	if admitted := m.received - m.finished; admitted+m.inflight+requested > m.capacity {
+		m.violatef("receive issued with admitted %d + in-flight %d + requested %d > capacity %d", admitted, m.inflight, requested, m.capacity)
 	}
-	m.inflight += m.batch
+	m.inflight += requested
 
 	if m.next >= len(m.script) {
 		m.parked++
+		m.parkedCredits += requested
 		m.mu.Unlock()
 		<-ctx.Done()
 		m.mu.Lock()
 		m.parked--
-		m.inflight -= m.batch
+		m.parkedCredits -= requested
+		m.inflight -= requested
 		m.mu.Unlock()
 		return nil, ctx.Err()
 	}
 
 	step := m.script[m.next]
 	m.next++
-	m.inflight -= m.batch
+	m.inflight -= requested
 	if step.fail {
 		m.mu.Unlock()
 		return nil, errPollerReceive
 	}
 
-	k := step.size % (m.batch + 1)
+	k := step.size % (requested + 1)
 	msgs := pollerMessages("p3", m.received, k)
 	m.received += k
 	m.mu.Unlock()
@@ -207,10 +214,17 @@ func (m *admissionModel) releaseNext(pick int) bool {
 	return true
 }
 
-func (m *admissionModel) settled(wantParked int) bool {
+func (m *admissionModel) settled() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.next >= len(m.script) && len(m.order) == 0 && m.parked == wantParked
+	if m.next < len(m.script) || len(m.order) > 0 {
+		return false
+	}
+	if m.parked != m.pollers && m.parkedCredits != m.capacity {
+		return false
+	}
+	m.settledParked = m.parked
+	return true
 }
 
 func (m *admissionModel) fail(msg string) {
@@ -228,7 +242,7 @@ func drawPollerScript(t *rapid.T) []pollerStep {
 	}), 0, 12).Draw(t, "script")
 }
 
-// Feature: consumer-flow-control, Property 3: For any route configuration (WorkerPoolSize, Prefetch, MaxMessages, Pollers), any sequence of receive responses (sizes 0 to MaxNumberOfMessages, errors), and any handler latencies, the number of Admitted_Messages never exceeds WorkerPoolSize + Prefetch, every ReceiveMessage call carries MaxNumberOfMessages == min(MaxMessages, Prefetch + 1), and no receive is issued while fewer Credits than that are available.
+// Feature: consumer-flow-control, Property 3: For any route configuration (WorkerPoolSize, Prefetch, MaxMessages, Pollers), any sequence of receive responses (sizes 0 to MaxNumberOfMessages, errors), and any handler latencies, the number of Admitted_Messages never exceeds WorkerPoolSize + Prefetch, every ReceiveMessage call carries 1 <= MaxNumberOfMessages <= min(MaxMessages, Prefetch + 1), and no receive is issued with fewer Credits than requested.
 func TestRun_PropertyAdmissionBoundAndRequestSize(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
@@ -242,8 +256,8 @@ func TestRun_PropertyAdmissionBoundAndRequestSize(t *testing.T) {
 
 		capacity := workers + prefetch
 		batch := min(maxMessages, prefetch+1)
-		wantParked := min(pollers, capacity/batch)
-		model := newAdmissionModel(capacity, batch, script)
+		minParked := min(pollers, (capacity+batch-1)/batch)
+		model := newAdmissionModel(capacity, batch, pollers, script)
 
 		client := pollerClient(model.receive)
 		client.DeleteMessageFunc = model.deleteMessage
@@ -260,7 +274,7 @@ func TestRun_PropertyAdmissionBoundAndRequestSize(t *testing.T) {
 			cancel, errc := startPollerRun(c)
 			for step := 0; ; step++ {
 				synctest.Wait()
-				if model.settled(wantParked) {
+				if model.settled() {
 					break
 				}
 				if step >= pollerMaxSteps {
@@ -278,7 +292,16 @@ func TestRun_PropertyAdmissionBoundAndRequestSize(t *testing.T) {
 
 		require.NoError(rt, runErr)
 		require.Empty(rt, model.violations, strings.Join(model.violations, "\n"))
-		assert.Len(rt, client.ReceiveMessageCalls(), len(script)+wantParked)
+		assert.GreaterOrEqual(rt, model.settledParked, minParked)
+		assert.LessOrEqual(rt, model.settledParked, pollers)
+		calls := client.ReceiveMessageCalls()
+		assert.Len(rt, calls, len(script)+model.settledParked)
+		assert.True(rt, slices.ContainsFunc(calls, func(in *sqs.ReceiveMessageInput) bool {
+			return int(in.MaxNumberOfMessages) == batch
+		}))
+		if pollers == 1 && len(calls) > 0 {
+			assert.Equal(rt, int32(batch), calls[0].MaxNumberOfMessages)
+		}
 		assert.Len(rt, model.handled, model.received)
 		for id, n := range model.handled {
 			assert.Equal(rt, 1, n, id)
@@ -289,41 +312,46 @@ func TestRun_PropertyAdmissionBoundAndRequestSize(t *testing.T) {
 }
 
 type stuckModel struct {
-	handled      map[string]int
-	deleted      map[string]int
-	stuckID      string
-	received     []string
-	script       []int
-	next         int
-	parked       int
-	stuckIndex   int
-	mu           sync.Mutex
-	stuckStarted bool
+	handled       map[string]int
+	deleted       map[string]int
+	stuckID       string
+	received      []string
+	script        []int
+	next          int
+	parked        int
+	parkedCredits int
+	anchor        int
+	stuckOffset   int
+	mu            sync.Mutex
+	stuckStarted  bool
 }
 
 type stuckSnapshot struct {
-	deleted      map[string]int
-	stuckID      string
-	received     []string
-	next         int
-	parked       int
-	stuckStarted bool
+	deleted       map[string]int
+	stuckID       string
+	received      []string
+	next          int
+	parked        int
+	parkedCredits int
+	stuckStarted  bool
 }
 
-func (m *stuckModel) receive(ctx context.Context, _ *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error) {
+func (m *stuckModel) receive(ctx context.Context, in *sqs.ReceiveMessageInput) (*sqs.ReceiveMessageOutput, error) {
 	m.mu.Lock()
+	requested := int(in.MaxNumberOfMessages)
 	if m.next >= len(m.script) {
 		m.parked++
+		m.parkedCredits += requested
 		m.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 
-	size := m.script[m.next]
+	step := m.next
 	m.next++
-	msgs := pollerMessages("p5", len(m.received), size)
-	for _, msg := range msgs {
-		if len(m.received) == m.stuckIndex {
+	msgs := pollerMessages("p5", len(m.received), min(m.script[step], requested))
+	for i, msg := range msgs {
+		if step == m.anchor && i == min(m.stuckOffset, len(msgs)-1) {
 			m.stuckID = aws.ToString(msg.ReceiptHandle)
 		}
 		m.received = append(m.received, aws.ToString(msg.ReceiptHandle))
@@ -363,12 +391,13 @@ func (m *stuckModel) snapshot() stuckSnapshot {
 		deleted[k] = v
 	}
 	return stuckSnapshot{
-		deleted:      deleted,
-		stuckID:      m.stuckID,
-		received:     slices.Clone(m.received),
-		next:         m.next,
-		parked:       m.parked,
-		stuckStarted: m.stuckStarted,
+		deleted:       deleted,
+		stuckID:       m.stuckID,
+		received:      slices.Clone(m.received),
+		next:          m.next,
+		parked:        m.parked,
+		parkedCredits: m.parkedCredits,
+		stuckStarted:  m.stuckStarted,
 	}
 }
 
@@ -387,19 +416,15 @@ func TestRun_PropertyParallelProgressDespiteStuckWorker(t *testing.T) {
 		script := rapid.SliceOfN(rapid.IntRange(0, batch), 1, 8).Draw(rt, "script")
 		anchor := rapid.IntRange(0, len(script)-1).Draw(rt, "anchor")
 		script[anchor] = max(script[anchor], 1)
-		total := 0
-		for _, n := range script {
-			total += n
-		}
-		stuckIndex := rapid.IntRange(0, total-1).Draw(rt, "stuckIndex")
-		freeBatches := (capacity - 1) / batch
-		wantParked := min(pollers, freeBatches)
+		stuckOffset := rapid.IntRange(0, script[anchor]-1).Draw(rt, "stuckOffset")
+		minParked := min(pollers, (capacity-1+batch-1)/batch)
 
 		model := &stuckModel{
-			handled:    make(map[string]int),
-			deleted:    make(map[string]int),
-			script:     script,
-			stuckIndex: stuckIndex,
+			handled:     make(map[string]int),
+			deleted:     make(map[string]int),
+			script:      script,
+			anchor:      anchor,
+			stuckOffset: stuckOffset,
 		}
 		client := pollerClient(model.receive)
 		client.DeleteMessageFunc = model.deleteMessage
@@ -434,13 +459,21 @@ func TestRun_PropertyParallelProgressDespiteStuckWorker(t *testing.T) {
 			assert.Equal(rt, 1, before.deleted[id], id)
 		}
 		assert.Len(rt, before.deleted, len(before.received)-1)
-		assert.Equal(rt, wantParked, before.parked)
-		if freeBatches >= 1 {
-			assert.Equal(rt, len(script), before.next)
-			assert.Len(rt, before.received, total)
-		}
+		assert.Equal(rt, len(script), before.next)
+		assert.GreaterOrEqual(rt, before.parked, minParked)
+		assert.LessOrEqual(rt, before.parked, pollers)
+		assert.True(rt, before.parked == pollers || before.parkedCredits == capacity-1)
 		for id, n := range model.handled {
 			assert.Equal(rt, 1, n, id)
+		}
+		calls := client.ReceiveMessageCalls()
+		assert.Len(rt, calls, len(script)+before.parked)
+		assert.True(rt, slices.ContainsFunc(calls, func(in *sqs.ReceiveMessageInput) bool {
+			return int(in.MaxNumberOfMessages) == batch
+		}))
+		for _, in := range calls {
+			assert.GreaterOrEqual(rt, int(in.MaxNumberOfMessages), 1)
+			assert.LessOrEqual(rt, int(in.MaxNumberOfMessages), batch)
 		}
 	})
 }
@@ -621,9 +654,11 @@ func TestRun_OversizedReceiveAdmitsOnlyRequestedBatch(t *testing.T) {
 
 				calls := client.ReceiveMessageCalls()
 				require.Len(t, calls, 2)
+				assert.Equal(t, int32(tt.wantBatch), calls[0].MaxNumberOfMessages)
+				assert.GreaterOrEqual(t, calls[1].MaxNumberOfMessages, int32(1))
+				assert.LessOrEqual(t, calls[1].MaxNumberOfMessages, int32(tt.wantBatch))
 				for _, in := range calls {
 					assert.Equal(t, pollerQueueURL, aws.ToString(in.QueueUrl))
-					assert.Equal(t, int32(tt.wantBatch), in.MaxNumberOfMessages)
 					assert.Equal(t, tt.waitTimeSeconds, in.WaitTimeSeconds)
 					assert.Equal(t, tt.visibilityTimeout, in.VisibilityTimeout)
 					assert.Equal(t, []string{"All"}, in.MessageAttributeNames)

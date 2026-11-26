@@ -197,6 +197,15 @@ func (v *visibilityManager) release(msgs ...*message) {
 	v.signal()
 }
 
+// isExpired reports whether msg is tracked and its Visibility_Deadline is not
+// after now, which means SQS may already have made it visible again.
+func (v *visibilityManager) isExpired(msg *message, now time.Time) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	e, ok := v.entries[msg]
+	return ok && !e.deadline.After(now)
+}
+
 // untrackLocked removes msg from the entries and the heap. v.mu must be held.
 func (v *visibilityManager) untrackLocked(msg *message) {
 	e, ok := v.entries[msg]

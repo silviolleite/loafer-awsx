@@ -29,18 +29,20 @@ type workSource interface {
 // sharedQueue is the Parallel-mode workSource: one channel drained by every
 // worker, so any idle worker takes the next message.
 type sharedQueue struct {
-	ch chan *message
+	ch   chan *message
+	idle *idleWorkers
 }
 
 var _ workSource = (*sharedQueue)(nil)
 
 // newSharedQueue builds a sharedQueue whose channel holds capacity messages. A
-// capacity below 1 is raised to 1.
-func newSharedQueue(capacity int) *sharedQueue {
+// capacity below 1 is raised to 1. idle, which may be nil, records the workers
+// waiting in take while the queue is empty.
+func newSharedQueue(capacity int, idle *idleWorkers) *sharedQueue {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &sharedQueue{ch: make(chan *message, capacity)}
+	return &sharedQueue{ch: make(chan *message, capacity), idle: idle}
 }
 
 // submit enqueues msgs. It does not block while the caller holds a credit for
@@ -51,8 +53,18 @@ func (q *sharedQueue) submit(msgs ...*message) {
 	}
 }
 
-// take returns the next Pending_Message, or ok false once ctx is done.
+// take returns the next Pending_Message, or ok false once ctx is done. A
+// worker that finds the queue empty counts as idle while it waits.
 func (q *sharedQueue) take(ctx context.Context) (*message, bool) {
+	select {
+	case msg := <-q.ch:
+		return msg, true
+	default:
+	}
+
+	q.idle.enter()
+	defer q.idle.leave()
+
 	select {
 	case <-ctx.Done():
 		return nil, false

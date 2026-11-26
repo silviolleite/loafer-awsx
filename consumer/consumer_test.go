@@ -991,9 +991,6 @@ func runBackoffScenario(tb require.TestingT, s backoffScenario) (*fake.SQSClient
 			deletes.tick()
 			return &sqs.DeleteMessageOutput{}, nil
 		},
-		ChangeMessageVisibilityFunc: func(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
-			return &sqs.ChangeMessageVisibilityOutput{}, nil
-		},
 	}
 	sched := &fake.SchedulerClient{
 		CreateScheduleFunc: func(_ context.Context, _ *scheduler.CreateScheduleInput, _ ...func(*scheduler.Options)) (*scheduler.CreateScheduleOutput, error) {

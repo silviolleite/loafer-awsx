@@ -149,7 +149,7 @@ func runToCompletion(t *testing.T, d *dispatcher, msgs []*message) {
 	ctx, cancel := context.WithCancel(t.Context())
 	d.visibility.start(context.WithoutCancel(ctx))
 	for _, m := range msgs {
-		require.NoError(t, d.credits.acquire(ctx, 1))
+		require.NoError(t, d.credits.Acquire(ctx, 1))
 		d.admit(m)
 	}
 	d.startWorkers(ctx)

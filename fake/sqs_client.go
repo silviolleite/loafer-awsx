@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
@@ -146,11 +147,23 @@ func (c *SQSClient) DeleteMessageBatch(
 // ChangeMessageVisibilityBatch records the call and delegates to
 // ChangeMessageVisibilityBatchFunc. When the function is not set it returns an
 // output that lists the Id of every entry in Successful, and a nil error.
+//
+// When only ChangeMessageVisibilityFunc is set, the batch is replayed as one
+// ChangeMessageVisibility call per entry instead, and only those single calls
+// are recorded. Tests written before the consumer used batched visibility
+// changes therefore keep observing every change through
+// ChangeMessageVisibilityFunc and ChangeMessageVisibilityCalls. An entry whose
+// single call returns an error is reported in Failed with that error as its
+// Message.
 func (c *SQSClient) ChangeMessageVisibilityBatch(
 	ctx context.Context,
 	params *sqs.ChangeMessageVisibilityBatchInput,
 	optFns ...func(*sqs.Options),
 ) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+	if c.ChangeMessageVisibilityBatchFunc == nil && c.ChangeMessageVisibilityFunc != nil {
+		return c.replayVisibilityBatch(ctx, params, optFns...), nil
+	}
+
 	c.mu.Lock()
 	c.changeMessageVisibilityBatchCalls = append(c.changeMessageVisibilityBatchCalls, params)
 	c.mu.Unlock()
@@ -168,6 +181,36 @@ func (c *SQSClient) ChangeMessageVisibilityBatch(
 		out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: entry.Id})
 	}
 	return out, nil
+}
+
+// replayVisibilityBatch sends every entry of params through
+// ChangeMessageVisibility and builds the batch output from the results.
+func (c *SQSClient) replayVisibilityBatch(
+	ctx context.Context,
+	params *sqs.ChangeMessageVisibilityBatchInput,
+	optFns ...func(*sqs.Options),
+) *sqs.ChangeMessageVisibilityBatchOutput {
+	out := &sqs.ChangeMessageVisibilityBatchOutput{}
+	if params == nil {
+		return out
+	}
+	for _, entry := range params.Entries {
+		_, err := c.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+			QueueUrl:          params.QueueUrl,
+			ReceiptHandle:     entry.ReceiptHandle,
+			VisibilityTimeout: entry.VisibilityTimeout,
+		}, optFns...)
+		if err != nil {
+			out.Failed = append(out.Failed, types.BatchResultErrorEntry{
+				Id:      entry.Id,
+				Code:    aws.String("FakeChangeMessageVisibilityError"),
+				Message: aws.String(err.Error()),
+			})
+			continue
+		}
+		out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: entry.Id})
+	}
+	return out
 }
 
 // ReceiveMessageCalls returns a copy of the inputs passed to ReceiveMessage, in

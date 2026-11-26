@@ -64,6 +64,7 @@ type dispatcher struct {
 	handler        middleware.Handler
 	visibility     *visibilityManager
 	credits        *creditPool
+	idle           *idleWorkers
 	src            workSource
 	log            *slog.Logger
 	dlq            *router.DLQConfig
@@ -123,9 +124,10 @@ func newDispatcher(
 	prefetch := max(route.Prefetch(), 0)
 	receiveBatch := int32(max(min(int(route.MaxMessages()), prefetch+1, maxReceiveBatch), 1))
 
-	var src workSource = newSharedQueue(capacity)
+	idle := newIdleWorkers()
+	var src workSource = newSharedQueue(capacity, idle)
 	if route.RunMode() == router.PerGroupID {
-		src = newGroupScheduler(capacity, route.CustomGroupFields())
+		src = newGroupScheduler(capacity, route.CustomGroupFields(), idle)
 	}
 
 	d := &dispatcher{
@@ -133,6 +135,7 @@ func newDispatcher(
 		handler:        handler,
 		visibility:     vm,
 		credits:        newCreditPool(capacity),
+		idle:           idle,
 		src:            src,
 		log:            log,
 		dlq:            route.DLQ(),
@@ -199,9 +202,28 @@ func (d *dispatcher) worker(ctx context.Context) {
 			continue
 		}
 
+		if d.visibility.isExpired(msg, time.Now()) {
+			d.skipExpired(msg)
+			d.hold(d.src.complete(msg, d.retryModel == router.VisibilityRetryModel))
+			continue
+		}
+
 		failed := d.process(ctx, msg)
 		d.hold(d.src.complete(msg, failed))
 	}
+}
+
+// skipExpired finishes a message whose visibility timeout ran out before a
+// worker could start it. SQS may already have delivered it to another consumer,
+// so its handler is not run and it is left for redelivery. Under the Visibility
+// retry model the caller holds the rest of its group, which keeps group order.
+func (d *dispatcher) skipExpired(msg *message) {
+	d.log.Warn("skipping message whose visibility timeout expired before it started",
+		slog.String("queue_url", d.queueURL),
+		slog.String("receipt_handle", msg.Identifier()),
+		slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+	)
+	d.finish(msg)
 }
 
 // releasePending makes every message still pending visible again at once and
@@ -253,7 +275,8 @@ func (d *dispatcher) process(ctx context.Context, msg *message) bool {
 		return true
 	}
 
-	defer d.finish(msg)
+	d.visibility.untrack(msg)
+	defer d.credits.release(1)
 
 	if err != nil {
 		if d.observeDLQ(ctx, msg) {

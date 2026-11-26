@@ -39,6 +39,8 @@ const (
 var (
 	errCommitHandler       = errors.New("handler failed")
 	errCommitOrchestration = errors.New("orchestration failed")
+
+	errReceiveScriptExceedsRequest = errors.New("scripted receive batch exceeds MaxNumberOfMessages")
 )
 
 type commitOutcome int
@@ -101,9 +103,10 @@ func drawCommitScenario(t *rapid.T) commitScenario {
 	groups := rapid.IntRange(1, 4).Draw(t, "groups")
 	outcomes := rapid.SampledFrom([]commitOutcome{outcomeSuccess, outcomeError, outcomeBackoff})
 	s.batches = make([][]commitMessage, rapid.IntRange(1, 3).Draw(t, "batchCount"))
-	next := 0
+	next, prev := 0, 0
 	for b := range s.batches {
-		size := rapid.IntRange(0, int(s.maxMessages)).Draw(t, "batchSize")
+		size := rapid.IntRange(0, min(int(s.maxMessages), s.workers+int(s.maxMessages)-prev)).Draw(t, "batchSize")
+		prev = size
 		s.batches[b] = make([]commitMessage, size)
 		for i := range s.batches[b] {
 			id := strconv.Itoa(next)
@@ -272,8 +275,11 @@ func newCommitScheduler(s commitScenario) *fake.SchedulerClient {
 
 func runQuiescentBatches(ctx context.Context, c *consumer.Consumer, client *fake.SQSClient, batches [][]types.Message, shutdown func()) error {
 	next := make(chan struct{})
-	var calls atomic.Int64
-	client.ReceiveMessageFunc = func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+	var (
+		calls     atomic.Int64
+		oversized atomic.Int64
+	)
+	client.ReceiveMessageFunc = func(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 		n := int(calls.Add(1) - 1)
 		if n > 0 {
 			select {
@@ -282,7 +288,11 @@ func runQuiescentBatches(ctx context.Context, c *consumer.Consumer, client *fake
 			case <-next:
 			}
 		}
-		return &sqs.ReceiveMessageOutput{Messages: batches[n]}, nil
+		k := min(len(batches[n]), int(in.MaxNumberOfMessages))
+		if k < len(batches[n]) {
+			oversized.Add(1)
+		}
+		return &sqs.ReceiveMessageOutput{Messages: batches[n][:k]}, nil
 	}
 
 	done := make(chan error, 1)
@@ -295,7 +305,22 @@ func runQuiescentBatches(ctx context.Context, c *consumer.Consumer, client *fake
 	synctest.Wait()
 	shutdown()
 
-	return <-done
+	err := <-done
+	if oversized.Load() > 0 {
+		return errors.Join(err, errReceiveScriptExceedsRequest)
+	}
+	return err
+}
+
+func assertCommitReceiveRequests(t assert.TestingT, s commitScenario, calls []*sqs.ReceiveMessageInput) {
+	if !assert.NotEmpty(t, calls) {
+		return
+	}
+	assert.Equal(t, s.maxMessages, calls[0].MaxNumberOfMessages)
+	for _, call := range calls {
+		assert.GreaterOrEqual(t, call.MaxNumberOfMessages, int32(1))
+		assert.LessOrEqual(t, call.MaxNumberOfMessages, s.maxMessages)
+	}
 }
 
 func runCommitScenario(
@@ -325,6 +350,7 @@ func runCommitScenario(
 		runErr = runQuiescentBatches(ctx, c, run.sqs, s.receiveBatches(), cancel)
 	})
 	require.NoError(tb, runErr)
+	assertCommitReceiveRequests(tb, s, run.sqs.ReceiveMessageCalls())
 	return run
 }
 
@@ -1087,12 +1113,21 @@ func receiptHandles(batches [][]types.Message) []string {
 func scriptedReceive(
 	batches [][]types.Message,
 ) func(context.Context, *sqs.ReceiveMessageInput, ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
-	var calls atomic.Int64
-	return func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
-		n := int(calls.Add(1) - 1)
-		if n < len(batches) {
-			return &sqs.ReceiveMessageOutput{Messages: batches[n]}, nil
+	var mu sync.Mutex
+	pending := slices.Clone(batches)
+	return func(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+		mu.Lock()
+		if len(pending) > 0 {
+			n := min(len(pending[0]), int(in.MaxNumberOfMessages))
+			msgs := pending[0][:n]
+			pending[0] = pending[0][n:]
+			if len(pending[0]) == 0 {
+				pending = pending[1:]
+			}
+			mu.Unlock()
+			return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
 		}
+		mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}

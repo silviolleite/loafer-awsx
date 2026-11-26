@@ -10,6 +10,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -68,7 +70,7 @@ func TestDispatcherHoldLogsAndFinishes(t *testing.T) {
 	)
 
 	msg := buildGroupMessage(t, "receipt-held", "group-1", nil)
-	require.NoError(t, d.credits.acquire(context.Background(), 1))
+	require.NoError(t, d.credits.Acquire(context.Background(), 1))
 	d.visibility.track(msg)
 
 	d.hold([]*message{msg})
@@ -260,7 +262,7 @@ func TestDispatcherReleasesMessagesTakenAfterCancel(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		d.visibility.start(context.Background())
-		require.NoError(t, d.credits.acquire(context.Background(), 2))
+		require.NoError(t, d.credits.Acquire(context.Background(), 2))
 		d.admit(buildGroupMessage(t, "r-1", "g", nil))
 		d.admit(buildGroupMessage(t, "r-2", "h", nil))
 
@@ -287,4 +289,423 @@ func nilIfEmptyInt32(s []int32) []int32 {
 		return nil
 	}
 	return s
+}
+
+type loggedWarn struct {
+	message  string
+	queueURL string
+	receipt  string
+	groupID  string
+}
+
+func (h *captureHandler) warns() []loggedWarn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []loggedWarn
+	for _, r := range h.records {
+		if r.Level != slog.LevelWarn {
+			continue
+		}
+		w := loggedWarn{message: r.Message}
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "queue_url":
+				w.queueURL = a.Value.String()
+			case "receipt_handle":
+				w.receipt = a.Value.String()
+			case "group_id":
+				w.groupID = a.Value.String()
+			}
+			return true
+		})
+		out = append(out, w)
+	}
+	return out
+}
+
+type hookedSQSClient struct {
+	*fakeSQSClient
+	onDelete func(ctx context.Context, handle string)
+}
+
+func (c *hookedSQSClient) DeleteMessage(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+	c.onDelete(ctx, aws.ToString(params.ReceiptHandle))
+	return c.fakeSQSClient.DeleteMessage(ctx, params, optFns...)
+}
+
+type handlerRecorder struct {
+	called []string
+	mu     sync.Mutex
+}
+
+func (r *handlerRecorder) handle(_ context.Context, m middleware.Message) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.called = append(r.called, m.(*message).Identifier())
+	return nil
+}
+
+func (r *handlerRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.called...)
+}
+
+func isTracked(d *dispatcher, msg *message) bool {
+	d.visibility.mu.Lock()
+	defer d.visibility.mu.Unlock()
+	_, ok := d.visibility.entries[msg]
+	return ok
+}
+
+func trackedCount(d *dispatcher) int {
+	d.visibility.mu.Lock()
+	defer d.visibility.mu.Unlock()
+	return len(d.visibility.entries)
+}
+
+const skipExpiredWarn = "skipping message whose visibility timeout expired before it started"
+
+const holdWarn = "holding message to preserve FIFO group order; earlier message in group failed"
+
+func TestDispatcherSkipsMessageExpiredBeforeStart(t *testing.T) {
+	tests := []struct {
+		name        string
+		opts        []router.Option
+		wantCalled  []string
+		wantDeletes []string
+		wantWarns   []loggedWarn
+	}{
+		{
+			name:        "per group id under the visibility model holds the rest of the group",
+			opts:        []router.Option{router.WithRunMode(router.PerGroupID)},
+			wantCalled:  []string{"h-1"},
+			wantDeletes: []string{"h-1"},
+			wantWarns: []loggedWarn{
+				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
+				{message: holdWarn, queueURL: "queue-url", receipt: "g-2", groupID: "g"},
+				{message: holdWarn, queueURL: "queue-url", receipt: "g-3", groupID: "g"},
+			},
+		},
+		{
+			name: "per group id under the scheduled retry model keeps the group running",
+			opts: []router.Option{
+				router.WithRunMode(router.PerGroupID),
+				router.WithRetryModel(router.ScheduledRetryModel),
+			},
+			wantCalled:  []string{"g-2", "g-3", "h-1"},
+			wantDeletes: []string{"g-2", "g-3", "h-1"},
+			wantWarns: []loggedWarn{
+				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
+			},
+		},
+		{
+			name:        "parallel skips only the expired message",
+			opts:        []router.Option{router.WithRunMode(router.Parallel)},
+			wantCalled:  []string{"g-2", "g-3", "h-1"},
+			wantDeletes: []string{"g-2", "g-3", "h-1"},
+			wantWarns: []loggedWarn{
+				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rec := &handlerRecorder{}
+				capture := &captureHandler{}
+				client := &fakeSQSClient{}
+				d := newTestDispatcher(t, client, slog.New(capture), rec.handle,
+					append([]router.Option{router.WithWorkerPoolSize(2)}, tt.opts...)...,
+				)
+				expired := buildGroupMessage(t, "g-1", "g", nil)
+				expired.receivedAt = time.Now().Add(-13 * time.Hour)
+
+				runToCompletion(t, d, []*message{
+					expired,
+					buildGroupMessage(t, "g-2", "g", nil),
+					buildGroupMessage(t, "h-1", "h", nil),
+					buildGroupMessage(t, "g-3", "g", nil),
+				})
+
+				assert.ElementsMatch(t, tt.wantCalled, rec.snapshot())
+				assert.ElementsMatch(t, tt.wantDeletes, client.deletes())
+				assert.Empty(t, client.calls())
+				assert.Equal(t, tt.wantWarns, capture.warns())
+				assert.Zero(t, trackedCount(d))
+				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+			})
+		})
+	}
+}
+
+func TestDispatcherWorkerSkipsOnlyPastDeadline(t *testing.T) {
+	tests := []struct {
+		name    string
+		age     time.Duration
+		wantRun bool
+	}{
+		{name: "received just now runs", age: 0, wantRun: true},
+		{name: "one nanosecond before the deadline runs", age: 30*time.Second - time.Nanosecond, wantRun: true},
+		{name: "at the deadline is skipped", age: 30 * time.Second},
+		{name: "past the deadline is skipped", age: 31 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rec := &handlerRecorder{}
+				capture := &captureHandler{}
+				client := &fakeSQSClient{}
+				d := newTestDispatcher(t, client, slog.New(capture), rec.handle,
+					router.WithRunMode(router.PerGroupID),
+					router.WithVisibilityTimeout(30),
+				)
+				msg := buildGroupMessage(t, "m-1", "g", nil)
+				msg.receivedAt = time.Now().Add(-tt.age)
+				ctx, cancel := context.WithCancel(t.Context())
+				require.NoError(t, d.credits.Acquire(ctx, 1))
+				d.admit(msg)
+
+				d.startWorkers(ctx)
+				synctest.Wait()
+				cancel()
+				d.stopWorkers()
+
+				if tt.wantRun {
+					assert.Equal(t, []string{"m-1"}, rec.snapshot())
+					assert.Equal(t, []string{"m-1"}, client.deletes())
+					assert.Empty(t, capture.warns())
+				} else {
+					assert.Empty(t, rec.snapshot())
+					assert.Empty(t, client.deletes())
+					assert.Equal(t, []loggedWarn{
+						{message: skipExpiredWarn, queueURL: "queue-url", receipt: "m-1", groupID: "g"},
+					}, capture.warns())
+				}
+				assert.Empty(t, client.calls())
+				assert.Zero(t, trackedCount(d))
+				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+			})
+		})
+	}
+}
+
+type outcomeObservation struct {
+	ctx       context.Context
+	tracked   bool
+	available int
+	calls     int
+}
+
+func TestDispatcherProcessUntracksBeforeOutcome(t *testing.T) {
+	tests := []struct {
+		name        string
+		handler     middleware.Handler
+		receive     string
+		opts        []router.Option
+		viaDLQ      bool
+		wantDeletes []string
+	}{
+		{name: "success under the visibility model", handler: nilHandler, wantDeletes: []string{"m-1"}},
+		{
+			name:        "success under the scheduled retry model",
+			handler:     nilHandler,
+			opts:        []router.Option{router.WithRetryModel(router.ScheduledRetryModel)},
+			wantDeletes: []string{"m-1"},
+		},
+		{
+			name:    "exhausted error observed for the dlq",
+			handler: errorHandler,
+			receive: "3",
+			viaDLQ:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var d *dispatcher
+			var msg *message
+			var obs outcomeObservation
+			observe := func(ctx context.Context) {
+				obs = outcomeObservation{
+					ctx:       ctx,
+					tracked:   isTracked(d, msg),
+					available: d.credits.Available(),
+					calls:     obs.calls + 1,
+				}
+			}
+			opts := tt.opts
+			if opts == nil {
+				opts = []router.Option{
+					router.WithDLQ(3, router.WithOnDLQ(func(ctx context.Context, _ middleware.Message) { observe(ctx) })),
+				}
+			}
+			client := &hookedSQSClient{
+				fakeSQSClient: &fakeSQSClient{},
+				onDelete:      func(ctx context.Context, _ string) { observe(ctx) },
+			}
+			d = newTestDispatcher(t, client, logger.NewNoOp(), tt.handler, opts...)
+			msg = buildDLQMessage("m-1", tt.receive)
+			require.NoError(t, d.credits.Acquire(context.Background(), 1))
+			d.visibility.track(msg)
+			require.True(t, isTracked(d, msg))
+
+			d.process(context.Background(), msg)
+
+			require.Equal(t, 1, obs.calls)
+			assert.False(t, obs.tracked)
+			assert.Equal(t, d.credits.Capacity()-1, obs.available)
+			assert.Equal(t, tt.wantDeletes, nilIfEmpty(client.deletes()))
+			assert.Empty(t, client.calls())
+			assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+		})
+	}
+}
+
+type ctxKey struct{}
+
+func TestOutcomeContext(t *testing.T) {
+	tests := []struct {
+		newCtx     func() (context.Context, context.CancelFunc)
+		name       string
+		isDetached bool
+	}{
+		{
+			name: "live context is returned unchanged",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+		},
+		{
+			name: "live context with a deadline is returned unchanged",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), time.Hour)
+			},
+		},
+		{
+			name: "canceled context is detached and bounded",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			isDetached: true,
+		},
+		{
+			name: "expired context is detached and bounded",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+			isDetached: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				parent, cancelParent := tt.newCtx()
+				defer cancelParent()
+				parent = context.WithValue(parent, ctxKey{}, tt.name)
+
+				got, cancel := outcomeContext(parent)
+
+				assert.Equal(t, tt.name, got.Value(ctxKey{}))
+				require.NoError(t, got.Err())
+				if !tt.isDetached {
+					assert.Equal(t, parent, got)
+					cancel()
+					assert.NoError(t, got.Err())
+					return
+				}
+				deadline, ok := got.Deadline()
+				require.True(t, ok)
+				assert.Equal(t, time.Now().Add(outcomeTimeout), deadline)
+				assert.LessOrEqual(t, outcomeTimeout, 5*time.Second)
+				cancel()
+				assert.ErrorIs(t, got.Err(), context.Canceled)
+			})
+		})
+	}
+}
+
+func TestDispatcherProcessAppliesOutcomeAfterRunContextCanceled(t *testing.T) {
+	tests := []struct {
+		name        string
+		receive     string
+		opts        []router.Option
+		fail        bool
+		cancelRun   bool
+		wantDeletes []string
+	}{
+		{name: "success under the visibility model", cancelRun: true, wantDeletes: []string{"m-1"}},
+		{
+			name:        "success under the scheduled retry model",
+			cancelRun:   true,
+			opts:        []router.Option{router.WithRetryModel(router.ScheduledRetryModel)},
+			wantDeletes: []string{"m-1"},
+		},
+		{name: "exhausted error observed for the dlq", cancelRun: true, fail: true, receive: "3"},
+		{name: "live run context is used as is", wantDeletes: []string{"m-1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var obs outcomeObservation
+				var observedErr error
+				var observedDeadline time.Time
+				var hasDeadline bool
+				observe := func(ctx context.Context) {
+					obs.ctx = ctx
+					obs.calls++
+					observedErr = ctx.Err()
+					observedDeadline, hasDeadline = ctx.Deadline()
+				}
+				runCtx, cancelRun := context.WithCancel(context.WithValue(t.Context(), ctxKey{}, tt.name))
+				defer cancelRun()
+				handler := func(context.Context, middleware.Message) error {
+					if tt.cancelRun {
+						cancelRun()
+					}
+					if tt.fail {
+						return errors.New("boom")
+					}
+					return nil
+				}
+				opts := tt.opts
+				if opts == nil {
+					opts = []router.Option{
+						router.WithDLQ(3, router.WithOnDLQ(func(ctx context.Context, _ middleware.Message) { observe(ctx) })),
+					}
+				}
+				client := &hookedSQSClient{
+					fakeSQSClient: &fakeSQSClient{},
+					onDelete:      func(ctx context.Context, _ string) { observe(ctx) },
+				}
+				d := newTestDispatcher(t, client, logger.NewNoOp(), handler, opts...)
+				msg := buildDLQMessage("m-1", tt.receive)
+				require.NoError(t, d.credits.Acquire(context.Background(), 1))
+				d.visibility.track(msg)
+				start := time.Now()
+
+				d.process(runCtx, msg)
+
+				require.Equal(t, 1, obs.calls)
+				require.NoError(t, observedErr)
+				assert.Equal(t, tt.name, obs.ctx.Value(ctxKey{}))
+				if tt.cancelRun {
+					require.True(t, hasDeadline)
+					assert.Equal(t, start.Add(outcomeTimeout), observedDeadline)
+					assert.ErrorIs(t, obs.ctx.Err(), context.Canceled)
+				} else {
+					assert.False(t, hasDeadline)
+					assert.Equal(t, runCtx, obs.ctx)
+				}
+				assert.Equal(t, tt.wantDeletes, nilIfEmpty(client.deletes()))
+				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
+			})
+		})
+	}
 }
