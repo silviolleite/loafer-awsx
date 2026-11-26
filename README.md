@@ -17,7 +17,7 @@ functional options, and every component accepts the standard library
 `*slog.Logger` directly, no custom logger interface.
 
 - **Module:** `github.com/silviolleite/loafer-awsx`
-- **Minimum Go version:** Go 1.26 or later
+- **Minimum Go version:** Go 1.27.4 or later
 - **AWS SDK:** `aws-sdk-go-v2` (SQS + SNS + EventBridge Scheduler)
 
 ---
@@ -143,7 +143,7 @@ used throughout.
 
 ## Installation
 
-Requires Go 1.26 or later.
+Requires Go 1.27.4 or later.
 
 ```bash
 go get github.com/silviolleite/loafer-awsx

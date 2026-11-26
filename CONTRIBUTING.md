@@ -59,15 +59,17 @@ Both use `@commitlint/config-conventional`, so passing locally means passing in 
 
 ## Local development setup
 
-Install the Go toolchain and developer tooling:
+Install Go 1.27.4 or later (the minimum declared in `go.mod` and
+`benchmarks/go.mod`), then the developer tooling:
 
 ```bash
 make configure
 ```
 
 `make configure` installs the Go tools (goimports, fieldalignment,
-golangci-lint, lefthook, mockery, rapid, govulncheck) and then runs
-`make setup-dev`.
+golangci-lint, lefthook, mockery, rapid, govulncheck) at the versions pinned
+in the `Makefile` (`*_VERSION` variables) and then runs `make setup-dev`.
+CI pins the same golangci-lint and govulncheck versions; bump them together.
 
 If you only need the commit-message tooling and git hooks, run:
 
