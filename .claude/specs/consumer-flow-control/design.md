@@ -623,8 +623,8 @@ machine-verifiable correctness guarantees.*
 
 ### Property 1: Route option validation and defaults
 
-*For any* integer `n`, `router.New` with `WithPrefetch(n)` succeeds iff `n ≥ 0` and then
-reports `Prefetch() == n`, and with `WithPollers(n)` succeeds iff `n ≥ 1` and then reports
+*For any* integer `n`, `router.New` with `WithPrefetch(n)` succeeds iff `0 <= n <= 1000`
+and then reports `Prefetch() == n`, and with `WithPollers(n)` succeeds iff `n ≥ 1` and then reports
 `Pollers() == n`. Failures match `errors.ErrInvalidOption`. *For any* valid `MaxMessages`
 `m` without `WithPrefetch`, `Prefetch() == m`, and without `WithPollers`, `Pollers() == 1`.
 
@@ -643,10 +643,10 @@ released `available() == c`. A canceled `acquire` leaves `available()` unchanged
 *For any* route configuration (`WorkerPoolSize`, `Prefetch`, `MaxMessages`, `Pollers`),
 any sequence of receive responses (sizes 0–`MaxNumberOfMessages`, errors), and any handler
 latencies, the number of Admitted_Messages never exceeds `WorkerPoolSize + Prefetch`,
-every `ReceiveMessage` call carries `MaxNumberOfMessages == min(MaxMessages, Prefetch + 1)`,
-and no receive is issued while fewer Credits than that are available.
+every `ReceiveMessage` call carries `1 <= MaxNumberOfMessages <= min(MaxMessages, Prefetch + 1)`,
+and no receive is issued with fewer Credits than requested.
 
-**Validates: Requirements 3.1–3.5, 4.2**
+**Validates: Requirements 3.1–3.5, 3.12, 4.2**
 
 ### Property 4: Every admitted message reaches exactly one Outcome
 
@@ -798,7 +798,7 @@ All property tests use `pgregory.net/rapid` with at least 100 iterations, live i
 `// Feature: consumer-flow-control, Property {n}: {text}`, run time-dependent cases inside
 `synctest.Test`, and check for leaks with `goleak`.
 
-- **Property 1**: `rapid.Int()` for `n`, plus boundary generators `{-1, 0, 1}`
+- **Property 1**: `rapid.Int()` for `n`, plus boundary generators `{-1, 0, 1, 999, 1000, 1001}`
   (router package).
 - **Property 2**: a capacity `1..64` and a sequence of operations driven by
   `rapid.StateMachine` (acquire with random `n`, release of held, canceled acquire).

@@ -160,8 +160,9 @@ throughput independently of the worker count.
 2. THE Route SHALL report the configured Prefetch through `Route.Prefetch() int`.
 3. WHEN a Route is created without the Prefetch_Option, THE Route SHALL report a Prefetch
    equal to the Route `MaxMessages`.
-4. IF the Prefetch_Option receives a negative value, THEN THE Route constructor SHALL
-   return an error matching `errors.ErrInvalidOption` with `errors.Is`.
+4. IF the Prefetch_Option receives a value outside the inclusive range [0, 1000], THEN THE
+   Route constructor SHALL return an error matching `errors.ErrInvalidOption` with
+   `errors.Is`.
 5. THE Route SHALL accept a Prefetch of zero.
 6. THE Route SHALL expose the Pollers_Option as `router.WithPollers(n int)`.
 7. THE Route SHALL report the configured number of Pollers through `Route.Pollers() int`.
@@ -202,8 +203,8 @@ capacity to start them soon, so that messages do not expire while waiting in mem
 2. THE Consumer SHALL NOT hold more Admitted_Messages than the Credit_Pool capacity.
 3. WHEN a Poller is about to call `ReceiveMessage`, THE Poller SHALL first acquire a number
    of Credits equal to the Receive_Batch.
-4. WHILE a Poller cannot acquire a Receive_Batch of Credits, THE Poller SHALL NOT call
-   `ReceiveMessage`.
+4. WHILE a Poller cannot acquire a Receive_Batch of Credits and no Worker is waiting with
+   nothing to run, THE Poller SHALL NOT call `ReceiveMessage`.
 5. THE Poller SHALL set `MaxNumberOfMessages` on each `ReceiveMessage` call to the number
    of Credits it acquired for that call.
 6. WHEN a `ReceiveMessage` call returns fewer messages than the Credits acquired for it,
@@ -218,6 +219,9 @@ capacity to start them soon, so that messages do not expire while waiting in mem
     is canceled.
 11. WHILE fewer Admitted_Messages than the Route `WorkerPoolSize` exist, THE Credit_Pool
     SHALL hold at least one Receive_Batch of available Credits.
+12. WHILE a Worker is waiting with nothing to run and at least one Credit is available,
+    THE Poller SHALL call `ReceiveMessage` with the available Credits, up to one
+    Receive_Batch, without waiting for a full Receive_Batch.
 
 ### Requirement 4: Concurrent pollers
 
@@ -328,6 +332,11 @@ limit.
     Visibility_Deadline is more than the Renewal_Margin plus the Coalesce_Window away.
 11. THE Visibility_Manager SHALL run as one goroutine per Consumer, independent of the
     number of Tracked_Messages.
+12. IF the Visibility_Deadline of a Pending_Message has passed when a Worker takes it,
+    THEN THE Consumer SHALL NOT run its handler, SHALL log one Warn record, and, under the
+    Visibility_Retry_Model in PerGroupID mode, SHALL Hold the rest of its group.
+13. WHEN a handler returns, THE Consumer SHALL stop tracking the message before it sends
+    the delete or applies any other outcome request.
 
 ### Requirement 9: Batched visibility changes
 
@@ -400,6 +409,9 @@ visibility timeout.
 6. THE Visibility_Manager SHALL bound each Release request by the Release_Timeout.
 7. WHEN the Consumer run context is canceled, THE Consumer SHALL keep the existing
    Delete_Batcher flush behavior.
+10. WHEN a handler returns after the Consumer run context was canceled, THE Consumer SHALL
+    apply its outcome requests with a context that is not canceled and is bounded by a
+    timeout.
 8. WHEN `Consumer.Run` returns, THE Consumer SHALL have no running Poller, Worker,
    Visibility_Manager, or Delete_Batcher goroutine.
 9. IF a Release fails, THEN THE Visibility_Manager SHALL log one Error record for the
@@ -440,6 +452,9 @@ batched visibility changes, so that I can test routes without AWS.
 4. THE `fake.SQSClient` type SHALL expose `ChangeMessageVisibilityBatchCalls()` returning a
    copy of the recorded inputs in call order.
 5. THE `fake.SQSClient` type SHALL be safe for concurrent use.
+6. WHERE only `ChangeMessageVisibilityFunc` is set, THE `fake.SQSClient` SHALL replay each
+   `ChangeMessageVisibilityBatch` entry through `ChangeMessageVisibility` and SHALL NOT
+   record the batch call.
 
 ### Requirement 14: Benchmarks
 
@@ -482,3 +497,4 @@ control, so that I can size workers, prefetch, pollers, and the visibility timeo
 7. THE `router.WithExtensionLimit` documentation SHALL state that a limit of `n` allows
    exactly `n` Extensions.
 8. THE feature SHALL provide a doc comment for every new exported symbol.
+9. THE README SHALL include upgrade notes listing every behavior change of this feature.

@@ -413,6 +413,26 @@ Delegate test writing to the `go-test-engineer` agent and review to `go-test-rev
     - `feat(consumer): credit-based admission and dynamic group scheduling`
     - `docs: document consumer flow control`
 
+- [ ] 10. Review fixes (from `/code-review` of the branch)
+  - [x] 10.1 Idle-aware partial receive: `idleWorkers` in `consumer/credits.go`,
+    `creditPool.acquireUpTo`, workers marked idle by `sharedQueue.take` /
+    `groupScheduler.nextReady` only when nothing is ready, poller requests the credits it got
+    - _Requirements: 3.4, 3.5, 3.12_
+  - [x] 10.2 Untrack before delete in `dispatcher.process`
+    - _Requirements: 8.8, 8.13_
+  - [x] 10.3 Bound `WithPrefetch` to [0, 1000]
+    - _Requirements: 1.4_
+  - [x] 10.4 Skip expired pending messages (`visibilityManager.isExpired`, `dispatcher.skipExpired`)
+    - _Requirements: 8.12_
+  - [x] 10.5 `fake.SQSClient` replays batches through `ChangeMessageVisibilityFunc` when only it is set
+    - _Requirements: 13.6_
+  - [x] 10.6 README upgrade notes; wrap long lines in `benchmarks/fakeclient.go`
+    - _Requirements: 15.9_
+  - [ ] 10.7 Update and add tests for 10.1–10.5 (Properties 1, 3, 4, 5, 19, 20 adjust to
+    partial receives; new tests for idle partial acquire, expired skip, untrack ordering,
+    prefetch bound, fake replay)
+    - _Requirements: 1.4, 3.12, 8.12, 8.13, 11.10, 13.6_
+
 ## Notes
 
 - Tasks marked with `*` are optional test sub-tasks; implementation tasks are never

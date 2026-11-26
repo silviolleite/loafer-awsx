@@ -757,14 +757,16 @@ Every message returned by `ReceiveMessage` holds one credit until it reaches an
 outcome (deleted, left for redelivery, backed off, held, or released). Before
 each receive, a poller acquires `min(MaxMessages, Prefetch + 1)` credits and asks
 for exactly that many messages; credits the response does not use are returned
-at once. A poller that cannot get a full batch of credits waits, so with the
-default `Prefetch` receives stay full-sized under backlog and cost the same
-number of requests as before. The `Prefetch + 1` bound guarantees that a
-receive can always start while any worker is idle.
+at once. While every worker is busy, a poller waits for a full batch of
+credits, so with the default `Prefetch` receives stay full-sized under backlog
+and cost the same number of requests as before. As soon as a worker is waiting
+with nothing to run (for example because every pending message belongs to a
+FIFO group that is already running), the poller receives with the credits
+already free instead, so other groups can reach the idle workers.
 
 | Option | Default | Bounds | Effect |
 | --- | --- | --- | --- |
-| `router.WithPrefetch(n)` | `MaxMessages` | `n >= 0` | Messages held beyond the worker count. Lower values shorten the wait between receive and start but also shrink each receive to `n + 1` messages, which costs more receive requests; `0` receives one message at a time. |
+| `router.WithPrefetch(n)` | `MaxMessages` | `0..1000` | Messages held beyond the worker count. Lower values shorten the wait between receive and start but also shrink each receive to `n + 1` messages, which costs more receive requests; `0` receives one message at a time. |
 | `router.WithPollers(n)` | `1` | `n >= 1` | Concurrent receive loops sharing the same capacity. Raise it when handlers are fast and the receive round trip is the bottleneck. |
 
 `MaxMessages` (`router.WithMaxMessages`) only sets the size of one receive
@@ -808,6 +810,11 @@ For longer handlers, size `ExtensionLimit` so that
 `VisibilityTimeout + Σ(k × VisibilityTimeout − 10 s)` for `k = 1..n` covers the
 p99. Handlers should still be idempotent: SQS delivery is at least once.
 
+A message whose visibility deadline has already passed when a worker takes it
+(for example the tail of a large FIFO group that used up `ExtensionLimit`) is
+not run: SQS may already have delivered it elsewhere. It is logged at Warn and
+left for redelivery, and under `PerGroupID` the rest of its group is held.
+
 ### Shutdown
 
 When the run context is canceled, the pollers stop, every message whose
@@ -815,7 +822,37 @@ handler is running finishes, and every received message that has not started is
 released with a visibility timeout of 0, so it and its FIFO group are available
 to other consumers at once instead of after a full visibility timeout. On a
 batched-delete route the pending deletes are then sent. These final requests are
-not canceled by the run context; each is bounded by its own timeout.
+not canceled by the run context; each is bounded by its own timeout. A handler
+that finishes after cancellation still has its outcome (delete, retry schedule,
+DLQ publish) applied on a context detached from the cancellation and bounded by
+5 seconds.
+
+### Upgrade notes
+
+Flow control changes behavior without changing any exported signature. Review
+these points when upgrading from v1.1.x:
+
+- **`ExtensionLimit` window.** `WithExtensionLimit(n)` now allows exactly `n`
+  extensions (it allowed `n + 1`), and the visibility budget is counted from the
+  receive instead of the handler start. With `VisibilityTimeout` 30 and
+  `ExtensionLimit` 2, a message is covered for about 100 s after it is received;
+  before, a handler started at once was covered for about 150 s. If your
+  handlers relied on that margin, raise `ExtensionLimit` by one or raise
+  `VisibilityTimeout`.
+- **`Backoff` timing.** `Message.Backoff(delay)` never blocks and the last delay
+  wins. The visibility change is applied when the handler returns, not at the
+  moment `Backoff` is called.
+- **Shutdown.** Messages received but not started are released (visibility 0)
+  instead of being run with a canceled context.
+- **`PerGroupID` dispatch.** Groups are no longer pinned to a worker by hash;
+  any idle worker takes any ready group, one message per group at a time.
+- **`MaxMessages`.** It only sets the size of one receive request; use
+  `WithPrefetch` to bound how many received messages wait for a worker.
+- **`fake.SQSClient`.** The fake now implements `ChangeMessageVisibilityBatch`,
+  which the consumer prefers. Tests that only set `ChangeMessageVisibilityFunc`
+  keep working: the fake replays each batch entry through it and records it in
+  `ChangeMessageVisibilityCalls`. Set `ChangeMessageVisibilityBatchFunc` to
+  observe the batch requests themselves.
 
 ---
 
