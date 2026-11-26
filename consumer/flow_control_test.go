@@ -954,9 +954,9 @@ func TestRun_HoldOnFailureExamples(t *testing.T) {
 	tests := []struct {
 		name       string
 		messages   []flowMessage
-		retryModel router.RetryModel
 		wantHeld   []string
 		wantRun    []string
+		retryModel router.RetryModel
 		fifo       bool
 	}{
 		{

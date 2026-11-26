@@ -69,10 +69,10 @@ type message struct {
 	receivedAt   time.Time
 	dispatched   chan struct{}
 	original     types.Message
-	groupKey     string
 	envelope     snsEnvelope
-	dispatchOnce sync.Once
+	groupKey     string
 	backoffNanos atomic.Int64
+	dispatchOnce sync.Once
 	backedOff    atomic.Bool
 }
 

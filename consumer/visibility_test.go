@@ -484,9 +484,9 @@ const (
 )
 
 type vmResponseSpec struct {
-	unknownIDs  []string
 	code        string
 	message     string
+	unknownIDs  []string
 	kind        vmBatchOutcome
 	failMask    uint16
 	dupMask     uint16
@@ -506,8 +506,8 @@ type vmEntryOutcome struct {
 type vmFailureScript struct {
 	vm       *consumer.VisibilityManager
 	byHandle map[string]*consumer.TestMessage
-	specs    []vmResponseSpec
 	outcomes map[int][]vmEntryOutcome
+	specs    []vmResponseSpec
 	unknown  int
 	mu       sync.Mutex
 }
@@ -1155,8 +1155,8 @@ func TestVisibilityManager_UntrackedDuringFlight(t *testing.T) {
 }
 
 type vmSingleRecorder struct {
-	sends []vmSend
 	err   error
+	sends []vmSend
 	mu    sync.Mutex
 }
 
@@ -1333,9 +1333,9 @@ func TestVisibilityManager_CoalesceWindowEdges(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		offset  time.Duration
 		wantAt  []time.Duration
 		wantLen []int
+		offset  time.Duration
 		vt      int32
 	}{
 		{name: "second due at the window edge", vt: 60, offset: consumer.CoalesceWindow, wantAt: []time.Duration{50 * time.Second}, wantLen: []int{2}},

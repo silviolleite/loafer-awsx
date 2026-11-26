@@ -177,8 +177,8 @@ func TestVisibilitySender_IsBatch(t *testing.T) {
 func TestVisibilitySender_EmptyInput(t *testing.T) {
 	tests := []struct {
 		wrap func(*fake.SQSClient) consumer.SQSClient
-		msgs []*consumer.TestMessage
 		name string
+		msgs []*consumer.TestMessage
 	}{
 		{name: "batch nil", wrap: batchCapableClient},
 		{name: "batch empty", wrap: batchCapableClient, msgs: []*consumer.TestMessage{}},
@@ -413,8 +413,8 @@ func TestVisibilitySender_SingleResponses(t *testing.T) {
 
 func TestVisibilitySender_RequestDeadline(t *testing.T) {
 	tests := []struct {
-		name           string
 		wrap           func(*fake.SQSClient) consumer.SQSClient
+		name           string
 		parentDeadline time.Duration
 		want           time.Duration
 	}{

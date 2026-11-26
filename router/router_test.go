@@ -479,8 +479,8 @@ func TestFlowControlOptionsCombine(t *testing.T) {
 	}
 
 	placements := []struct {
-		name  string
 		build func(flow, other []router.Option) []router.Option
+		name  string
 	}{
 		{name: "flow control first", build: func(flow, other []router.Option) []router.Option { return append(flow, other...) }},
 		{name: "flow control last", build: func(flow, other []router.Option) []router.Option { return append(other, flow...) }},

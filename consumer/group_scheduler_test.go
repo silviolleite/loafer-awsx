@@ -661,10 +661,10 @@ func TestGroupScheduler_TakeMarksIdleOnlyWhileBlocked(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	tests := []struct {
+		wakeUp   func(s *consumer.WorkSource, active *consumer.TestMessage, cancel context.CancelFunc)
 		name     string
 		submit   []string
 		preTake  int
-		wakeUp   func(s *consumer.WorkSource, active *consumer.TestMessage, cancel context.CancelFunc)
 		wantOK   bool
 		wantIdle bool
 	}{

@@ -676,12 +676,12 @@ type outcomeObservation struct {
 
 func TestDispatcherProcessUntracksBeforeOutcome(t *testing.T) {
 	tests := []struct {
-		name        string
 		handler     middleware.Handler
+		name        string
 		receive     string
 		opts        []router.Option
-		viaDLQ      bool
 		wantDeletes []string
+		viaDLQ      bool
 	}{
 		{name: "success under the visibility model", handler: nilHandler, wantDeletes: []string{"m-1"}},
 		{
@@ -810,9 +810,9 @@ func TestDispatcherProcessAppliesOutcomeAfterRunContextCanceled(t *testing.T) {
 		name        string
 		receive     string
 		opts        []router.Option
+		wantDeletes []string
 		fail        bool
 		cancelRun   bool
-		wantDeletes []string
 	}{
 		{name: "success under the visibility model", cancelRun: true, wantDeletes: []string{"m-1"}},
 		{
