@@ -430,8 +430,9 @@ type trackedEntry struct {
     msg        *message
     deadline   time.Time // current Visibility_Deadline
     due        time.Time // deadline − renewalMargin
-    extensions int
+    extensions int       // Counted_Extensions (sent while active)
     index      int       // heap index; −1 when not in the heap
+    isActive   bool      // set by begin when a worker starts the message
 }
 
 type visibilityChange struct {
@@ -464,7 +465,17 @@ func (v *visibilityManager) track(msg *message)
 func (v *visibilityManager) untrack(msg *message)
 func (v *visibilityManager) backoff(msg *message, delay time.Duration) // untrack + immediate
 func (v *visibilityManager) release(msgs ...*message)                // untrack + immediate(0)
+func (v *visibilityManager) begin(msg *message, now time.Time) bool  // start check + mark active
 ```
+
+`begin` is called by the worker that takes a message. It returns false, leaving the entry
+untouched, when the message must be Skipped (deadline passed, or no Extension left and less
+than `startMargin` remaining); otherwise it sets `isActive`. Each collected Extension records
+`isCounted = entry.isActive` at send time, and `apply` increments `extensions` only for
+counted ones. A pending entry is re-pushed after every successful Extension; an active one
+only while `extensions < extensionLimit`. Because `k = extensions + 1`, every Extension of a
+pending message asks for exactly VT, so a message whose handler fails right after a long
+wait becomes visible again about one VT later instead of `k × VT` later.
 
 `track` creates an entry with `deadline = msg.receivedAt + VT` and pushes it on the heap
 only when `extensionLimit > 0` (Req 8.5). It also records the entry in `entries`, so
@@ -485,8 +496,8 @@ loop:
                 append change{entry, timeout, sentAt: now}
   unlock
   send batch in chunks of 10 (outside the lock)
-  lock; apply results: success → entry.extensions++, deadline = sentAt + timeout,
-        due = deadline − margin, re-push if extensions < limit and still tracked;
+  lock; apply results: success → entry.extensions++ only if counted, deadline = sentAt + timeout,
+        due = deadline − margin, re-push if still tracked and (pending or extensions < limit);
         failure → re-push with unchanged deadline only if still tracked and deadline > now
         (otherwise drop); log failures only for still-tracked entries or immediate changes
   unlock
@@ -494,7 +505,7 @@ loop:
 ```
 
 `nextTimeout(e, now)`:
-`k = e.extensions + 1`; `want = k × VT`;
+`k = e.extensions + 1` (always 1 while pending); `want = k × VT`;
 `remaining = maxVisibilitySeconds − ceil(now − receivedAt)`;
 `t = min(want, remaining)`. Return 0 (exhausted) when `t ≤ 0` or when `now + t ≤ e.deadline`
 and the entry is already due (no further progress possible within the 12-hour budget).
@@ -717,11 +728,12 @@ later than `receivedAt + VT − margin`, and no Extension is sent earlier than
 
 ### Property 12: Extension limit is exact
 
-*For any* `ExtensionLimit = n ≥ 0` and a handler that outlives every Extension, exactly `n`
-Extensions are sent for the message, and the k-th carries timeout
-`min(k × VT, 43200 − elapsed)`.
+*For any* `ExtensionLimit = n ≥ 0`, wait before handler start, and a handler that outlives
+every Extension, exactly `n` Extensions are sent after the handler starts, and the k-th of
+them carries timeout `min(k × VT, 43200 − elapsed)`. With `n = 0` no Extension is sent at
+all, before or after the handler starts.
 
-**Validates: Requirements 8.4, 8.5**
+**Validates: Requirements 8.4, 8.5, 8.14**
 
 ### Property 13: 12-hour ceiling
 
@@ -789,6 +801,26 @@ Consumer runs without error and every visibility change is sent through
 
 **Validates: Requirements 2.7**
 
+### Property 21: A pending message never expires while it waits
+
+*For any* VT ≥ 11 s, `ExtensionLimit ≥ 1`, and wait before handler start that keeps the
+message within the 12-hour ceiling, when every Extension succeeds the message is never
+Skipped, every Extension sent before the handler starts carries timeout `VT`, and none of
+them counts against the Extension_Limit, including one whose result arrives after the
+handler started.
+
+**Validates: Requirements 8.3, 8.12, 8.14**
+
+### Property 22: Skip signals
+
+*For any* Skipped message (Extensions failing, or `ExtensionLimit = 0` with a wait past
+the deadline), the handler never runs, exactly one Error record carries the queue URL,
+receipt handle, `sqs_message_id`, group id, and receive count, `IncSkipped` is invoked
+once when the recorder implements `SkipRecorder` and never otherwise, and the observe-only
+DLQ signals fire exactly when the receive count reached the configured MaxReceiveCount.
+
+**Validates: Requirements 8.12, 8.15, 8.16**
+
 ## Testing Strategy
 
 ### Property-based tests
@@ -830,6 +862,12 @@ All property tests use `pgregory.net/rapid` with at least 100 iterations, live i
   invocations, and goleak.
 - **Property 20**: rerun the Property 4 generator with a client wrapper that hides
   `ChangeMessageVisibilityBatch`.
+- **Property 21**: `synctest` with the export-bridge `visibilityManager`, generated VT,
+  limit `1..5`, and wait; `Begin` is called after the wait, and a variant holds the batch
+  request open across `Begin` to cover an in-flight pending Extension.
+- **Property 22**: `synctest` with a full `Consumer.Run`, one worker blocked on a channel,
+  generated failing visibility responses or `ExtensionLimit = 0`, generated receive counts
+  and DLQ thresholds, and recorders with and without `SkipRecorder`.
 
 ### Example and integration tests (PBT not appropriate)
 

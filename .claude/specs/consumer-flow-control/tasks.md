@@ -448,6 +448,24 @@ Delegate test writing to the `go-test-engineer` agent and review to `go-test-rev
   - [x] 11.5 Remove the dead polling loop in `TestRunVisibilityModelBackoffExtendsVisibilityAndLeavesMessage`
   - [x] 11.6 Update tests for 11.1–11.4 (fake default replay, FIFO hold release in Property 9 and
     examples, IsExpired margin, concurrent sends under slow clients)
+
+- [x] 12. PR #16 feedback: skipped messages
+  - [x] 12.1 Extend Pending_Messages without counting against `ExtensionLimit`:
+    `trackedEntry.isActive`, `sentChange.isCounted`, `visibilityManager.begin` replaces
+    `isExpired` in the worker; pending Extensions always ask for VT
+    - _Requirements: 8.3, 8.4, 8.5, 8.12, 8.14_
+  - [x] 12.2 Skip signals: Error log with `sqs_message_id` and `receive_count`, optional
+    `consumer.SkipRecorder.IncSkipped`, observe-only DLQ path on Skip; add `sqs_message_id`
+    to the exhausted log
+    - _Requirements: 8.12, 8.15, 8.16_
+  - [x] 12.3 Register `loafer_messages_skipped_total` in `middleware.Metrics`
+    - _Requirements: 8.17_
+  - [x] 12.4 Tests: Properties 12, 21, 22; update the skip, IsExpired, and Extension tests;
+    middleware registration; an end-to-end reproduction of the PR #16 scenario
+    - _Requirements: 8.3, 8.4, 8.12, 8.14, 8.15, 8.16, 8.17_
+  - [x] 12.5 Docs: README (Visibility management, Sizing, Skipped messages, Metrics, Upgrade
+    notes), `consumer/doc.go`, `router.WithExtensionLimit`, example recorder
+    - _Requirements: 15.3, 15.7, 15.9, 15.10_
     - _Requirements: 7.5, 8.12, 9.13, 13.3, 13.6_
 
 ## Notes

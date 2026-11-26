@@ -45,7 +45,8 @@ done for batched deletes. The change is released as a minor version.
 Out of scope:
 
 - A per-route processing timeout for handlers (`router.WithProcessingTimeout`).
-- New metrics or new methods on `consumer.MetricsRecorder`.
+- New methods on `consumer.MetricsRecorder`. The skip counter is reported through the
+  separate, optional `consumer.SkipRecorder` interface instead (Requirement 8.15).
 - Changes to the Scheduled_Retry_Model outcome logic, the observe-only DLQ path, or the
   Delete_Batcher.
 - Changes to the `producer`, `broker`, or `typed` packages beyond documentation.
@@ -67,7 +68,11 @@ Accepted tradeoffs:
   that relied on the extra extension. This is documented in the changelog.
 - In PerGroupID mode the Group_Scheduler serializes each Group_Key, so the tail of a
   Receive_Batch that holds many messages of one group still waits for its predecessors;
-  the Visibility_Manager covers that wait through extensions.
+  the Visibility_Manager covers that wait through extensions that do not count against
+  the Extension_Limit.
+- Because Pending_Messages are extended for as long as they wait, a worker pool whose
+  handlers all hang keeps up to Prefetch received messages invisible until the handlers
+  return, shutdown releases them, or the 12-hour ceiling is reached.
 
 ## Glossary
 
@@ -121,10 +126,18 @@ Accepted tradeoffs:
   send an Extension ahead of its due instant so that it shares a batch request with an
   Extension that is already due.
 - **Extension**: A visibility change that moves the Visibility_Deadline of a
-  Tracked_Message later. The k-th Extension (k starting at 1) sets the visibility timeout
-  to k multiplied by Visibility_Timeout, measured from the instant it is sent.
-- **Extension_Limit**: The Route `ExtensionLimit`, the maximum number of Extensions per
-  Tracked_Message.
+  Tracked_Message later. An Extension of a Pending_Message sets the visibility timeout to
+  Visibility_Timeout. The k-th Extension sent after the handler started (k starting at 1)
+  sets it to k multiplied by Visibility_Timeout. Both are measured from the instant the
+  Extension is sent.
+- **Counted_Extension**: An Extension sent while its message is an Active_Message.
+  Extensions sent while the message is a Pending_Message are not counted, even when their
+  result arrives after the handler started.
+- **Extension_Limit**: The Route `ExtensionLimit`, the maximum number of
+  Counted_Extensions per Tracked_Message. A value of zero disables every Extension.
+- **Skip**: The decision not to run the handler of a Pending_Message whose
+  Visibility_Deadline passed, or that has no Extension left and less than 1 second of
+  visibility remaining, when a Worker takes it.
 - **Max_Visibility**: The AWS SQS upper bound of 43,200 seconds (12 hours) on a visibility
   timeout, which also bounds the total time a message can stay invisible counted from its
   Receive_Time.
@@ -316,11 +329,12 @@ limit.
 1. WHEN a message is admitted, THE Visibility_Manager SHALL start tracking it with a
    Visibility_Deadline equal to its Receive_Time plus the Visibility_Timeout.
 2. THE Visibility_Manager SHALL track every Pending_Message and every Active_Message.
-3. WHILE fewer than Extension_Limit Extensions were sent for a Tracked_Message, THE
+3. WHILE Extension_Limit is greater than zero and a Tracked_Message is a Pending_Message,
+   or an Active_Message with fewer than Extension_Limit Counted_Extensions, THE
    Visibility_Manager SHALL send its next Extension no later than its Visibility_Deadline
    minus the Renewal_Margin.
-4. THE Visibility_Manager SHALL NOT send more than Extension_Limit Extensions for one
-   Tracked_Message.
+4. THE Visibility_Manager SHALL NOT send more than Extension_Limit Counted_Extensions for
+   one Tracked_Message.
 5. WHERE Extension_Limit is zero, THE Visibility_Manager SHALL NOT send any Extension.
 6. THE Visibility_Manager SHALL NOT send a visibility timeout that would keep a message
    invisible beyond its Receive_Time plus Max_Visibility.
@@ -338,12 +352,26 @@ limit.
     number of Tracked_Messages.
 12. IF the Visibility_Deadline of a Pending_Message has passed when a Worker takes it, or
     the message has no Extension left and less than 1 second of visibility remains, THEN
-    THE Consumer SHALL NOT run its handler, SHALL log one Warn record, and, under the
+    THE Consumer SHALL Skip it: it SHALL NOT run its handler, SHALL log one Error record
+    carrying the queue URL, the receipt handle, the SQS MessageId (`sqs_message_id`), the
+    MessageGroupId, and the ApproximateReceiveCount, and, under the
     Visibility_Retry_Model in PerGroupID mode, SHALL Hold the rest of its group. Under the
     Scheduled_Retry_Model the rest of the group is not held, consistent with that model
     unblocking groups on failure.
 13. WHEN a handler returns, THE Consumer SHALL stop tracking the message before it sends
     the delete or applies any other outcome request.
+14. WHEN a Worker starts a Pending_Message, THE Visibility_Manager SHALL treat it as an
+    Active_Message from then on, so only Extensions sent afterwards are Counted_Extensions.
+15. WHEN the Consumer Skips a message AND the recorder configured with `WithMetrics` also
+    implements the optional `SkipRecorder` interface, THE Consumer SHALL invoke
+    `IncSkipped` once with the route name. A recorder that does not implement it SHALL
+    keep working unchanged.
+16. WHEN the Consumer Skips a message, THE Consumer SHALL run the observe-only DLQ path
+    (Requirement 12) exactly as after a handler error, so a message whose receive count
+    reached the configured MaxReceiveCount emits the exhausted log, `IncDLQ`, and
+    `OnDLQ`.
+17. THE Metrics middleware SHALL register the `loafer_messages_skipped_total` counter,
+    labeled by route, without incrementing it.
 
 ### Requirement 9: Batched visibility changes
 
@@ -508,3 +536,6 @@ control, so that I can size workers, prefetch, pollers, and the visibility timeo
    exactly `n` Extensions.
 8. THE feature SHALL provide a doc comment for every new exported symbol.
 9. THE README SHALL include upgrade notes listing every behavior change of this feature.
+10. THE README SHALL document when a message is Skipped, the signals a Skip emits (Error
+    log fields, `SkipRecorder`, DLQ observation), and that a Skip in PerGroupID mode under
+    the Visibility_Retry_Model also logs one Warn record per held message of its group.

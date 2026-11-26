@@ -498,6 +498,15 @@ completes:
 | `IncDeadLetter(routeName string)` | An exhausted message is published to the DLQ successfully. |
 | `IncDLQ(routeName string)` | Under the Visibility model, a message is observed as exhausted (observe-only DLQ). |
 
+A recorder that also implements the optional `consumer.SkipRecorder` interface
+receives `IncSkipped(routeName string)` once for every message the consumer
+finishes without running its handler because its visibility timeout ran out
+before a worker started it (see [Skipped messages](#skipped-messages)). Such a
+message never reaches the handler middlewares, so neither `middleware.Metrics`
+nor the OpenTelemetry span sees it. `middleware.Metrics` registers the
+`loafer_messages_skipped_total` counter for this purpose. `SkipRecorder` is a
+separate interface so existing `MetricsRecorder` implementations keep compiling.
+
 ### Example
 
 ```go
@@ -571,15 +580,17 @@ func main() {
     }
 }
 
-// logMetrics is a consumer.MetricsRecorder that logs each outcome. A production
-// implementation would back these methods with the counters registered by the
-// Metrics middleware.
+// logMetrics is a consumer.MetricsRecorder, and an optional
+// consumer.SkipRecorder, that logs each outcome. A production implementation
+// would back these methods with the counters registered by the Metrics
+// middleware.
 type logMetrics struct{ log *slog.Logger }
 
 func (m logMetrics) IncDLQ(route string)        { m.log.Info("dlq", slog.String("route", route)) }
 func (m logMetrics) IncSuccess(route string)    { m.log.Info("success", slog.String("route", route)) }
 func (m logMetrics) IncRetry(route string)      { m.log.Info("retry", slog.String("route", route)) }
 func (m logMetrics) IncDeadLetter(route string) { m.log.Info("dead-letter", slog.String("route", route)) }
+func (m logMetrics) IncSkipped(route string)    { m.log.Info("skipped", slog.String("route", route)) }
 ```
 
 ### Required AWS resources and IAM permissions
@@ -796,9 +807,12 @@ next 5 s is sent with it, in `ChangeMessageVisibilityBatch` requests of up to 10
 entries (or one `ChangeMessageVisibility` per message when the client does not
 implement `consumer.BatchVisibilityClient`). The k-th extension sets the
 visibility timeout to `k × VisibilityTimeout`, never past 12 hours after the
-receive. `router.WithExtensionLimit(n)` allows exactly `n` extensions (`0`
-disables them). Messages that finish before their first due instant cost no
-visibility request at all.
+receive. While a message waits for a worker it is extended by one
+`VisibilityTimeout` at a time, as often as needed, and those extensions are not
+counted: `router.WithExtensionLimit(n)` allows exactly `n` extensions after the
+handler starts, with `k` counting only those (`0` disables every extension,
+including the ones while waiting). Messages that finish before their first due
+instant cost no visibility request at all.
 
 `Message.Backoff(delay)` never blocks; the last delay wins and is applied when
 the handler returns.
@@ -807,19 +821,43 @@ the handler returns.
 
 A message waits roughly `t × Prefetch / WorkerPoolSize` before starting, where
 `t` is the handler duration, and with `PerGroupID` another `(m − 1) × t` for the
-m-th message of a group in one receive. To avoid any extension, keep
-`VisibilityTimeout` above that wait plus the p99 handler duration plus 10 s.
-For longer handlers, size `ExtensionLimit` so that
-`VisibilityTimeout + Σ(k × VisibilityTimeout − 10 s)` for `k = 1..n` covers the
-p99. Handlers should still be idempotent: SQS delivery is at least once.
+m-th message of a group in one receive. That wait is covered by uncounted
+extensions, so it never makes a message expire; it only costs visibility
+requests. To avoid any extension, keep `VisibilityTimeout` above that wait plus
+the p99 handler duration plus 10 s. For longer handlers, size `ExtensionLimit`
+so that `VisibilityTimeout + Σ(k × VisibilityTimeout − 10 s)` for `k = 1..n`
+covers the p99 handler duration. Handlers should still be idempotent: SQS
+delivery is at least once.
+
+Because waiting messages are always extended, a worker pool whose handlers all
+hang keeps up to `Prefetch` received messages invisible until a handler
+returns, shutdown releases them, or 12 hours pass since their receive.
+
+### Skipped messages
 
 A message whose visibility deadline has already passed when a worker takes it,
-or that has no extension left and less than 1 second of visibility, is not run
-(for example the tail of a large FIFO group that used up `ExtensionLimit`): SQS
-may already have delivered it elsewhere. It is logged at Warn and left for
-redelivery. Under the Visibility retry model with `PerGroupID` the rest of its
-group is held; under the Scheduled Retry model it is not, consistent with that
-model unblocking groups on failure.
+or that has no extension left and less than 1 second of visibility, is not run:
+SQS may already have delivered it elsewhere. With extensions enabled this only
+happens when they fail (for example, permission or throttling errors, which are
+logged at Error); with `ExtensionLimit` 0 it happens whenever the wait outlasts
+`VisibilityTimeout`. A skipped message:
+
+- is logged at **Error** (`skipping message whose visibility timeout expired
+  before it started`) with `queue_url`, `receipt_handle`, `sqs_message_id`,
+  `group_id`, and `receive_count`, so repeated skips of the same message can be
+  correlated across deliveries;
+- is counted through the optional `consumer.SkipRecorder`
+  (`loafer_messages_skipped_total`);
+- goes through the observe-only DLQ path like a handler error: when its receive
+  count reached the `router.WithDLQ` threshold, the exhausted log,
+  `loafer_messages_dlq_total`, and `OnDLQ` fire, because SQS will redrive it
+  without its handler having run;
+- is left for redelivery. Under the Visibility retry model with `PerGroupID`
+  the rest of its group is held, and each held message logs its own Warn
+  (`holding message to preserve FIFO group order; ...`), so one skip can show
+  up as a short burst of records for that group. Under the Scheduled Retry model
+  the group is not held, consistent with that model unblocking groups on
+  failure.
 
 Visibility requests run concurrently (up to 8 at a time, and the changes of one
 batch at once when the client has no batch API), so one slow request does not
@@ -843,12 +881,17 @@ Flow control changes behavior without changing any exported signature. Review
 these points when upgrading from v1.1.x:
 
 - **`ExtensionLimit` window.** `WithExtensionLimit(n)` now allows exactly `n`
-  extensions (it allowed `n + 1`), and the visibility budget is counted from the
-  receive instead of the handler start. With `VisibilityTimeout` 30 and
-  `ExtensionLimit` 2, a message is covered for about 100 s after it is received;
-  before, a handler started at once was covered for about 150 s. If your
-  handlers relied on that margin, raise `ExtensionLimit` by one or raise
-  `VisibilityTimeout`.
+  extensions after the handler starts (it allowed `n + 1`). Time spent waiting
+  for a worker is covered by extra extensions that are not counted. With
+  `VisibilityTimeout` 30 and `ExtensionLimit` 2, a handler started right after
+  the receive is covered for about 100 s; before, it was covered for about
+  150 s. If your handlers relied on that margin, raise `ExtensionLimit` by one
+  or raise `VisibilityTimeout`.
+- **Skipped messages.** A message whose visibility ran out before it started is
+  logged at Error (it was Warn) with new `sqs_message_id` and `receive_count`
+  fields, reported through the optional `consumer.SkipRecorder`, and observed by
+  the DLQ path. The DLQ exhausted log also gained `sqs_message_id`. See
+  [Skipped messages](#skipped-messages).
 - **`Backoff` timing.** `Message.Backoff(delay)` never blocks and the last delay
   wins. The visibility change is applied when the handler returns, not at the
   moment `Backoff` is called.
