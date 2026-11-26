@@ -288,7 +288,7 @@ func TestNewValidOptionsPreservedProperty(t *testing.T) {
 	})
 }
 
-// Feature: consumer-flow-control, Property 1: For any integer n, router.New with WithPrefetch(n) succeeds iff n >= 0 and reports Prefetch() == n, and with WithPollers(n) succeeds iff n >= 1 and reports Pollers() == n; failures match errors.ErrInvalidOption; without the options Prefetch() == MaxMessages and Pollers() == 1.
+// Feature: consumer-flow-control, Property 1: For any integer n, router.New with WithPrefetch(n) succeeds iff 0 <= n <= 1000 and reports Prefetch() == n, and with WithPollers(n) succeeds iff n >= 1 and reports Pollers() == n; failures match errors.ErrInvalidOption; without the options Prefetch() == MaxMessages and Pollers() == 1.
 func TestNewFlowControlOptionsProperty(t *testing.T) {
 	drawN := func(rt *rapid.T) int {
 		return rapid.OneOf(rapid.Int(), rapid.SampledFrom([]int{-1, 0, 1})).Draw(rt, "n")
@@ -296,11 +296,15 @@ func TestNewFlowControlOptionsProperty(t *testing.T) {
 
 	t.Run("prefetch", func(t *testing.T) {
 		rapid.Check(t, func(rt *rapid.T) {
-			n := drawN(rt)
+			n := rapid.OneOf(
+				rapid.Int(),
+				rapid.IntRange(-2000, 2000),
+				rapid.SampledFrom([]int{-1, 0, 1, 999, 1000, 1001}),
+			).Draw(rt, "n")
 
 			r, err := router.New("orders", noopHandler, router.WithPrefetch(n))
 
-			if n < 0 {
+			if n < 0 || n > 1000 {
 				require.Error(rt, err)
 				assert.ErrorIs(rt, err, errors.ErrInvalidOption)
 				assert.Nil(rt, r)
@@ -400,6 +404,7 @@ func TestFlowControlDefaults(t *testing.T) {
 			wantPollers:  2,
 		},
 		{name: "pollers one", opts: []router.Option{router.WithPollers(1)}, wantPrefetch: 10, wantPollers: 1},
+		{name: "prefetch at upper bound", opts: []router.Option{router.WithPrefetch(1000)}, wantPrefetch: 1000, wantPollers: 1},
 	}
 
 	for _, tt := range tests {
@@ -420,6 +425,8 @@ func TestFlowControlOptionValidationErrors(t *testing.T) {
 	}{
 		{name: "prefetch negative one", opt: router.WithPrefetch(-1)},
 		{name: "prefetch min int", opt: router.WithPrefetch(math.MinInt)},
+		{name: "prefetch one above upper bound", opt: router.WithPrefetch(1001)},
+		{name: "prefetch max int", opt: router.WithPrefetch(math.MaxInt)},
 		{name: "pollers zero", opt: router.WithPollers(0)},
 		{name: "pollers negative one", opt: router.WithPollers(-1)},
 		{name: "pollers min int", opt: router.WithPollers(math.MinInt)},
