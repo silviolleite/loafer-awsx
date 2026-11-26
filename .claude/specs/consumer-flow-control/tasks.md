@@ -323,8 +323,9 @@ Delegate test writing to the `go-test-engineer` agent and review to `go-test-rev
     - **Property 9: Hold on failure**
     - **Validates: Requirements 7.1–7.7**
     - PerGroupID through `Run` with a generated failure position (error or backoff) per
-      group under both retry models. Assert held messages never run, are never deleted,
-      get no visibility change, and produce one Warn each. Under the Scheduled model,
+      group under both retry models, on FIFO and non-FIFO queue URLs. Assert held messages
+      never run, are never deleted, get exactly one visibility change with timeout 0 on a
+      FIFO queue and none otherwise, and produce one Warn each. Under the Scheduled model,
       assert no holds.
     - Tag: `// Feature: consumer-flow-control, Property 9: ...`
 
@@ -413,7 +414,7 @@ Delegate test writing to the `go-test-engineer` agent and review to `go-test-rev
     - `feat(consumer): credit-based admission and dynamic group scheduling`
     - `docs: document consumer flow control`
 
-- [ ] 10. Review fixes (from `/code-review` of the branch)
+- [x] 10. Review fixes (from `/code-review` of the branch)
   - [x] 10.1 Idle-aware partial receive: `idleWorkers` in `consumer/credits.go`,
     `creditPool.acquireUpTo`, workers marked idle by `sharedQueue.take` /
     `groupScheduler.nextReady` only when nothing is ready, poller requests the credits it got
@@ -428,10 +429,26 @@ Delegate test writing to the `go-test-engineer` agent and review to `go-test-rev
     - _Requirements: 13.6_
   - [x] 10.6 README upgrade notes; wrap long lines in `benchmarks/fakeclient.go`
     - _Requirements: 15.9_
-  - [ ] 10.7 Update and add tests for 10.1–10.5 (Properties 1, 3, 4, 5, 19, 20 adjust to
+  - [x] 10.7 Update and add tests for 10.1–10.5 (Properties 1, 3, 4, 5, 19, 20 adjust to
     partial receives; new tests for idle partial acquire, expired skip, untrack ordering,
     prefetch bound, fake replay)
     - _Requirements: 1.4, 3.12, 8.12, 8.13, 11.10, 13.6_
+
+- [x] 11. Second review fixes
+  - [x] 11.1 Concurrent visibility sends (`maxConcurrentVisibilityRequests` = 8 chunks; fallback
+    sender sends one batch's changes concurrently)
+    - _Requirements: 9.13_
+  - [x] 11.2 `fake.SQSClient` replays batches by default; batch calls recorded only with
+    `ChangeMessageVisibilityBatchFunc`
+    - _Requirements: 13.3, 13.6_
+  - [x] 11.3 Release held messages on FIFO queues (`dispatcher.isFIFO`)
+    - _Requirements: 7.5_
+  - [x] 11.4 `startMargin`: do not start a message with no Extension left and < 1 s of visibility
+    - _Requirements: 8.12_
+  - [x] 11.5 Remove the dead polling loop in `TestRunVisibilityModelBackoffExtendsVisibilityAndLeavesMessage`
+  - [x] 11.6 Update tests for 11.1–11.4 (fake default replay, FIFO hold release in Property 9 and
+    examples, IsExpired margin, concurrent sends under slow clients)
+    - _Requirements: 7.5, 8.12, 9.13, 13.3, 13.6_
 
 ## Notes
 

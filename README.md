@@ -781,8 +781,11 @@ request; it no longer sizes any internal buffer.
   messages and nothing running, so unrelated groups never wait for each other
   and a slow group occupies one worker, not the route. Under the Visibility
   retry model, when a message fails (error or backoff), every pending message of
-  the same group is held: its handler does not run, it is not deleted, and its
-  visibility is not changed, so SQS redelivers the group in order.
+  the same group is held: its handler does not run and it is not deleted. On a
+  FIFO queue held messages are released (visibility 0); SQS still delivers
+  nothing from the group while the failed message is in flight, so the group is
+  retried in order as soon as the failed message's backoff or visibility timeout
+  ends. On other queues held messages keep their current visibility.
 
 ### Visibility management
 
@@ -810,10 +813,17 @@ For longer handlers, size `ExtensionLimit` so that
 `VisibilityTimeout + Σ(k × VisibilityTimeout − 10 s)` for `k = 1..n` covers the
 p99. Handlers should still be idempotent: SQS delivery is at least once.
 
-A message whose visibility deadline has already passed when a worker takes it
-(for example the tail of a large FIFO group that used up `ExtensionLimit`) is
-not run: SQS may already have delivered it elsewhere. It is logged at Warn and
-left for redelivery, and under `PerGroupID` the rest of its group is held.
+A message whose visibility deadline has already passed when a worker takes it,
+or that has no extension left and less than 1 second of visibility, is not run
+(for example the tail of a large FIFO group that used up `ExtensionLimit`): SQS
+may already have delivered it elsewhere. It is logged at Warn and left for
+redelivery. Under the Visibility retry model with `PerGroupID` the rest of its
+group is held; under the Scheduled Retry model it is not, consistent with that
+model unblocking groups on failure.
+
+Visibility requests run concurrently (up to 8 at a time, and the changes of one
+batch at once when the client has no batch API), so one slow request does not
+make other messages miss their deadlines.
 
 ### Shutdown
 
@@ -849,9 +859,10 @@ these points when upgrading from v1.1.x:
 - **`MaxMessages`.** It only sets the size of one receive request; use
   `WithPrefetch` to bound how many received messages wait for a worker.
 - **`fake.SQSClient`.** The fake now implements `ChangeMessageVisibilityBatch`,
-  which the consumer prefers. Tests that only set `ChangeMessageVisibilityFunc`
-  keep working: the fake replays each batch entry through it and records it in
-  `ChangeMessageVisibilityCalls`. Set `ChangeMessageVisibilityBatchFunc` to
+  which the consumer prefers. Unless `ChangeMessageVisibilityBatchFunc` is set,
+  the fake replays each batch entry through `ChangeMessageVisibility`, so
+  existing tests keep observing every change through `ChangeMessageVisibilityFunc`
+  and `ChangeMessageVisibilityCalls`. Set `ChangeMessageVisibilityBatchFunc` to
   observe the batch requests themselves.
 
 ---

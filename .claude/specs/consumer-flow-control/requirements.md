@@ -292,7 +292,11 @@ fails, so that the group is redelivered in order instead of being processed out 
    of the same Group_Key.
 3. THE Consumer SHALL NOT run the handler of a held message.
 4. THE Consumer SHALL NOT delete a held message.
-5. THE Consumer SHALL NOT send any visibility change for a held message.
+5. WHERE the Route queue is not a FIFO queue, THE Consumer SHALL NOT send any visibility
+   change for a held message. WHERE the Route queue is a FIFO queue (its URL ends in
+   `.fifo`), THE Consumer SHALL Release every held message, so the group is retried when
+   the failed message becomes visible rather than when a held message's extended
+   visibility runs out.
 6. WHEN a message is held, THE Consumer SHALL log one Warn record that includes the queue
    URL, the receipt handle, and the group ID.
 7. WHILE consuming a Route under the Scheduled_Retry_Model, THE Group_Scheduler SHALL NOT
@@ -332,9 +336,12 @@ limit.
     Visibility_Deadline is more than the Renewal_Margin plus the Coalesce_Window away.
 11. THE Visibility_Manager SHALL run as one goroutine per Consumer, independent of the
     number of Tracked_Messages.
-12. IF the Visibility_Deadline of a Pending_Message has passed when a Worker takes it,
-    THEN THE Consumer SHALL NOT run its handler, SHALL log one Warn record, and, under the
-    Visibility_Retry_Model in PerGroupID mode, SHALL Hold the rest of its group.
+12. IF the Visibility_Deadline of a Pending_Message has passed when a Worker takes it, or
+    the message has no Extension left and less than 1 second of visibility remains, THEN
+    THE Consumer SHALL NOT run its handler, SHALL log one Warn record, and, under the
+    Visibility_Retry_Model in PerGroupID mode, SHALL Hold the rest of its group. Under the
+    Scheduled_Retry_Model the rest of the group is not held, consistent with that model
+    unblocking groups on failure.
 13. WHEN a handler returns, THE Consumer SHALL stop tracking the message before it sends
     the delete or applies any other outcome request.
 
@@ -369,6 +376,9 @@ so that extensions cost fewer SQS requests.
 11. THE Visibility_Manager SHALL NOT panic on any `ChangeMessageVisibilityBatch` response,
     including a nil output or a failed entry whose `Id` does not match a sent entry.
 12. THE Visibility_Manager SHALL bound each visibility request by a timeout.
+13. THE Visibility_Manager SHALL send up to 8 visibility requests concurrently, and the
+    fallback sender SHALL send the changes of one batch concurrently, so a slow request
+    does not delay other Extensions past their Visibility_Deadline.
 
 ### Requirement 10: Backoff
 
@@ -447,14 +457,14 @@ batched visibility changes, so that I can test routes without AWS.
 1. THE `fake.SQSClient` type SHALL implement `ChangeMessageVisibilityBatch`.
 2. THE `fake.SQSClient` type SHALL expose a `ChangeMessageVisibilityBatchFunc` field that,
    when set, determines the `ChangeMessageVisibilityBatch` result.
-3. WHEN `ChangeMessageVisibilityBatchFunc` is not set, THE `fake.SQSClient` SHALL report
-   every entry of a `ChangeMessageVisibilityBatch` call as successful.
+3. WHEN `ChangeMessageVisibilityBatchFunc` is not set, THE `fake.SQSClient` SHALL replay
+   every entry of a `ChangeMessageVisibilityBatch` call through `ChangeMessageVisibility`
+   and report the entries whose single call succeeded as successful.
 4. THE `fake.SQSClient` type SHALL expose `ChangeMessageVisibilityBatchCalls()` returning a
    copy of the recorded inputs in call order.
 5. THE `fake.SQSClient` type SHALL be safe for concurrent use.
-6. WHERE only `ChangeMessageVisibilityFunc` is set, THE `fake.SQSClient` SHALL replay each
-   `ChangeMessageVisibilityBatch` entry through `ChangeMessageVisibility` and SHALL NOT
-   record the batch call.
+6. WHEN `ChangeMessageVisibilityBatchFunc` is not set, THE `fake.SQSClient` SHALL NOT record
+   the batch call in `ChangeMessageVisibilityBatchCalls`.
 
 ### Requirement 14: Benchmarks
 

@@ -693,9 +693,9 @@ separator-joined `MessageGroupId` and field values, with native values taking pr
 
 *For any* group script under the Visibility_Retry_Model in which message *i* of a group
 fails (error or backoff), no Pending_Message of that group submitted before the failure
-runs its handler, none is deleted, and none receives any visibility change. Each held
-message produces exactly one Warn record. Under the Scheduled_Retry_Model no message is
-held.
+runs its handler and none is deleted; on a FIFO queue each held message receives exactly
+one visibility change with timeout 0, on other queues none. Each held message produces
+exactly one Warn record. Under the Scheduled_Retry_Model no message is held.
 
 **Validates: Requirements 7.1–7.7**
 
