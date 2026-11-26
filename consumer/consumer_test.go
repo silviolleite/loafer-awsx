@@ -7,10 +7,13 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/scheduler"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,6 +25,7 @@ import (
 
 	"github.com/silviolleite/loafer-awsx/consumer"
 	verrors "github.com/silviolleite/loafer-awsx/errors"
+	"github.com/silviolleite/loafer-awsx/fake"
 	"github.com/silviolleite/loafer-awsx/middleware"
 	"github.com/silviolleite/loafer-awsx/router"
 )
@@ -29,6 +33,7 @@ import (
 type stubClient struct {
 	getErr        error
 	receiveFn     func(call int) (*sqs.ReceiveMessageOutput, error)
+	onDelete      func()
 	queueName     string
 	queueURL      string
 	receiveInputs []sqs.ReceiveMessageInput
@@ -55,9 +60,14 @@ func (s *stubClient) ReceiveMessage(_ context.Context, in *sqs.ReceiveMessageInp
 
 func (s *stubClient) DeleteMessage(_ context.Context, in *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if in.ReceiptHandle != nil {
 		s.deleted = append(s.deleted, *in.ReceiptHandle)
+	}
+	onDelete := s.onDelete
+	s.mu.Unlock()
+
+	if onDelete != nil {
+		onDelete()
 	}
 	return &sqs.DeleteMessageOutput{}, nil
 }
@@ -161,15 +171,11 @@ func (h *countingHandler) errorCount() int {
 
 type recorder struct {
 	handled []string
-	delay   time.Duration
 	mu      sync.Mutex
 }
 
 func (r *recorder) handler() middleware.Handler {
 	return func(_ context.Context, m middleware.Message) error {
-		if r.delay > 0 {
-			time.Sleep(r.delay)
-		}
 		r.mu.Lock()
 		r.handled = append(r.handled, m.Identifier())
 		r.mu.Unlock()
@@ -177,10 +183,12 @@ func (r *recorder) handler() middleware.Handler {
 	}
 }
 
-func (r *recorder) handledCount() int {
+func (r *recorder) handledIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.handled)
+	out := make([]string, len(r.handled))
+	copy(out, r.handled)
+	return out
 }
 
 func newRoute(tb require.TestingT, handler middleware.Handler, opts ...router.Option) *router.Route {
@@ -385,8 +393,9 @@ func TestRunRetriesAfterReceiveError(t *testing.T) {
 
 	rec := &recorder{}
 	logs := &countingHandler{}
+	deleted := newCountdown(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &stubClient{queueURL: "https://sqs/orders"}
+	client := &stubClient{queueURL: "https://sqs/orders", onDelete: deleted.tick}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
 		switch call {
 		case 0:
@@ -394,6 +403,7 @@ func TestRunRetriesAfterReceiveError(t *testing.T) {
 		case 1:
 			return messageBatch("receipt-1"), nil
 		default:
+			<-deleted.done
 			cancel()
 			return &sqs.ReceiveMessageOutput{}, nil
 		}
@@ -476,22 +486,39 @@ func TestRunContextCancellationStopsPolling(t *testing.T) {
 func TestRunCompletesInFlightMessagesBeforeReturn(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	rec := &recorder{delay: 10 * time.Millisecond}
+	const workers = 2
+	rec := &recorder{}
+	record := rec.handler()
+	running := newCountdown(workers)
+	handler := func(ctx context.Context, m middleware.Message) error {
+		running.tick()
+		<-ctx.Done()
+		return record(ctx, m)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	client := &stubClient{queueURL: "https://sqs/orders"}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
 		if call == 0 {
-			return messageBatch("receipt-1", "receipt-2", "receipt-3"), nil
+			return messageBatch("receipt-1", "receipt-2", "receipt-3", "receipt-4", "receipt-5"), nil
 		}
-		cancel()
-		return &sqs.ReceiveMessageOutput{}, nil
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 
-	c := newConsumer(t, client, newRoute(t, rec.handler()))
+	c := newConsumer(t, client, newRoute(t, handler, router.WithWorkerPoolSize(workers)))
 
-	require.NoError(t, c.Run(ctx))
-	assert.Equal(t, 3, rec.handledCount())
-	assert.ElementsMatch(t, []string{"receipt-1", "receipt-2", "receipt-3"}, client.deletedHandles())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	<-running.done
+	cancel()
+
+	require.NoError(t, <-done)
+	assert.ElementsMatch(t, []string{"receipt-1", "receipt-2"}, rec.handledIDs())
+	assert.ElementsMatch(t, []string{"receipt-1", "receipt-2"}, client.deletedHandles())
+	assert.Equal(t, []int32{0, 0, 0}, client.visibilityChanges())
 }
 
 func TestRunAppliesGlobalMiddlewareOutermost(t *testing.T) {
@@ -517,12 +544,14 @@ func TestRunAppliesGlobalMiddlewareOutermost(t *testing.T) {
 		return nil
 	}
 
+	deleted := newCountdown(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &stubClient{queueURL: "https://sqs/orders"}
+	client := &stubClient{queueURL: "https://sqs/orders", onDelete: deleted.tick}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
 		if call == 0 {
 			return messageBatch("receipt-1"), nil
 		}
+		<-deleted.done
 		cancel()
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
@@ -596,8 +625,9 @@ func TestRunConsumesStandardQueueRawMessagesInParallel(t *testing.T) {
 		return nil
 	}
 
+	deleted := newCountdown(3)
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &stubClient{queueURL: "https://sqs/orders"}
+	client := &stubClient{queueURL: "https://sqs/orders", onDelete: deleted.tick}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
 		if call == 0 {
 			return &sqs.ReceiveMessageOutput{Messages: []types.Message{
@@ -606,6 +636,7 @@ func TestRunConsumesStandardQueueRawMessagesInParallel(t *testing.T) {
 				rawMessage("receipt-3", `{"id":"c","total":30}`),
 			}}, nil
 		}
+		<-deleted.done
 		cancel()
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
@@ -636,12 +667,14 @@ func TestRunProcessesEveryReceivedMessageProperty(t *testing.T) {
 		}
 
 		rec := &recorder{}
+		deleted := newCountdown(n)
 		ctx, cancel := context.WithCancel(context.Background())
-		client := &stubClient{queueURL: "https://sqs/orders"}
+		client := &stubClient{queueURL: "https://sqs/orders", onDelete: deleted.tick}
 		client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
 			if call == 0 {
 				return messageBatch(handles...), nil
 			}
+			<-deleted.done
 			cancel()
 			return &sqs.ReceiveMessageOutput{}, nil
 		}
@@ -677,6 +710,7 @@ func TestRunIncrementsDLQMetricWhenExhausted(t *testing.T) {
 
 	handler := func(context.Context, middleware.Message) error { return stderrors.New("boom") }
 
+	observed := newCountdown(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &stubClient{queueURL: "https://sqs/orders"}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
@@ -688,6 +722,7 @@ func TestRunIncrementsDLQMetricWhenExhausted(t *testing.T) {
 				},
 			}}, nil
 		}
+		<-observed.done
 		cancel()
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
@@ -697,7 +732,10 @@ func TestRunIncrementsDLQMetricWhenExhausted(t *testing.T) {
 		router.WithDLQ(5),
 	)
 	c := newConsumer(t, client, route,
-		consumer.WithMetrics(recorderFunc{dlq: func(routeName string) { dlqCounter.WithLabelValues(routeName).Inc() }}),
+		consumer.WithMetrics(recorderFunc{dlq: func(routeName string) {
+			dlqCounter.WithLabelValues(routeName).Inc()
+			observed.tick()
+		}}),
 	)
 
 	require.NoError(t, c.Run(ctx))
@@ -712,6 +750,7 @@ func TestRunLeavesExhaustedMessageForRedrive(t *testing.T) {
 	var onDLQCalls int
 	handler := func(context.Context, middleware.Message) error { return stderrors.New("boom") }
 
+	observed := newCountdown(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &stubClient{queueURL: "https://sqs/orders"}
 	client.receiveFn = func(call int) (*sqs.ReceiveMessageOutput, error) {
@@ -723,11 +762,15 @@ func TestRunLeavesExhaustedMessageForRedrive(t *testing.T) {
 				},
 			}}, nil
 		}
+		<-observed.done
 		cancel()
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
 
-	route := newRoute(t, handler, router.WithDLQ(5, router.WithOnDLQ(func(context.Context, middleware.Message) { onDLQCalls++ })))
+	route := newRoute(t, handler, router.WithDLQ(5, router.WithOnDLQ(func(context.Context, middleware.Message) {
+		onDLQCalls++
+		observed.tick()
+	})))
 	c := newConsumer(t, client, route)
 
 	require.NoError(t, c.Run(ctx))
@@ -802,4 +845,294 @@ func TestRunReturnsErrorWhenScheduledModelMissingSchedulerClient(t *testing.T) {
 	assert.True(t, stderrors.Is(err, verrors.ErrNoSchedulerClient))
 	assert.Equal(t, 0, client.resolveCalls())
 	assert.Equal(t, 0, client.receives())
+}
+
+var errBackoffHandler = stderrors.New("backoff handler failed")
+
+type backoffScript struct {
+	delays []time.Duration
+	fail   bool
+}
+
+type backoffScenario struct {
+	scripts    []backoffScript
+	retryModel router.RetryModel
+	batch      bool
+}
+
+type countdown struct {
+	done      chan struct{}
+	remaining atomic.Int64
+}
+
+func newCountdown(n int) *countdown {
+	c := &countdown{done: make(chan struct{})}
+	c.remaining.Store(int64(n))
+	if n == 0 {
+		close(c.done)
+	}
+	return c
+}
+
+func (c *countdown) tick() {
+	if c.remaining.Add(-1) == 0 {
+		close(c.done)
+	}
+}
+
+func drawBackoffDelay(t *rapid.T, label string) time.Duration {
+	ranges := [][2]time.Duration{
+		{-48 * time.Hour, -time.Nanosecond},
+		{0, 0},
+		{time.Nanosecond, time.Second - time.Nanosecond},
+		{time.Second, 12 * time.Hour},
+		{12*time.Hour + time.Nanosecond, 30 * 24 * time.Hour},
+	}
+	r := rapid.SampledFrom(ranges).Draw(t, label+"-range")
+	return time.Duration(rapid.Int64Range(int64(r[0]), int64(r[1])).Draw(t, label))
+}
+
+func drawBackoffScenario(t *rapid.T) backoffScenario {
+	s := backoffScenario{
+		retryModel: rapid.SampledFrom([]router.RetryModel{router.VisibilityRetryModel, router.ScheduledRetryModel}).Draw(t, "retryModel"),
+		batch:      rapid.Bool().Draw(t, "batch"),
+	}
+	n := rapid.IntRange(1, 10).Draw(t, "messages")
+	s.scripts = make([]backoffScript, n)
+	for i := range s.scripts {
+		calls := rapid.IntRange(1, 20).Draw(t, "calls")
+		delays := make([]time.Duration, calls)
+		for j := range delays {
+			delays[j] = drawBackoffDelay(t, "delay")
+		}
+		s.scripts[i] = backoffScript{delays: delays, fail: rapid.Bool().Draw(t, "fail")}
+	}
+	return s
+}
+
+func backoffHandle(i int) string {
+	return "receipt-backoff-" + strconv.Itoa(i)
+}
+
+func expectedBackoffTimeout(delay time.Duration) int32 {
+	return int32(min(max(int64(delay/time.Second), 0), 43200))
+}
+
+func (s backoffScenario) handler(handlers *countdown, notBackedOff *atomic.Int64) middleware.Handler {
+	scripts := make(map[string]backoffScript, len(s.scripts))
+	for i, script := range s.scripts {
+		scripts[backoffHandle(i)] = script
+	}
+	return func(_ context.Context, m middleware.Message) error {
+		defer handlers.tick()
+		msg, ok := m.(consumer.Message)
+		if !ok {
+			notBackedOff.Add(1)
+			return errBackoffHandler
+		}
+		script := scripts[msg.Identifier()]
+		for _, d := range script.delays {
+			msg.Backoff(d)
+		}
+		if !msg.BackedOff() {
+			notBackedOff.Add(1)
+		}
+		if script.fail {
+			return errBackoffHandler
+		}
+		return nil
+	}
+}
+
+func (s backoffScenario) route(tb require.TestingT, handler middleware.Handler) *router.Route {
+	opts := []router.Option{router.WithExtensionLimit(0)}
+	if s.retryModel == router.ScheduledRetryModel {
+		opts = append(opts, router.WithScheduledRetry(
+			router.WithSchedulerIdentity("arn:aws:sqs:us-east-1:123456789012:orders.fifo", "arn:aws:iam::123456789012:role/scheduler"),
+			router.WithScheduledDLQ("https://sqs.us-east-1.amazonaws.com/123456789012/orders-dlq"),
+			router.WithMaxRetryCount(5),
+			router.WithBackoff(time.Second, 2*time.Second),
+		))
+	}
+	return newRoute(tb, handler, opts...)
+}
+
+func runBackoffScenario(tb require.TestingT, s backoffScenario) (*fake.SQSClient, *fake.SchedulerClient) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := len(s.scripts)
+	handlers := newCountdown(n)
+	deletes := newCountdown(0)
+	if s.retryModel == router.ScheduledRetryModel {
+		deletes = newCountdown(n)
+	}
+
+	msgs := make([]types.Message, n)
+	for i := range msgs {
+		msgs[i] = types.Message{ReceiptHandle: aws.String(backoffHandle(i)), Body: aws.String("body-" + strconv.Itoa(i))}
+	}
+
+	var receives atomic.Int64
+	client := &fake.SQSClient{
+		GetQueueUrlFunc: func(_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
+			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(commitQueueURL)}, nil
+		},
+		ReceiveMessageFunc: func(_ context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			if receives.Add(1) == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
+			}
+			<-handlers.done
+			<-deletes.done
+			cancel()
+			return &sqs.ReceiveMessageOutput{}, nil
+		},
+		DeleteMessageFunc: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			deletes.tick()
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+		ChangeMessageVisibilityFunc: func(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
+		},
+	}
+	sched := &fake.SchedulerClient{
+		CreateScheduleFunc: func(_ context.Context, _ *scheduler.CreateScheduleInput, _ ...func(*scheduler.Options)) (*scheduler.CreateScheduleOutput, error) {
+			return &scheduler.CreateScheduleOutput{}, nil
+		},
+	}
+
+	var sqsClient consumer.SQSClient = client
+	if !s.batch {
+		sqsClient = standardClient(client)
+	}
+
+	var notBackedOff atomic.Int64
+	c := newConsumer(tb, sqsClient, s.route(tb, s.handler(handlers, &notBackedOff)), consumer.WithSchedulerClient(sched))
+	require.NoError(tb, c.Run(ctx))
+	require.Zero(tb, notBackedOff.Load())
+	return client, sched
+}
+
+func visibilityChangesByHandle(client *fake.SQSClient) map[string][]int32 {
+	out := make(map[string][]int32)
+	for _, call := range client.ChangeMessageVisibilityBatchCalls() {
+		for _, entry := range call.Entries {
+			handle := aws.ToString(entry.ReceiptHandle)
+			out[handle] = append(out[handle], entry.VisibilityTimeout)
+		}
+	}
+	for _, call := range client.ChangeMessageVisibilityCalls() {
+		handle := aws.ToString(call.ReceiptHandle)
+		out[handle] = append(out[handle], call.VisibilityTimeout)
+	}
+	return out
+}
+
+func deletedHandleCounts(client *fake.SQSClient) map[string]int {
+	out := make(map[string]int)
+	for _, call := range client.DeleteMessageCalls() {
+		out[aws.ToString(call.ReceiptHandle)]++
+	}
+	return out
+}
+
+// Feature: consumer-flow-control, Property 18: For any sequence of Backoff calls in a handler, every call returns without blocking; under the Visibility_Retry_Model exactly one visibility change is sent, with timeout clamp(last delay seconds, 0, 43200), and the message is not deleted; under the Scheduled_Retry_Model no visibility change is sent.
+func TestRun_PropertyBackoffSemantics(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		defer goleak.VerifyNone(rt)
+
+		s := drawBackoffScenario(rt)
+		client, sched := runBackoffScenario(rt, s)
+
+		changes := visibilityChangesByHandle(client)
+		deleted := deletedHandleCounts(client)
+		assert.Empty(rt, client.DeleteMessageBatchCalls())
+
+		if s.retryModel == router.ScheduledRetryModel {
+			assert.Empty(rt, changes)
+			assert.Len(rt, sched.CreateScheduleCalls(), len(s.scripts))
+			for i := range s.scripts {
+				assert.Equal(rt, 1, deleted[backoffHandle(i)], backoffHandle(i))
+			}
+			return
+		}
+
+		assert.Empty(rt, deleted)
+		assert.Empty(rt, sched.CreateScheduleCalls())
+		assert.Len(rt, changes, len(s.scripts))
+		for i, script := range s.scripts {
+			want := expectedBackoffTimeout(script.delays[len(script.delays)-1])
+			assert.Equal(rt, []int32{want}, changes[backoffHandle(i)], backoffHandle(i))
+		}
+		if s.batch {
+			assert.Empty(rt, client.ChangeMessageVisibilityCalls())
+		} else {
+			assert.Empty(rt, client.ChangeMessageVisibilityBatchCalls())
+		}
+	})
+}
+
+func TestRun_BackoffThousandCallsReturns(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	delays := make([]time.Duration, 1000)
+	for i := range delays {
+		delays[i] = time.Duration(i) * time.Second
+	}
+	s := backoffScenario{
+		scripts:    []backoffScript{{delays: delays}},
+		retryModel: router.VisibilityRetryModel,
+		batch:      true,
+	}
+
+	client, _ := runBackoffScenario(t, s)
+
+	assert.Equal(t, map[string][]int32{backoffHandle(0): {999}}, visibilityChangesByHandle(client))
+	assert.Empty(t, client.DeleteMessageCalls())
+	assert.Empty(t, client.ChangeMessageVisibilityCalls())
+}
+
+func TestRun_PerGroupIDHoldsSameReceiveTailAfterFailure(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		defer goleak.VerifyNone(rt)
+
+		n := rapid.IntRange(2, 10).Draw(rt, "messages")
+		workers := rapid.IntRange(1, 4).Draw(rt, "workers")
+		batch := make([]types.Message, n)
+		for i := range batch {
+			batch[i] = types.Message{
+				ReceiptHandle: aws.String("receipt-" + strconv.Itoa(i)),
+				Body:          aws.String(strconv.Itoa(i)),
+				Attributes:    map[string]string{"MessageGroupId": "group"},
+			}
+		}
+
+		var handled atomic.Int64
+		handler := func(_ context.Context, m middleware.Message) error {
+			handled.Add(1)
+			if string(m.Body()) == "0" {
+				return errCommitHandler
+			}
+			return nil
+		}
+
+		client := &fake.SQSClient{
+			GetQueueUrlFunc: func(context.Context, *sqs.GetQueueUrlInput, ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
+				return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(commitQueueURL)}, nil
+			},
+		}
+		route := newRoute(rt, handler, router.WithRunMode(router.PerGroupID), router.WithWorkerPoolSize(workers), router.WithMaxMessages(10))
+		c := newConsumer(rt, standardClient(client), route)
+
+		var runErr error
+		synctest.Test(t, func(*testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runErr = runQuiescentBatches(ctx, c, client, [][]types.Message{batch}, cancel)
+		})
+
+		require.NoError(rt, runErr)
+		assert.Equal(rt, int64(1), handled.Load())
+		assert.Empty(rt, deleteMessageHandles(client.DeleteMessageCalls()))
+	})
 }

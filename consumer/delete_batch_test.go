@@ -222,24 +222,22 @@ func (m commitMessage) sqsMessage() types.Message {
 	}
 }
 
-func newCommitSQSClient(s commitScenario, cancel context.CancelFunc) *fake.SQSClient {
+func (s commitScenario) receiveBatches() [][]types.Message {
+	out := make([][]types.Message, len(s.batches))
+	for b, batch := range s.batches {
+		out[b] = make([]types.Message, len(batch))
+		for i, m := range batch {
+			out[b][i] = m.sqsMessage()
+		}
+	}
+	return out
+}
+
+func newCommitSQSClient(s commitScenario) *fake.SQSClient {
 	failing := s.failingBodies()
-	var calls atomic.Int64
 	return &fake.SQSClient{
 		GetQueueUrlFunc: func(_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
 			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(commitQueueURL)}, nil
-		},
-		ReceiveMessageFunc: func(_ context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
-			n := int(calls.Add(1) - 1)
-			if n >= len(s.batches) {
-				cancel()
-				return &sqs.ReceiveMessageOutput{}, nil
-			}
-			msgs := make([]types.Message, len(s.batches[n]))
-			for i, m := range s.batches[n] {
-				msgs[i] = m.sqsMessage()
-			}
-			return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
 		},
 		SendMessageFunc: func(_ context.Context, params *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
 			if failing[aws.ToString(params.MessageBody)] {
@@ -272,29 +270,61 @@ func newCommitScheduler(s commitScenario) *fake.SchedulerClient {
 	}
 }
 
+func runQuiescentBatches(ctx context.Context, c *consumer.Consumer, client *fake.SQSClient, batches [][]types.Message, shutdown func()) error {
+	next := make(chan struct{})
+	var calls atomic.Int64
+	client.ReceiveMessageFunc = func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+		n := int(calls.Add(1) - 1)
+		if n > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-next:
+			}
+		}
+		return &sqs.ReceiveMessageOutput{Messages: batches[n]}, nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	for range len(batches) - 1 {
+		synctest.Wait()
+		next <- struct{}{}
+	}
+	synctest.Wait()
+	shutdown()
+
+	return <-done
+}
+
 func runCommitScenario(
-	t require.TestingT,
+	t *testing.T,
+	tb require.TestingT,
 	s commitScenario,
 	wrap func(*fake.SQSClient) consumer.SQSClient,
 	routeOpts []router.Option,
 	consumerOpts ...consumer.Option,
 ) commitRun {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	run := commitRun{
-		sqs:       newCommitSQSClient(s, cancel),
+		sqs:       newCommitSQSClient(s),
 		scheduler: newCommitScheduler(s),
 	}
 
 	route, err := router.New(commitQueueName, s.handler(), append(s.routeOptions(), routeOpts...)...)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	opts := append([]consumer.Option{consumer.WithSchedulerClient(run.scheduler)}, consumerOpts...)
 	c, err := consumer.New(wrap(run.sqs), route, opts...)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
-	require.NoError(t, c.Run(ctx))
+	var runErr error
+	synctest.Test(t, func(*testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runErr = runQuiescentBatches(ctx, c, run.sqs, s.receiveBatches(), cancel)
+	})
+	require.NoError(tb, runErr)
 	return run
 }
 
@@ -432,7 +462,7 @@ func TestRun_StandardRouteCommitsSynchronously(t *testing.T) {
 			t.Run(tt.name+"/"+cl.name, func(t *testing.T) {
 				defer goleak.VerifyNone(t)
 
-				run := runCommitScenario(t, tt.scenario, cl.wrap, nil)
+				run := runCommitScenario(t, t, tt.scenario, cl.wrap, nil)
 
 				assert.ElementsMatch(t, tt.want, tt.scenario.expectedCommitted())
 				assertSynchronousCommits(t, tt.scenario, run)
@@ -452,7 +482,7 @@ func TestRun_PropertyStandardRouteKeepsSynchronousPath(t *testing.T) {
 			wrap = batchCapableClient
 		}
 
-		run := runCommitScenario(rt, s, wrap, nil)
+		run := runCommitScenario(t, rt, s, wrap, nil)
 
 		assertSynchronousCommits(rt, s, run)
 		assert.Len(rt, run.sqs.GetQueueURLCalls(), 1)
@@ -466,8 +496,8 @@ func TestRun_PropertyCommittedSetIdenticalOnBothPaths(t *testing.T) {
 
 		s := drawCommitScenario(rt)
 
-		batched := runCommitScenario(rt, s, batchCapableClient, []router.Option{router.WithDeleteBatch()})
-		standard := runCommitScenario(rt, s, standardClient, nil)
+		batched := runCommitScenario(t, rt, s, batchCapableClient, []router.Option{router.WithDeleteBatch()})
+		standard := runCommitScenario(t, rt, s, standardClient, nil)
 
 		batchCalls := batched.sqs.DeleteMessageBatchCalls()
 		batchRemoved := sentHandles(batchCalls)
@@ -588,8 +618,8 @@ func TestRun_PropertyMetricsParityOnBothPaths(t *testing.T) {
 		standardMetrics := newMetricCounter()
 
 		deleteBatch := []router.Option{router.WithDeleteBatch()}
-		runCommitScenario(rt, s, batchCapableClient, deleteBatch, consumer.WithMetrics(batchedMetrics.recorder()))
-		runCommitScenario(rt, s, standardClient, nil, consumer.WithMetrics(standardMetrics.recorder()))
+		runCommitScenario(t, rt, s, batchCapableClient, deleteBatch, consumer.WithMetrics(batchedMetrics.recorder()))
+		runCommitScenario(t, rt, s, standardClient, nil, consumer.WithMetrics(standardMetrics.recorder()))
 
 		batched := batchedMetrics.snapshot()
 		standard := standardMetrics.snapshot()
@@ -658,10 +688,17 @@ func drawShutdownScenario(t *rapid.T) (commitScenario, map[string]bool) {
 	return s, gated
 }
 
-func gateHandlers(gated map[string]bool, head string, headStarted chan<- struct{}, release <-chan struct{}) middleware.Middleware {
+func gateHandlers(
+	gated map[string]bool,
+	head string,
+	started *handledRecorder,
+	headStarted chan<- struct{},
+	release <-chan struct{},
+) middleware.Middleware {
 	return func(next middleware.Handler) middleware.Handler {
 		return func(ctx context.Context, m middleware.Message) error {
 			body := string(m.Body())
+			started.record(body)
 			if body == head {
 				close(headStarted)
 			}
@@ -671,6 +708,56 @@ func gateHandlers(gated map[string]bool, head string, headStarted chan<- struct{
 			return next(ctx, m)
 		}
 	}
+}
+
+func (s commitScenario) committedAmong(started map[string]bool) []string {
+	committed := make(map[string]bool)
+	for _, h := range s.expectedCommitted() {
+		committed[h] = true
+	}
+	var out []string
+	for _, m := range s.messages() {
+		if started[m.body] && committed[m.handle] {
+			out = append(out, m.handle)
+		}
+	}
+	return out
+}
+
+func (s commitScenario) releasedAtShutdown(started map[string]bool) []string {
+	holds := s.retryModel == router.VisibilityRetryModel && s.runMode == router.PerGroupID
+	failedGroups := make(map[string]bool)
+	var out []string
+	for _, m := range s.messages() {
+		if started[m.body] {
+			if holds && m.outcome != outcomeSuccess {
+				failedGroups[m.groupID] = true
+			}
+			continue
+		}
+		if !failedGroups[m.groupID] {
+			out = append(out, m.handle)
+		}
+	}
+	return out
+}
+
+func releasedHandles(client *fake.SQSClient) []string {
+	var out []string
+	for handle, timeouts := range visibilityChangesByHandle(client) {
+		if slices.Contains(timeouts, 0) {
+			out = append(out, handle)
+		}
+	}
+	return out
+}
+
+func setOf(items []string) map[string]bool {
+	out := make(map[string]bool, len(items))
+	for _, item := range items {
+		out[item] = true
+	}
+	return out
 }
 
 func (s commitScenario) gatedCommitted(gated map[string]bool) []string {
@@ -693,53 +780,62 @@ func TestRun_PropertyShutdownFlushesAndLeaksNothing(t *testing.T) {
 		s, gated := drawShutdownScenario(rt)
 		batch := s.batches[0]
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		headStarted := make(chan struct{})
-		release := make(chan struct{})
-		shutdown := sync.OnceFunc(func() {
-			cancel()
-			close(release)
-		})
-
 		rec := &shutdownRecorder{}
-		client := newCommitSQSClient(s, cancel)
-		var receives atomic.Int64
-		client.ReceiveMessageFunc = func(_ context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
-			if receives.Add(1) == 1 {
-				msgs := make([]types.Message, len(batch))
-				for i, m := range batch {
-					msgs[i] = m.sqsMessage()
-				}
-				return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
-			}
-			<-headStarted
-			shutdown()
-			return &sqs.ReceiveMessageOutput{}, nil
-		}
-		client.DeleteMessageBatchFunc = rec.deleteBatchFunc(ctx)
+		started := &handledRecorder{}
+		client := newCommitSQSClient(s)
 
-		routeOpts := append(s.routeOptions(),
-			router.WithDeleteBatch(),
-			router.WithMiddleware(gateHandlers(gated, batch[0].body, headStarted, release)),
+		var (
+			runErr       error
+			headRan      bool
+			sentAtReturn int
 		)
-		route, err := router.New(commitQueueName, s.handler(), routeOpts...)
-		require.NoError(rt, err)
-		c, err := consumer.New(client, route, consumer.WithSchedulerClient(newCommitScheduler(s)))
-		require.NoError(rt, err)
+		synctest.Test(t, func(st *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-		require.NoError(rt, c.Run(ctx))
-		rec.returned.Store(true)
-		sentAtReturn := len(client.DeleteMessageBatchCalls())
+			headStarted := make(chan struct{})
+			release := make(chan struct{})
+			client.DeleteMessageBatchFunc = rec.deleteBatchFunc(ctx)
+
+			routeOpts := append(s.routeOptions(),
+				router.WithDeleteBatch(),
+				router.WithMiddleware(gateHandlers(gated, batch[0].body, started, headStarted, release)),
+			)
+			route, err := router.New(commitQueueName, s.handler(), routeOpts...)
+			require.NoError(st, err)
+			c, err := consumer.New(client, route, consumer.WithSchedulerClient(newCommitScheduler(s)))
+			require.NoError(st, err)
+
+			runErr = runQuiescentBatches(ctx, c, client, s.receiveBatches(), func() {
+				select {
+				case <-headStarted:
+					headRan = true
+				default:
+				}
+				cancel()
+				close(release)
+			})
+			rec.returned.Store(true)
+			sentAtReturn = len(client.DeleteMessageBatchCalls())
+		})
+		require.NoError(rt, runErr)
+		require.True(rt, headRan)
 
 		goleak.VerifyNone(rt)
+
+		ran := setOf(started.snapshot())
+		ranGated := make(map[string]bool)
+		for body := range ran {
+			ranGated[body] = gated[body]
+		}
 
 		calls := rec.snapshot()
 		assert.Len(rt, client.DeleteMessageBatchCalls(), sentAtReturn)
 		assert.Len(rt, calls, sentAtReturn)
 		assert.Empty(rt, client.DeleteMessageCalls())
-		assert.ElementsMatch(rt, s.expectedCommitted(), sentHandles(client.DeleteMessageBatchCalls()))
+		assert.Empty(rt, client.ChangeMessageVisibilityCalls())
+		assert.ElementsMatch(rt, s.committedAmong(ran), sentHandles(client.DeleteMessageBatchCalls()))
+		assert.ElementsMatch(rt, s.releasedAtShutdown(ran), releasedHandles(client))
 
 		var sentAfterCancel []string
 		for _, call := range calls {
@@ -749,7 +845,7 @@ func TestRun_PropertyShutdownFlushesAndLeaksNothing(t *testing.T) {
 				sentAfterCancel = append(sentAfterCancel, call.handles...)
 			}
 		}
-		assert.Subset(rt, sentAfterCancel, s.gatedCommitted(gated))
+		assert.Subset(rt, sentAfterCancel, s.gatedCommitted(ranGated))
 	})
 }
 
@@ -782,7 +878,7 @@ func runFailFast(
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	client := newCommitSQSClient(commitScenario{}, cancel)
+	client := newCommitSQSClient(commitScenario{})
 	route, err := router.New(commitQueueName, commitScenario{}.handler(), routeOpts...)
 	require.NoError(t, err)
 	require.True(t, route.DeleteBatch())
@@ -953,7 +1049,7 @@ func TestRun_DeleteBatchFailureLeavesMessagesInQueue(t *testing.T) {
 					return c
 				}
 
-				run := runCommitScenario(rt, s, failing, []router.Option{router.WithDeleteBatch()}, consumer.WithLogger(slog.New(handler)))
+				run := runCommitScenario(t, rt, s, failing, []router.Option{router.WithDeleteBatch()}, consumer.WithLogger(slog.New(handler)))
 
 				want := s.expectedCommitted()
 				assert.Empty(rt, run.sqs.DeleteMessageCalls())
@@ -1008,10 +1104,14 @@ type handledRecorder struct {
 }
 
 func (r *handledRecorder) handler(_ context.Context, m middleware.Message) error {
+	r.record(string(m.Body()))
+	return nil
+}
+
+func (r *handledRecorder) record(handle string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.handles = append(r.handles, string(m.Body()))
-	return nil
+	r.handles = append(r.handles, handle)
 }
 
 func (r *handledRecorder) snapshot() []string {

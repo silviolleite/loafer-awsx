@@ -858,3 +858,187 @@ func TestIntegrationScheduledRetryCreatesRealSchedule(t *testing.T) {
 		})
 	}
 }
+
+type flowControlRun struct {
+	seq int
+	ok  bool
+}
+
+func TestIntegrationFlowControlHoldsGroupTailAndRedeliversInOrder(t *testing.T) {
+	const total = 4
+
+	client := newSQSClient(t)
+	url := createFIFOQueue(t, client)
+	name := queueNameFromURL(t, client, url)
+
+	var (
+		mu        sync.Mutex
+		runs      []flowControlRun
+		failed    bool
+		firstOK   []int
+		succeeded = map[int]bool{}
+	)
+	handler := func(_ context.Context, msg middleware.Message) error {
+		var payload struct {
+			Seq int `json:"seq"`
+		}
+		if err := msg.Decode(&payload); err != nil {
+			return err
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if payload.Seq == 1 && !failed {
+			failed = true
+			runs = append(runs, flowControlRun{seq: payload.Seq})
+			return fmt.Errorf("first attempt of seq %d fails", payload.Seq)
+		}
+		runs = append(runs, flowControlRun{seq: payload.Seq, ok: true})
+		if !succeeded[payload.Seq] {
+			succeeded[payload.Seq] = true
+			firstOK = append(firstOK, payload.Seq)
+		}
+		return nil
+	}
+
+	for seq := 1; seq <= total; seq++ {
+		sendMessage(t, client, url, map[string]int{"seq": seq}, "group-hold")
+	}
+
+	route := itNewRoute(t, name, handler,
+		router.WithWaitTimeSeconds(1),
+		router.WithVisibilityTimeout(11),
+		router.WithPollers(2),
+		router.WithRunMode(router.PerGroupID),
+	)
+	cancel, done := runConsumer(t, client, route)
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(firstOK) == total
+	}, 90*time.Second, 250*time.Millisecond)
+	waitQueueDrained(t, client, url)
+	stopConsumer(t, cancel, done)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.NotEmpty(t, runs)
+	assert.Equal(t, flowControlRun{seq: 1}, runs[0])
+	require.GreaterOrEqual(t, len(runs), 2)
+	assert.Equal(t, flowControlRun{seq: 1, ok: true}, runs[1])
+	assert.Equal(t, []int{1, 2, 3, 4}, firstOK)
+}
+
+func TestIntegrationFlowControlShutdownReleasesPending(t *testing.T) {
+	const (
+		total             = 5
+		visibilityTimeout = 120
+		releaseDeadline   = 15 * time.Second
+	)
+
+	client := newSQSClient(t)
+	url := createFIFOQueue(t, client)
+	name := queueNameFromURL(t, client, url)
+
+	decodeSeq := func(msg middleware.Message) (int32, error) {
+		var payload struct {
+			Seq int32 `json:"seq"`
+		}
+		err := msg.Decode(&payload)
+		return payload.Seq, err
+	}
+
+	var (
+		calls      atomic.Int32
+		blockedSeq atomic.Int32
+	)
+	started := make(chan struct{})
+	blocking := func(ctx context.Context, msg middleware.Message) error {
+		seq, err := decodeSeq(msg)
+		if err != nil {
+			return err
+		}
+		if calls.Add(1) == 1 {
+			blockedSeq.Store(seq)
+			close(started)
+			<-ctx.Done()
+		}
+		return nil
+	}
+
+	for seq := 1; seq <= total; seq++ {
+		sendMessage(t, client, url, map[string]int{"seq": seq}, fmt.Sprintf("group-%d", seq))
+	}
+
+	opts := []router.Option{
+		router.WithWaitTimeSeconds(1),
+		router.WithVisibilityTimeout(visibilityTimeout),
+		router.WithWorkerPoolSize(1),
+		router.WithPrefetch(9),
+		router.WithMaxMessages(10),
+		router.WithPollers(2),
+		router.WithRunMode(router.PerGroupID),
+	}
+	cancel, done := runConsumer(t, client, itNewRoute(t, name, blocking, opts...))
+
+	select {
+	case <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		out, err := client.GetQueueAttributes(context.Background(), &sqs.GetQueueAttributesInput{
+			QueueUrl: aws.String(url),
+			AttributeNames: []types.QueueAttributeName{
+				types.QueueAttributeNameApproximateNumberOfMessages,
+				types.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
+			},
+		})
+		require.NoError(c, err)
+		assert.Equal(c, "0", out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)])
+		assert.Equal(c, strconv.Itoa(total), out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+	}, 30*time.Second, 250*time.Millisecond)
+
+	stopConsumer(t, cancel, done)
+	assert.Equal(t, int32(1), calls.Load())
+
+	var (
+		mu       sync.Mutex
+		received = map[int32]int{}
+	)
+	recording := func(_ context.Context, msg middleware.Message) error {
+		seq, err := decodeSeq(msg)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		received[seq]++
+		mu.Unlock()
+		return nil
+	}
+
+	stoppedAt := time.Now()
+	cancel, done = runConsumer(t, client, itNewRoute(t, name, recording, opts...))
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(received) == total-1
+	}, releaseDeadline, 100*time.Millisecond)
+	assert.Less(t, time.Since(stoppedAt), releaseDeadline)
+	waitQueueDrained(t, client, url)
+	stopConsumer(t, cancel, done)
+
+	want := map[int32]int{}
+	for seq := int32(1); seq <= total; seq++ {
+		if seq != blockedSeq.Load() {
+			want[seq] = 1
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, want, received)
+}

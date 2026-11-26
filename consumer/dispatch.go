@@ -2,12 +2,10 @@ package consumer
 
 import (
 	"context"
-	"hash/fnv"
 	"log/slog"
-	"math/rand/v2"
 	"strconv"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -33,53 +31,67 @@ const (
 	// detection: once it reaches the route's configured MaxReceiveCount, AWS SQS
 	// is about to redrive the message to its dead letter queue.
 	approximateReceiveCountKey = "ApproximateReceiveCount"
+
+	// maxReceiveBatch is the AWS SQS limit on messages per ReceiveMessage call.
+	maxReceiveBatch = 10
+
+	// outcomeTimeout bounds the outcome requests of a message whose handler
+	// finished after the run context was canceled.
+	outcomeTimeout = 5 * time.Second
 )
 
-// dispatcher owns the per-route worker pool. It fans received messages out to a
-// fixed set of worker goroutines, each draining a buffered channel, and drives
-// the full processing lifecycle of every message: starting the visibility
-// extension goroutine, invoking the middleware-wrapped handler, and applying
-// the outcome (delete on success, leave on error, change visibility on
-// backoff).
+// dispatcher owns the per-route worker pool and the admission state shared with
+// the pollers. Workers take Pending_Messages from the work source, run the
+// middleware-wrapped handler, and apply the outcome (delete on success, leave on
+// error, change visibility on backoff). Every admitted message holds one credit
+// of the credit pool until it reaches an outcome, so the number of messages the
+// consumer holds is bounded by WorkerPoolSize plus Prefetch.
+//
+// The work source depends on the run mode: Parallel uses a sharedQueue that any
+// idle worker drains, PerGroupID uses a groupScheduler that keeps at most one
+// message per group active and hands any ready group to any idle worker.
 //
 // On a route without batched deletes, batcher is nil and every Commit is a
 // synchronous DeleteMessage issued from the worker. On a route configured with
-// router.WithDeleteBatch, batcher is set before start and every Commit hands the
-// receipt handle to the deleteBatcher, whose Senders remove it through
-// DeleteMessageBatch.
+// router.WithDeleteBatch, batcher is set before the workers start and every
+// Commit hands the receipt handle to the deleteBatcher.
 //
-// A dispatcher is created with newDispatcher, started with start, fed with
-// dispatch, and torn down with stop. start, dispatch, and stop must be called
-// from a single goroutine (the polling loop); the worker and visibility
-// goroutines they manage are internally synchronized and leak-free.
+// A dispatcher is created with newDispatcher, its workers are started with
+// startWorkers and awaited with stopWorkers, and the messages still pending at
+// shutdown are released with releasePending.
 type dispatcher struct {
-	client            SQSClient
-	handler           middleware.Handler
-	visibility        *visibilityManager
-	log               *slog.Logger
-	dlq               *router.DLQConfig
-	metrics           MetricsRecorder
-	retryScheduler    *retryScheduler
-	dlqPublisher      *dlqPublisher
-	batcher           *deleteBatcher
-	scheduledRetry    *router.ScheduledRetryConfig
-	queueURL          string
-	queueName         string
-	channels          []chan *message
-	randIntN          func(int) int
-	customGroupFields []string
-	mode              router.Mode
-	retryModel        router.RetryModel
-	workerPoolSize    int
-	bufferSize        int
-	wg                sync.WaitGroup
+	client         SQSClient
+	handler        middleware.Handler
+	visibility     *visibilityManager
+	credits        *creditPool
+	src            workSource
+	log            *slog.Logger
+	dlq            *router.DLQConfig
+	metrics        MetricsRecorder
+	retryScheduler *retryScheduler
+	dlqPublisher   *dlqPublisher
+	batcher        *deleteBatcher
+	scheduledRetry *router.ScheduledRetryConfig
+	queueURL       string
+	queueName      string
+	mode           router.Mode
+	retryModel     router.RetryModel
+	workerPoolSize int
+	workers        sync.WaitGroup
+	receiveBatch   int32
 }
 
 // newDispatcher builds a dispatcher for a route. The route handler is wrapped
 // with the global middlewares (outermost) followed by the route middlewares,
 // preserving first-is-outermost semantics. queueURL is the resolved URL of the
-// route queue and vm is the shared visibility manager used to extend visibility
-// while each message is in flight. A nil logger is replaced with a no-op logger.
+// route queue and vm is the visibility manager that tracks every admitted
+// message. A nil logger is replaced with a no-op logger.
+//
+// The credit pool and the work source are sized to WorkerPoolSize plus
+// Prefetch, and each receive asks for min(MaxMessages, Prefetch+1) messages.
+// Bounding the batch by Prefetch+1 guarantees that a poller can always start a
+// receive while any worker is idle: with fewer than WorkerPoolSize messages
+// admitted, at least Prefetch+1 credits are free.
 //
 // schedulerClient is the EventBridge Scheduler client used only by the Scheduled
 // Retry model. The retryScheduler and dlqPublisher collaborators are constructed
@@ -105,30 +117,31 @@ func newDispatcher(
 	mws = append(mws, route.Middlewares()...)
 	handler := middleware.Chain(mws...)(route.Handler())
 
-	workers := route.WorkerPoolSize()
-	if workers < 1 {
-		workers = 1
-	}
+	workers := max(route.WorkerPoolSize(), 1)
+	capacity := workers + max(route.Prefetch(), 0)
 
-	buffer := int(route.MaxMessages())
-	if buffer < 1 {
-		buffer = 1
+	prefetch := max(route.Prefetch(), 0)
+	receiveBatch := int32(max(min(int(route.MaxMessages()), prefetch+1, maxReceiveBatch), 1))
+
+	var src workSource = newSharedQueue(capacity)
+	if route.RunMode() == router.PerGroupID {
+		src = newGroupScheduler(capacity, route.CustomGroupFields())
 	}
 
 	d := &dispatcher{
-		client:            client,
-		handler:           handler,
-		visibility:        vm,
-		log:               log,
-		dlq:               route.DLQ(),
-		queueURL:          queueURL,
-		queueName:         route.QueueName(),
-		randIntN:          rand.IntN,
-		customGroupFields: route.CustomGroupFields(),
-		mode:              route.RunMode(),
-		retryModel:        route.RetryModel(),
-		workerPoolSize:    workers,
-		bufferSize:        buffer,
+		client:         client,
+		handler:        handler,
+		visibility:     vm,
+		credits:        newCreditPool(capacity),
+		src:            src,
+		log:            log,
+		dlq:            route.DLQ(),
+		queueURL:       queueURL,
+		queueName:      route.QueueName(),
+		mode:           route.RunMode(),
+		retryModel:     route.RetryModel(),
+		workerPoolSize: workers,
+		receiveBatch:   receiveBatch,
 	}
 
 	if cfg := route.ScheduledRetry(); route.RetryModel() == router.ScheduledRetryModel && cfg != nil && schedulerClient != nil {
@@ -146,116 +159,105 @@ func newDispatcher(
 	return d
 }
 
-// start launches the worker pool. It allocates one buffered channel and one
-// worker goroutine per configured worker, each processing messages until its
-// channel is closed by stop. start must be called exactly once before dispatch.
-func (d *dispatcher) start(ctx context.Context) {
-	d.channels = make([]chan *message, d.workerPoolSize)
-	for i := range d.channels {
-		d.channels[i] = make(chan *message, d.bufferSize)
-		d.wg.Add(1)
-		go d.worker(ctx, d.channels[i])
+// admit hands the messages of one receive to the work source in a single step,
+// after the visibility manager starts tracking each of them. The caller holds
+// one credit per message; each is returned when its message reaches an
+// outcome.
+func (d *dispatcher) admit(msgs ...*message) {
+	for _, msg := range msgs {
+		d.visibility.track(msg)
+	}
+	d.src.submit(msgs...)
+}
+
+// startWorkers launches WorkerPoolSize workers. Each returns once ctx is done.
+func (d *dispatcher) startWorkers(ctx context.Context) {
+	for range d.workerPoolSize {
+		d.workers.Go(func() { d.worker(ctx) })
 	}
 }
 
-// dispatch assigns msg to a worker and enqueues it for processing. The worker
-// index is chosen by run mode: Parallel picks a random worker, PerGroupID picks
-// a worker by hashing the message group key so that a given group is always
-// handled by the same worker. dispatch returns early without enqueuing when ctx
-// is canceled, so it never blocks past shutdown.
-func (d *dispatcher) dispatch(ctx context.Context, msg *message) {
-	index := d.workerIndex(msg)
+// stopWorkers waits for every worker to return. Workers return once ctx is done
+// and the message each one is running has reached its outcome.
+func (d *dispatcher) stopWorkers() {
+	d.workers.Wait()
+}
 
-	select {
-	case <-ctx.Done():
-	case d.channels[index] <- msg:
+// worker takes messages from the work source and processes them until ctx is
+// done. A message taken after ctx was canceled is released instead of run.
+func (d *dispatcher) worker(ctx context.Context) {
+	for {
+		msg, ok := d.src.take(ctx)
+		if !ok {
+			return
+		}
+
+		if ctx.Err() != nil {
+			d.visibility.release(msg)
+			d.credits.release(1)
+			d.hold(d.src.complete(msg, false))
+			continue
+		}
+
+		failed := d.process(ctx, msg)
+		d.hold(d.src.complete(msg, failed))
 	}
 }
 
-// stop closes every worker channel and waits for all worker and visibility
-// goroutines to finish. When batched deletes are enabled it then closes the
-// deleteBatcher, which sends every remaining Pending_Delete and waits for its
-// Senders to exit. The batcher is closed only after every worker has exited, so
-// commits made while workers drain their channels during shutdown are still
-// accepted and no enqueue can happen after the close. After stop returns no
-// goroutine started by the dispatcher or its batcher remains, satisfying the
-// leak-free guarantee. stop must be called exactly once after the polling loop
-// stops feeding dispatch.
-func (d *dispatcher) stop() {
-	for _, ch := range d.channels {
-		close(ch)
+// releasePending makes every message still pending visible again at once and
+// returns its credit. It is called after every poller and worker has returned.
+func (d *dispatcher) releasePending() {
+	pending := d.src.drain()
+	if len(pending) == 0 {
+		return
 	}
-	d.wg.Wait()
-
-	if d.batcher != nil {
-		d.batcher.close()
-	}
+	d.visibility.release(pending...)
+	d.credits.release(len(pending))
 }
 
-// worker drains ch, processing each message in turn until the channel is closed.
-func (d *dispatcher) worker(ctx context.Context, ch <-chan *message) {
-	defer d.wg.Done()
-	for msg := range ch {
-		d.process(ctx, msg)
-	}
-}
-
-// process runs the full lifecycle for a single message. In PerGroupID mode under
-// the Visibility retry model, when an earlier message of this message's FIFO
-// group has already failed in the same batch, the message is held back before
-// any work starts: its handler never runs and it is left in the queue so the
-// group is redelivered in order. Otherwise it starts a visibility extension
-// goroutine, invokes the middleware-wrapped handler, and then applies the
-// outcome:
-//   - backoff: the message is left in the queue; the visibility manager
-//     consumes the backoff signal and changes visibility to the backoff
-//     duration. The message is not deleted. In PerGroupID mode the group is
-//     marked failed so the rest of the group in the batch is held back.
+// process runs the middleware-wrapped handler for msg and applies the outcome.
+// It reports whether the outcome is a failure that must hold the rest of the
+// message group, which is the case for a handler error or a backoff under the
+// Visibility retry model. Outcomes:
+//   - backoff (Visibility model): the visibility manager changes the message
+//     visibility to the backoff delay; the message is not deleted.
 //   - error, message exhausted: when a DLQ route option is configured and the
 //     message's ApproximateReceiveCount has reached MaxReceiveCount, the message
 //     is treated as exhausted. Observability signals are emitted and the message
 //     is left in the source queue so AWS SQS performs the redrive natively; the
 //     library never publishes or deletes it for DLQ purposes.
 //   - error: the error is logged with message body, group ID, and receipt
-//     handle, and the message is left in the queue for redelivery. In PerGroupID
-//     mode the group is marked failed so the rest of the group in the batch is
-//     held back.
+//     handle, and the message is left in the queue for redelivery.
 //   - success: the message is deleted from the queue.
+//   - Scheduled Retry model: processScheduled decides the outcome.
 //
-// The visibility goroutine is tracked by the dispatcher wait group and always
-// terminates: on backoff it stops after reading the backoff signal, otherwise
-// Dispatch closes the dispatch signal to stop it immediately.
-func (d *dispatcher) process(ctx context.Context, msg *message) {
-	if d.orderedGroups() && msg.barrier.failed(msg.groupKey) {
-		d.holdForOrder(msg)
-		return
-	}
-
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		d.visibility.run(ctx, msg)
-	}()
-
+// In every case the message stops being tracked for visibility and its credit
+// is returned. When the run context was canceled while the handler ran, the
+// outcome is still applied, through outcomeContext.
+func (d *dispatcher) process(ctx context.Context, msg *message) bool {
 	err := d.handler(ctx, msg)
 
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
+
 	if d.retryModel == router.ScheduledRetryModel {
+		d.visibility.untrack(msg)
 		d.processScheduled(ctx, msg, err)
-		return
+		d.credits.release(1)
+		return false
 	}
 
 	if msg.BackedOff() {
-		d.failGroup(msg)
-		return
+		d.visibility.backoff(msg, msg.backoffDelay())
+		d.credits.release(1)
+		return true
 	}
 
-	msg.Dispatch()
+	defer d.finish(msg)
 
 	if err != nil {
-		d.failGroup(msg)
-
 		if d.observeDLQ(ctx, msg) {
-			return
+			return true
 		}
 
 		d.log.Error("handler returned an error",
@@ -265,38 +267,51 @@ func (d *dispatcher) process(ctx context.Context, msg *message) {
 			slog.String("body", string(msg.Body())),
 			slog.Any("error", err),
 		)
-		return
+		return true
 	}
 
 	d.deleteMessage(ctx, msg)
+	return false
 }
 
-// failGroup records the message's group as failed on the batch barrier so that,
-// in PerGroupID mode, every later message of the same group in the batch is held
-// back to preserve order. It is a no-op unless per-group ordering is active.
-func (d *dispatcher) failGroup(msg *message) {
-	if d.orderedGroups() {
-		msg.barrier.fail(msg.groupKey)
+// outcomeContext returns the context used to apply a handler outcome. While
+// ctx is live it is returned unchanged. Once ctx is canceled, which happens
+// when the consumer shuts down while a handler is still running, the outcome
+// requests (delete, retry schedule, DLQ publish) run on a context detached from
+// that cancellation and bounded by outcomeTimeout, so a message that finished
+// is still committed instead of being redelivered.
+func outcomeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), outcomeTimeout)
+}
+
+// finish stops tracking msg for visibility and returns its credit.
+func (d *dispatcher) finish(msg *message) {
+	d.visibility.untrack(msg)
+	d.credits.release(1)
+}
+
+// hold finishes every message held back because an earlier message of its FIFO
+// group failed. A held message never runs its handler, is not deleted, and gets
+// no visibility change: it stays in the queue with its current visibility so
+// AWS SQS redelivers the whole group in order once the failed message becomes
+// visible again.
+func (d *dispatcher) hold(msgs []*message) {
+	for _, msg := range msgs {
+		d.log.Warn("holding message to preserve FIFO group order; earlier message in group failed",
+			slog.String("queue_url", d.queueURL),
+			slog.String("receipt_handle", msg.Identifier()),
+			slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+		)
+		d.finish(msg)
 	}
 }
 
-// holdForOrder handles a message whose FIFO group already failed earlier in the
-// batch. To preserve group order the message must not run its handler and must
-// not be deleted: it is left in the queue with its receive-time visibility
-// timeout so AWS SQS redelivers the whole group in order once the failed head
-// becomes visible again. No visibility goroutine is started for a held message,
-// so nothing is leaked.
-func (d *dispatcher) holdForOrder(msg *message) {
-	d.log.Warn("holding message to preserve FIFO group order; earlier message in group failed",
-		slog.String("queue_url", d.queueURL),
-		slog.String("receipt_handle", msg.Identifier()),
-		slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
-	)
-}
-
 // processScheduled applies the Scheduled Retry model outcome for a message after
-// its handler returns. It first calls msg.Dispatch to stop the visibility
-// goroutine so no backoff-driven ChangeMessageVisibility is issued, then:
+// its handler returns. A backoff request never changes the message visibility
+// under this model:
 //
 //   - Failure (handler error OR requested backoff): the current retry count is
 //     parsed from the message (defaulting to 0) and the next count is
@@ -311,8 +326,6 @@ func (d *dispatcher) holdForOrder(msg *message) {
 //     library performs no success-side publishing; that is the handler's
 //     responsibility.
 func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err error) {
-	msg.Dispatch()
-
 	if err != nil || msg.BackedOff() {
 		current := parseRetryCount(msg, d.log)
 		next := current + 1
@@ -437,66 +450,4 @@ func (d *dispatcher) deleteMessage(ctx context.Context, msg *message) {
 			slog.Any("error", err),
 		)
 	}
-}
-
-// workerIndex selects the worker that will process msg. In Parallel mode the
-// worker is chosen at random; in PerGroupID mode it is chosen by hashing the
-// message group key so equal keys always map to the same worker. In PerGroupID
-// mode the computed group key is also cached on the message so the group
-// barrier can key on it without recomputing.
-func (d *dispatcher) workerIndex(msg *message) int {
-	if d.mode == router.PerGroupID {
-		key := d.groupKey(msg)
-		msg.groupKey = key
-		return d.groupIndex(key)
-	}
-	return d.randIntN(d.workerPoolSize)
-}
-
-// orderedGroups reports whether per-group FIFO ordering must be preserved on
-// failure. PerGroupID dispatch exists to keep each message group in order, so
-// under the Visibility retry model the group barrier is always engaged: a failed
-// message holds back the rest of its group. The Scheduled Retry model unblocks
-// groups by design and is therefore excluded.
-func (d *dispatcher) orderedGroups() bool {
-	return d.mode == router.PerGroupID &&
-		d.retryModel == router.VisibilityRetryModel
-}
-
-// newBatchBarrier returns the group barrier shared by a received batch, or nil
-// when per-group ordering is not preserved (any mode other than PerGroupID, or
-// the Scheduled Retry model). A nil barrier disables all hold-back behavior, so
-// the fast path pays nothing.
-func (d *dispatcher) newBatchBarrier() *groupBarrier {
-	if !d.orderedGroups() {
-		return nil
-	}
-	return newGroupBarrier()
-}
-
-// groupIndex maps a group key to a worker index using a stable 32-bit FNV-1a
-// hash modulo the worker pool size, yielding deterministic per-group affinity.
-func (d *dispatcher) groupIndex(key string) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return int(h.Sum32() % uint32(d.workerPoolSize))
-}
-
-// groupKey builds the routing key for PerGroupID mode by joining the message
-// group ID with the configured custom group fields. Each field is read from the
-// native SQS user message attributes first (where SNS places them under raw
-// message delivery) and falls back to the SNS-envelope attributes, so custom
-// group fields work under both delivery modes. The separator keeps distinct
-// field combinations from colliding.
-func (d *dispatcher) groupKey(msg *message) string {
-	parts := make([]string, 0, len(d.customGroupFields)+1)
-	parts = append(parts, msg.SystemAttributeByKey(messageGroupIDKey))
-	for _, field := range d.customGroupFields {
-		value := msg.UserMessageAttribute(field)
-		if value == "" {
-			value = msg.Attribute(field)
-		}
-		parts = append(parts, value)
-	}
-	return strings.Join(parts, groupKeySeparator)
 }

@@ -68,8 +68,7 @@ func TestNewMessageParsesEnvelope(t *testing.T) {
 			m := newMessage(tt.msg)
 			require.NotNil(t, m)
 			assert.NotNil(t, m.dispatched)
-			assert.NotNil(t, m.backoffChannel)
-			assert.Equal(t, 1, cap(m.backoffChannel))
+			assert.Zero(t, m.backoffDelay())
 		})
 	}
 }
@@ -268,7 +267,7 @@ func TestMessageDispatch(t *testing.T) {
 	m.Dispatch()
 
 	select {
-	case _, ok := <-m.dispatchSignal():
+	case _, ok := <-m.dispatched:
 		assert.False(t, ok)
 	default:
 		t.Fatal("dispatch channel was not closed")
@@ -292,12 +291,11 @@ func TestMessageBackoff(t *testing.T) {
 	m.Backoff(15 * time.Second)
 
 	assert.True(t, m.BackedOff())
-	select {
-	case got := <-m.backoffSignal():
-		assert.Equal(t, 15*time.Second, got)
-	default:
-		t.Fatal("backoff channel had no value")
-	}
+	assert.Equal(t, 15*time.Second, m.backoffDelay())
+
+	m.Backoff(3 * time.Second)
+
+	assert.Equal(t, 3*time.Second, m.backoffDelay())
 }
 
 func TestMessageBackoffDoesNotBlock(t *testing.T) {

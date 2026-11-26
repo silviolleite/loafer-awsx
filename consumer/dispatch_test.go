@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,7 +26,6 @@ func newTestDispatcher(tb require.TestingT, client SQSClient, log *slog.Logger, 
 	require.NoError(tb, err)
 
 	vm := newVisibilityManager(client, "queue-url", route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
-	vm.sleepInterval = time.Hour
 
 	return newDispatcher(client, route, "queue-url", vm, nil, log)
 }
@@ -103,7 +103,6 @@ func TestDispatcherProcessDeletesOnSuccess(t *testing.T) {
 
 	msg := testMessage("receipt-success")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Equal(t, []string{"receipt-success"}, client.deletes())
 	assert.Empty(t, client.calls())
@@ -119,7 +118,6 @@ func TestDispatcherProcessLeavesMessageOnError(t *testing.T) {
 
 	msg := buildGroupMessage(t, "receipt-error", "group-7", nil)
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Empty(t, client.deletes())
 	assert.Empty(t, client.calls())
@@ -153,8 +151,9 @@ func TestDispatcherProcessChangesVisibilityOnBackoff(t *testing.T) {
 			d := newTestDispatcher(t, client, logger.NewNoOp(), handler)
 
 			msg := testMessage("receipt-backoff")
+			d.visibility.start(context.Background())
 			d.process(context.Background(), msg)
-			d.wg.Wait()
+			d.visibility.close()
 
 			assert.Empty(t, client.deletes())
 			assert.Equal(t, []int32{tt.want}, client.calls())
@@ -173,8 +172,9 @@ func TestDispatcherProcessLeavesMessageOnBackoffWithError(t *testing.T) {
 	d := newTestDispatcher(t, client, logger.NewNoOp(), handler)
 
 	msg := testMessage("receipt-backoff-error")
+	d.visibility.start(context.Background())
 	d.process(context.Background(), msg)
-	d.wg.Wait()
+	d.visibility.close()
 
 	assert.Empty(t, client.deletes())
 	assert.Equal(t, []int32{30}, client.calls())
@@ -187,7 +187,6 @@ func TestDispatcherProcessLogsDeleteFailure(t *testing.T) {
 
 	msg := testMessage("receipt-del-fail")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Equal(t, []string{"receipt-del-fail"}, client.deletes())
 	assert.Equal(t, 1, capture.errorCount())
@@ -214,11 +213,9 @@ func TestDispatcherAppliesMiddlewareInOrder(t *testing.T) {
 
 	client := &fakeSQSClient{}
 	vm := newVisibilityManager(client, "queue-url", route.VisibilityTimeout(), route.ExtensionLimit(), logger.NewNoOp())
-	vm.sleepInterval = time.Hour
 	d := newDispatcher(client, route, "queue-url", vm, nil, logger.NewNoOp(), record("global"))
 
 	d.process(context.Background(), testMessage("receipt-mw"))
-	d.wg.Wait()
 
 	assert.Equal(t, []string{"global", "route", "handler"}, order)
 }
@@ -233,139 +230,25 @@ func TestNewDispatcherNilLoggerDefaultsToNoOp(t *testing.T) {
 
 	require.NotNil(t, d.log)
 	assert.Equal(t, route.WorkerPoolSize(), d.workerPoolSize)
-	assert.Equal(t, int(route.MaxMessages()), d.bufferSize)
-}
-
-func TestDispatcherParallelDistributesAcrossWorkers(t *testing.T) {
-	client := &fakeSQSClient{}
-	d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
-		router.WithRunMode(router.Parallel),
-		router.WithWorkerPoolSize(3),
-	)
-
-	d.channels = make([]chan *message, d.workerPoolSize)
-	for i := range d.channels {
-		d.channels[i] = make(chan *message, 4)
-	}
-
-	sequence := []int{0, 1, 2, 0, 1, 2}
-	var cursor int
-	d.randIntN = func(int) int {
-		idx := sequence[cursor]
-		cursor++
-		return idx
-	}
-
-	for range sequence {
-		d.dispatch(context.Background(), testMessage("receipt"))
-	}
-
-	for i := range d.channels {
-		assert.Len(t, d.channels[i], 2)
-	}
-}
-
-func TestDispatcherParallelUsesInjectedSelector(t *testing.T) {
-	client := &fakeSQSClient{}
-	d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
-		router.WithRunMode(router.Parallel),
-		router.WithWorkerPoolSize(4),
-	)
-	d.randIntN = func(n int) int {
-		assert.Equal(t, 4, n)
-		return 2
-	}
-
-	assert.Equal(t, 2, d.workerIndex(testMessage("receipt")))
+	assert.Equal(t, route.MaxMessages(), d.receiveBatch)
 }
 
 func TestDispatcherEndToEndProcessesAllMessages(t *testing.T) {
-	client := &fakeSQSClient{}
-	d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
-		router.WithWorkerPoolSize(3),
-		router.WithMaxMessages(5),
-	)
-
-	ctx := context.Background()
-	d.start(ctx)
-	for i := 0; i < 12; i++ {
-		d.dispatch(ctx, testMessage("receipt"))
-	}
-	d.stop()
-
-	assert.Len(t, client.deletes(), 12)
-}
-
-func TestDispatcherDispatchStopsOnContextCancel(t *testing.T) {
-	client := &fakeSQSClient{}
-	d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
-		router.WithWorkerPoolSize(1),
-		router.WithMaxMessages(1),
-	)
-
-	d.channels = []chan *message{make(chan *message, 1)}
-	d.channels[0] <- testMessage("blocker")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	assert.NotPanics(t, func() {
-		d.dispatch(ctx, testMessage("receipt"))
-	})
-	assert.Len(t, d.channels[0], 1)
-}
-
-func TestDispatcherPerGroupIDConsistencyProperty(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		poolSize := rapid.IntRange(1, 16).Draw(rt, "poolSize")
-		groupID := rapid.String().Draw(rt, "groupID")
-
-		fieldNames := rapid.SliceOfDistinct(
-			rapid.StringMatching(`[a-z][a-z0-9]{0,6}`),
-			func(s string) string { return s },
-		).Draw(rt, "fields")
-
-		custom := make(map[string]string, len(fieldNames))
-		for _, name := range fieldNames {
-			custom[name] = rapid.String().Draw(rt, "value-"+name)
-		}
-
-		opts := []router.Option{
-			router.WithRunMode(router.PerGroupID),
-			router.WithWorkerPoolSize(poolSize),
-		}
-		if len(fieldNames) > 0 {
-			opts = append(opts, router.WithCustomGroupFields(fieldNames...))
-		}
-
-		d := newTestDispatcher(rt, &fakeSQSClient{}, logger.NewNoOp(), nilHandler, opts...)
-
-		first := buildGroupMessage(rt, "receipt-a", groupID, custom)
-		second := buildGroupMessage(rt, "receipt-b", groupID, custom)
-
-		idx1 := d.workerIndex(first)
-		idx2 := d.workerIndex(second)
-
-		assert.Equal(rt, idx1, idx2)
-		assert.GreaterOrEqual(rt, idx1, 0)
-		assert.Less(rt, idx1, poolSize)
-	})
-}
-
-func TestDispatcherPerGroupIDDifferentKeysStayInRange(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		poolSize := rapid.IntRange(1, 8).Draw(rt, "poolSize")
-		groupID := rapid.String().Draw(rt, "groupID")
-
-		d := newTestDispatcher(rt, &fakeSQSClient{}, logger.NewNoOp(), nilHandler,
-			router.WithRunMode(router.PerGroupID),
-			router.WithWorkerPoolSize(poolSize),
+	synctest.Test(t, func(t *testing.T) {
+		client := &fakeSQSClient{}
+		d := newTestDispatcher(t, client, logger.NewNoOp(), nilHandler,
+			router.WithWorkerPoolSize(3),
+			router.WithMaxMessages(5),
 		)
 
-		idx := d.workerIndex(buildGroupMessage(rt, "receipt", groupID, nil))
+		msgs := make([]*message, 0, 8)
+		for range 8 {
+			msgs = append(msgs, testMessage("receipt"))
+		}
+		runToCompletion(t, d, msgs)
 
-		assert.GreaterOrEqual(rt, idx, 0)
-		assert.Less(rt, idx, poolSize)
+		assert.Len(t, client.deletes(), 8)
+		assert.Equal(t, d.credits.Capacity(), d.credits.Available())
 	})
 }
 
@@ -389,7 +272,6 @@ func TestDispatcherProcessObservesDLQWhenExhausted(t *testing.T) {
 
 	msg := buildDLQMessage("receipt-dlq", "3")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Empty(t, client.deletes())
 	assert.Empty(t, client.calls())
@@ -417,7 +299,6 @@ func TestDispatcherProcessDLQBelowThresholdSkipsSignals(t *testing.T) {
 
 	msg := buildDLQMessage("receipt-below", "2")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Empty(t, client.deletes())
 	assert.Equal(t, 0, metricCalls)
@@ -439,7 +320,6 @@ func TestDispatcherProcessNoDLQConfiguredSkipsSignals(t *testing.T) {
 
 	msg := buildDLQMessage("receipt-nodlq", "10")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Empty(t, client.deletes())
 	assert.Equal(t, 0, metricCalls)
@@ -457,7 +337,6 @@ func TestDispatcherProcessDLQWithoutMetricOrCallback(t *testing.T) {
 	msg := buildDLQMessage("receipt-plain-dlq", "1")
 	assert.NotPanics(t, func() {
 		d.process(context.Background(), msg)
-		d.wg.Wait()
 	})
 
 	assert.Empty(t, client.deletes())
@@ -486,7 +365,6 @@ func TestDispatcherProcessDLQReceiveCountParsing(t *testing.T) {
 
 			msg := buildDLQMessage("receipt", tt.receiveCount)
 			d.process(context.Background(), msg)
-			d.wg.Wait()
 
 			assert.Empty(t, client.deletes())
 			assert.Equal(t, 0, metricCalls)
@@ -509,7 +387,6 @@ func TestDispatcherProcessDLQConfiguredSuccessDeletes(t *testing.T) {
 
 	msg := buildDLQMessage("receipt-ok", "9")
 	d.process(context.Background(), msg)
-	d.wg.Wait()
 
 	assert.Equal(t, []string{"receipt-ok"}, client.deletes())
 	assert.Equal(t, 0, metricCalls)
@@ -532,7 +409,6 @@ func TestDispatcherProcessDLQThresholdProperty(t *testing.T) {
 
 		msg := buildDLQMessage("receipt", strconv.Itoa(receiveCount))
 		d.process(context.Background(), msg)
-		d.wg.Wait()
 
 		if receiveCount >= maxReceive {
 			assert.Equal(rt, 1, metricCalls)
