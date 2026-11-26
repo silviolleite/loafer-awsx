@@ -104,7 +104,9 @@ func (c *benchClient) GetQueueUrl(_ context.Context, _ *sqs.GetQueueUrlInput, _ 
 // budget is exhausted, after which it briefly idles and returns an empty batch
 // so the caller's polling loop does not busy-spin before the context is
 // canceled.
-func (c *benchClient) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (c *benchClient) ReceiveMessage(
+	ctx context.Context, params *sqs.ReceiveMessageInput, _ ...func(*sqs.Options),
+) (*sqs.ReceiveMessageOutput, error) {
 	atomic.AddInt64(&c.receiveCalls, 1)
 
 	limit := int64(receiveBatch)
@@ -161,7 +163,9 @@ func (c *benchClient) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMes
 // DeleteMessage waits deleteLatency, records a fully processed message, and
 // signals completion once every seeded message has been deleted. It returns the
 // context error without deleting when ctx ends during the simulated latency.
-func (c *benchClient) DeleteMessage(ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+func (c *benchClient) DeleteMessage(
+	ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options),
+) (*sqs.DeleteMessageOutput, error) {
 	if err := c.simulateDeleteLatency(ctx); err != nil {
 		return nil, err
 	}
@@ -227,7 +231,9 @@ func (c *benchClient) markDelivered(n int64) {
 }
 
 // ChangeMessageVisibility counts the request and otherwise does nothing.
-func (c *benchClient) ChangeMessageVisibility(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+func (c *benchClient) ChangeMessageVisibility(
+	_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityOutput, error) {
 	atomic.AddInt64(&c.visibilityCalls, 1)
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
 }
