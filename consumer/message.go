@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/silviolleite/loafer-awsx/middleware"
@@ -194,6 +195,12 @@ func (m *message) Identifier() string {
 		return ""
 	}
 	return *m.original.ReceiptHandle
+}
+
+// sqsMessageID returns the SQS MessageId, or the empty string when it is
+// absent. Unlike the receipt handle it stays the same across deliveries.
+func (m *message) sqsMessageID() string {
+	return aws.ToString(m.original.MessageId)
 }
 
 // Message returns the inner message content as a string.

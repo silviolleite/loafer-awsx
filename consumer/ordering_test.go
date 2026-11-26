@@ -444,6 +444,43 @@ func (h *captureHandler) warns() []loggedWarn {
 	return out
 }
 
+type loggedSkip struct {
+	queueURL     string
+	receipt      string
+	messageID    string
+	groupID      string
+	receiveCount int64
+}
+
+func (h *captureHandler) skips() []loggedSkip {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []loggedSkip
+	for _, r := range h.records {
+		if r.Level != slog.LevelError || r.Message != skipExpiredError {
+			continue
+		}
+		var k loggedSkip
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "queue_url":
+				k.queueURL = a.Value.String()
+			case "receipt_handle":
+				k.receipt = a.Value.String()
+			case "sqs_message_id":
+				k.messageID = a.Value.String()
+			case "group_id":
+				k.groupID = a.Value.String()
+			case "receive_count":
+				k.receiveCount = a.Value.Int64()
+			}
+			return true
+		})
+		out = append(out, k)
+	}
+	return out
+}
+
 type hookedSQSClient struct {
 	*fakeSQSClient
 	onDelete func(ctx context.Context, handle string)
@@ -485,7 +522,7 @@ func trackedCount(d *dispatcher) int {
 	return len(d.visibility.entries)
 }
 
-const skipExpiredWarn = "skipping message whose visibility timeout expired before it started"
+const skipExpiredError = "skipping message whose visibility timeout expired before it started"
 
 const holdWarn = "holding message to preserve FIFO group order; earlier message in group failed"
 
@@ -503,7 +540,6 @@ func TestDispatcherSkipsMessageExpiredBeforeStart(t *testing.T) {
 			wantCalled:  []string{"h-1"},
 			wantDeletes: []string{"h-1"},
 			wantWarns: []loggedWarn{
-				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
 				{message: holdWarn, queueURL: "queue-url", receipt: "g-2", groupID: "g"},
 				{message: holdWarn, queueURL: "queue-url", receipt: "g-3", groupID: "g"},
 			},
@@ -516,18 +552,12 @@ func TestDispatcherSkipsMessageExpiredBeforeStart(t *testing.T) {
 			},
 			wantCalled:  []string{"g-2", "g-3", "h-1"},
 			wantDeletes: []string{"g-2", "g-3", "h-1"},
-			wantWarns: []loggedWarn{
-				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
-			},
 		},
 		{
 			name:        "parallel skips only the expired message",
 			opts:        []router.Option{router.WithRunMode(router.Parallel)},
 			wantCalled:  []string{"g-2", "g-3", "h-1"},
 			wantDeletes: []string{"g-2", "g-3", "h-1"},
-			wantWarns: []loggedWarn{
-				{message: skipExpiredWarn, queueURL: "queue-url", receipt: "g-1", groupID: "g"},
-			},
 		},
 	}
 
@@ -542,6 +572,8 @@ func TestDispatcherSkipsMessageExpiredBeforeStart(t *testing.T) {
 				)
 				expired := buildGroupMessage(t, "g-1", "g", nil)
 				expired.receivedAt = time.Now().Add(-13 * time.Hour)
+				expired.original.MessageId = aws.String("id-g-1")
+				expired.original.Attributes[approximateReceiveCountKey] = "4"
 
 				runToCompletion(t, d, []*message{
 					expired,
@@ -554,6 +586,9 @@ func TestDispatcherSkipsMessageExpiredBeforeStart(t *testing.T) {
 				assert.ElementsMatch(t, tt.wantDeletes, client.deletes())
 				assert.Empty(t, client.calls())
 				assert.Equal(t, tt.wantWarns, capture.warns())
+				assert.Equal(t, []loggedSkip{
+					{queueURL: "queue-url", receipt: "g-1", messageID: "id-g-1", groupID: "g", receiveCount: 4},
+				}, capture.skips())
 				assert.Zero(t, trackedCount(d))
 				assert.Equal(t, d.credits.Capacity(), d.credits.Available())
 			})
@@ -598,12 +633,14 @@ func TestDispatcherWorkerSkipsOnlyPastDeadline(t *testing.T) {
 					assert.Equal(t, []string{"m-1"}, rec.snapshot())
 					assert.Equal(t, []string{"m-1"}, client.deletes())
 					assert.Empty(t, capture.warns())
+					assert.Empty(t, capture.skips())
 				} else {
 					assert.Empty(t, rec.snapshot())
 					assert.Empty(t, client.deletes())
-					assert.Equal(t, []loggedWarn{
-						{message: skipExpiredWarn, queueURL: "queue-url", receipt: "m-1", groupID: "g"},
-					}, capture.warns())
+					assert.Empty(t, capture.warns())
+					assert.Equal(t, []loggedSkip{
+						{queueURL: "queue-url", receipt: "m-1", groupID: "g"},
+					}, capture.skips())
 				}
 				assert.Empty(t, client.calls())
 				assert.Zero(t, trackedCount(d))
@@ -652,12 +689,14 @@ func TestDispatcherWorkerSkipsWithoutExtensionLeft(t *testing.T) {
 					assert.Equal(t, []string{"m-1"}, rec.snapshot())
 					assert.Equal(t, []string{"m-1"}, client.deletes())
 					assert.Empty(t, capture.warns())
+					assert.Empty(t, capture.skips())
 				} else {
 					assert.Empty(t, rec.snapshot())
 					assert.Empty(t, client.deletes())
-					assert.Equal(t, []loggedWarn{
-						{message: skipExpiredWarn, queueURL: "queue-url", receipt: "m-1", groupID: "g"},
-					}, capture.warns())
+					assert.Empty(t, capture.warns())
+					assert.Equal(t, []loggedSkip{
+						{queueURL: "queue-url", receipt: "m-1", groupID: "g"},
+					}, capture.skips())
 				}
 				assert.Empty(t, client.calls())
 				assert.Zero(t, trackedCount(d))

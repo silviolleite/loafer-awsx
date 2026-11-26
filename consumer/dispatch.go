@@ -208,8 +208,8 @@ func (d *dispatcher) worker(ctx context.Context) {
 			continue
 		}
 
-		if d.visibility.isExpired(msg, time.Now()) {
-			d.skipExpired(msg)
+		if !d.visibility.begin(msg, time.Now()) {
+			d.skipExpired(ctx, msg)
 			d.hold(d.src.complete(msg, d.retryModel == router.VisibilityRetryModel))
 			continue
 		}
@@ -221,15 +221,31 @@ func (d *dispatcher) worker(ctx context.Context) {
 
 // skipExpired finishes a message whose visibility timeout ran out before a
 // worker could start it. SQS may already have delivered it to another consumer,
-// so its handler is not run and it is left for redelivery. Under the Visibility
+// so its handler is not run and it is left for redelivery. Because a pending
+// message is extended while it waits, this only happens when its Extensions
+// failed or the route disables them, so it is logged at Error with the
+// identifiers needed to follow the message across deliveries. The skip is
+// counted through the optional SkipRecorder, and the observe-only DLQ path runs
+// as it does after a handler error, because the receive that was just skipped
+// may be the last one before SQS redrives the message. Under the Visibility
 // retry model the caller holds the rest of its group, which keeps group order.
-func (d *dispatcher) skipExpired(msg *message) {
-	d.log.Warn("skipping message whose visibility timeout expired before it started",
+func (d *dispatcher) skipExpired(ctx context.Context, msg *message) {
+	d.visibility.untrack(msg)
+	defer d.credits.release(1)
+
+	d.log.Error("skipping message whose visibility timeout expired before it started",
 		slog.String("queue_url", d.queueURL),
 		slog.String("receipt_handle", msg.Identifier()),
+		slog.String("sqs_message_id", msg.sqsMessageID()),
 		slog.String("group_id", msg.SystemAttributeByKey(messageGroupIDKey)),
+		slog.Int("receive_count", receiveCount(msg)),
 	)
-	d.finish(msg)
+
+	if rec, ok := d.metrics.(SkipRecorder); ok {
+		emitMetric(d.log, rec.IncSkipped, d.queueName)
+	}
+
+	d.observeDLQ(ctx, msg)
 }
 
 // releasePending makes every message still pending visible again at once and
@@ -414,7 +430,8 @@ func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err err
 }
 
 // observeDLQ emits observe-only dead-letter signals for a message whose handler
-// returned an error and reports whether it treated the message as exhausted.
+// returned an error, or that was skipped because its visibility timeout ran out
+// before it started, and reports whether it treated the message as exhausted.
 //
 // It is a no-op returning false unless a DLQ route option is configured and the
 // message's ApproximateReceiveCount has reached the route's MaxReceiveCount. The
@@ -422,8 +439,8 @@ func (d *dispatcher) processScheduled(ctx context.Context, msg *message, err err
 // its own redrive policy, so the message is left untouched in the source queue —
 // it is never published to any destination and never deleted for DLQ purposes.
 //
-// When the message is exhausted it logs at Error level (message identifier,
-// queue name, receive count), increments loafer_messages_dlq_total through the
+// When the message is exhausted it logs at Error level (receipt handle under
+// message_id, SQS MessageId, queue name, receive count), increments loafer_messages_dlq_total through the
 // injected metric incrementer when the Metrics middleware is enabled, invokes
 // the optional OnDLQ callback, and returns true.
 func (d *dispatcher) observeDLQ(ctx context.Context, msg *message) bool {
@@ -439,6 +456,7 @@ func (d *dispatcher) observeDLQ(ctx context.Context, msg *message) bool {
 	d.log.Error("message exhausted; left in source queue for AWS SQS redrive",
 		slog.String("queue_name", d.queueName),
 		slog.String("message_id", msg.Identifier()),
+		slog.String("sqs_message_id", msg.sqsMessageID()),
 		slog.Int("receive_count", receiveCount),
 	)
 

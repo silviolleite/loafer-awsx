@@ -1245,3 +1245,582 @@ func TestRun_DeleteBatchWithPollersPerGroupID(t *testing.T) {
 		})
 	}
 }
+
+const (
+	skipLogMessage        = "skipping message whose visibility timeout expired before it started"
+	metricPanicLogMessage = "metric hook panicked; recovered and continuing"
+	skipActiveHandle      = "receipt-active"
+	skipPendingHandle     = "receipt-pending"
+)
+
+var errSkipVisibility = errors.New("visibility change failed")
+
+type skipRecorderKind int
+
+const (
+	skipRecorderNone skipRecorderKind = iota
+	skipRecorderPlain
+	skipRecorderCounting
+	skipRecorderPanicking
+)
+
+type skipSignals struct {
+	skipped []string
+	dlq     []string
+	onDLQ   []string
+	mu      sync.Mutex
+}
+
+func (s *skipSignals) add(dst *[]string, v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	*dst = append(*dst, v)
+}
+
+func (s *skipSignals) snapshot() ([]string, []string, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.skipped), slices.Clone(s.dlq), slices.Clone(s.onDLQ)
+}
+
+type plainSkipRecorder struct {
+	signals *skipSignals
+}
+
+func (r plainSkipRecorder) IncDLQ(route string) { r.signals.add(&r.signals.dlq, route) }
+
+func (plainSkipRecorder) IncSuccess(string) {}
+
+func (plainSkipRecorder) IncRetry(string) {}
+
+func (plainSkipRecorder) IncDeadLetter(string) {}
+
+type countingSkipRecorder struct {
+	plainSkipRecorder
+}
+
+func (r countingSkipRecorder) IncSkipped(route string) { r.signals.add(&r.signals.skipped, route) }
+
+type panickingSkipRecorder struct {
+	plainSkipRecorder
+}
+
+func (r panickingSkipRecorder) IncSkipped(route string) {
+	r.signals.add(&r.signals.skipped, route)
+	panic("skip recorder failed")
+}
+
+var (
+	_ consumer.SkipRecorder = countingSkipRecorder{}
+	_ consumer.SkipRecorder = panickingSkipRecorder{}
+)
+
+func (k skipRecorderKind) recorder(signals *skipSignals) consumer.MetricsRecorder {
+	plain := plainSkipRecorder{signals: signals}
+	switch k {
+	case skipRecorderPlain:
+		return plain
+	case skipRecorderCounting:
+		return countingSkipRecorder{plainSkipRecorder: plain}
+	case skipRecorderPanicking:
+		return panickingSkipRecorder{plainSkipRecorder: plain}
+	default:
+		return nil
+	}
+}
+
+type skipScenario struct {
+	messageID      string
+	groupID        string
+	runMode        router.Mode
+	recorder       skipRecorderKind
+	receiveCount   int
+	dlqThreshold   int
+	vt             int32
+	failExtensions bool
+}
+
+func drawSkipScenario(t *rapid.T) skipScenario {
+	return skipScenario{
+		messageID:      rapid.StringMatching(`[a-f0-9-]{0,36}`).Draw(t, "messageID"),
+		groupID:        rapid.StringMatching(`[a-z0-9]{0,8}`).Draw(t, "groupID"),
+		runMode:        rapid.SampledFrom([]router.Mode{router.Parallel, router.PerGroupID}).Draw(t, "runMode"),
+		recorder:       skipRecorderKind(rapid.IntRange(int(skipRecorderNone), int(skipRecorderPanicking)).Draw(t, "recorder")),
+		receiveCount:   rapid.IntRange(1, 10).Draw(t, "receiveCount"),
+		dlqThreshold:   rapid.IntRange(0, 10).Draw(t, "dlqThreshold"),
+		vt:             rapid.Int32Range(11, 120).Draw(t, "visibilityTimeout"),
+		failExtensions: rapid.Bool().Draw(t, "failExtensions"),
+	}
+}
+
+func (s skipScenario) isExhausted() bool {
+	return s.dlqThreshold > 0 && s.receiveCount >= s.dlqThreshold
+}
+
+func (s skipScenario) pendingMessage() types.Message {
+	m := types.Message{
+		ReceiptHandle: aws.String(skipPendingHandle),
+		Body:          aws.String("pending"),
+		Attributes:    map[string]string{"ApproximateReceiveCount": strconv.Itoa(s.receiveCount)},
+	}
+	if s.messageID != "" {
+		m.MessageId = aws.String(s.messageID)
+	}
+	if s.groupID != "" {
+		m.Attributes["MessageGroupId"] = s.groupID
+	}
+	return m
+}
+
+func (s skipScenario) routeOptions(signals *skipSignals) []router.Option {
+	opts := []router.Option{
+		router.WithWorkerPoolSize(1),
+		router.WithPrefetch(1),
+		router.WithMaxMessages(2),
+		router.WithVisibilityTimeout(s.vt),
+		router.WithRunMode(s.runMode),
+	}
+	if !s.failExtensions {
+		opts = append(opts, router.WithExtensionLimit(0))
+	}
+	if s.dlqThreshold > 0 {
+		opts = append(opts, router.WithDLQ(s.dlqThreshold, router.WithOnDLQ(func(_ context.Context, m middleware.Message) {
+			signals.add(&signals.onDLQ, m.Identifier())
+		})))
+	}
+	return opts
+}
+
+type skipRun struct {
+	err             error
+	client          *fake.SQSClient
+	logs            *fake.LogHandler
+	signals         *skipSignals
+	handledEarly    []string
+	handled         []string
+	visibilityCalls int
+}
+
+func runSkipScenario(t *testing.T, s skipScenario) skipRun {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	run := skipRun{logs: fake.NewLogHandler(), signals: &skipSignals{}}
+	release := make(chan struct{})
+	var mu sync.Mutex
+	handler := func(_ context.Context, m middleware.Message) error {
+		mu.Lock()
+		run.handled = append(run.handled, m.Identifier())
+		mu.Unlock()
+		if m.Identifier() == skipActiveHandle {
+			<-release
+		}
+		return nil
+	}
+
+	var receives int
+	run.client = &fake.SQSClient{
+		GetQueueUrlFunc: func(_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
+			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(flowQueueURL)}, nil
+		},
+		ReceiveMessageFunc: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receives++
+			if receives > 1 {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			active := types.Message{
+				ReceiptHandle: aws.String(skipActiveHandle),
+				Body:          aws.String("active"),
+				Attributes:    map[string]string{"MessageGroupId": "active-group"},
+			}
+			return &sqs.ReceiveMessageOutput{Messages: []types.Message{active, s.pendingMessage()}}, nil
+		},
+	}
+	if s.failExtensions {
+		run.client.ChangeMessageVisibilityBatchFunc = func(
+			context.Context, *sqs.ChangeMessageVisibilityBatchInput, ...func(*sqs.Options),
+		) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+			return nil, errSkipVisibility
+		}
+	}
+
+	route, err := router.New(flowQueueName, handler, s.routeOptions(run.signals)...)
+	require.NoError(t, err)
+	opts := []consumer.Option{consumer.WithLogger(slog.New(run.logs))}
+	if rec := s.recorder.recorder(run.signals); rec != nil {
+		opts = append(opts, consumer.WithMetrics(rec))
+	}
+	c, err := consumer.New(run.client, route, opts...)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	time.Sleep(time.Duration(s.vt)*time.Second + time.Second)
+	synctest.Wait()
+
+	mu.Lock()
+	run.handledEarly = slices.Clone(run.handled)
+	mu.Unlock()
+	run.visibilityCalls = len(run.client.ChangeMessageVisibilityBatchCalls()) + len(run.client.ChangeMessageVisibilityCalls())
+
+	close(release)
+	synctest.Wait()
+	cancel()
+	run.err = <-done
+	return run
+}
+
+func logsWithMessage(h *fake.LogHandler, level slog.Level, message string) []fake.LogRecord {
+	var out []fake.LogRecord
+	for _, r := range h.Records() {
+		if r.Level == level && r.Message == message {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func assertSkipSignals(t assert.TestingT, s skipScenario, run skipRun) {
+	assert.NoError(t, run.err)
+	assert.Equal(t, []string{skipActiveHandle}, run.handledEarly)
+	assert.Equal(t, []string{skipActiveHandle}, run.handled)
+	assert.Equal(t, []string{skipActiveHandle}, deleteMessageHandles(run.client.DeleteMessageCalls()))
+	if s.failExtensions {
+		assert.Positive(t, run.visibilityCalls)
+	} else {
+		assert.Zero(t, run.visibilityCalls)
+	}
+
+	skips := logsWithMessage(run.logs, slog.LevelError, skipLogMessage)
+	if assert.Len(t, skips, 1) {
+		assert.Equal(t, map[string]any{
+			"queue_url":      flowQueueURL,
+			"receipt_handle": skipPendingHandle,
+			"sqs_message_id": s.messageID,
+			"group_id":       s.groupID,
+			"receive_count":  int64(s.receiveCount),
+		}, skips[0].Attrs)
+	}
+	assert.Empty(t, logsWithMessage(run.logs, slog.LevelWarn, skipLogMessage))
+
+	skipped, dlq, onDLQ := run.signals.snapshot()
+	switch s.recorder {
+	case skipRecorderCounting, skipRecorderPanicking:
+		assert.Equal(t, []string{flowQueueName}, skipped)
+	default:
+		assert.Empty(t, skipped)
+	}
+
+	panics := logsWithMessage(run.logs, slog.LevelError, metricPanicLogMessage)
+	if s.recorder == skipRecorderPanicking {
+		if assert.Len(t, panics, 1) {
+			assert.Equal(t, flowQueueName, panics[0].Attrs["route_name"])
+			assert.Equal(t, "skip recorder failed", panics[0].Attrs["panic"])
+		}
+	} else {
+		assert.Empty(t, panics)
+	}
+
+	exhausted := logsWithMessage(run.logs, slog.LevelError, exhaustedMessage)
+	if !s.isExhausted() {
+		assert.Empty(t, exhausted)
+		assert.Empty(t, dlq)
+		assert.Empty(t, onDLQ)
+		return
+	}
+	if assert.Len(t, exhausted, 1) {
+		assert.Equal(t, map[string]any{
+			"queue_name":     flowQueueName,
+			"message_id":     skipPendingHandle,
+			"sqs_message_id": s.messageID,
+			"receive_count":  int64(s.receiveCount),
+		}, exhausted[0].Attrs)
+	}
+	assert.Equal(t, []string{skipPendingHandle}, onDLQ)
+	if s.recorder == skipRecorderNone {
+		assert.Empty(t, dlq)
+	} else {
+		assert.Equal(t, []string{flowQueueName}, dlq)
+	}
+}
+
+// Feature: consumer-flow-control, Property 22: For any Skipped message (Extensions failing, or ExtensionLimit = 0 with a wait past the deadline), the handler never runs, exactly one Error record carries the queue URL, receipt handle, sqs_message_id, group id, and receive count, IncSkipped is invoked once when the recorder implements SkipRecorder and never otherwise, and the observe-only DLQ signals fire exactly when the receive count reached the configured MaxReceiveCount.
+func TestRun_PropertySkipSignals(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		s := drawSkipScenario(rt)
+		var run skipRun
+		synctest.Test(t, func(t *testing.T) {
+			run = runSkipScenario(t, s)
+		})
+		assertSkipSignals(rt, s, run)
+	})
+}
+
+func TestRun_SkipSignalsExamples(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	base := skipScenario{messageID: "sqs-id-1", groupID: "group-1", runMode: router.Parallel, receiveCount: 3, vt: 30}
+	tests := []struct {
+		modify func(*skipScenario)
+		name   string
+	}{
+		{name: "no recorder and no dlq", modify: func(*skipScenario) {}},
+		{name: "plain recorder without skip recorder", modify: func(s *skipScenario) { s.recorder = skipRecorderPlain }},
+		{name: "skip recorder", modify: func(s *skipScenario) { s.recorder = skipRecorderCounting }},
+		{name: "panicking skip recorder", modify: func(s *skipScenario) { s.recorder = skipRecorderPanicking }},
+		{name: "failing extensions", modify: func(s *skipScenario) { s.failExtensions = true; s.recorder = skipRecorderCounting }},
+		{name: "receive count below threshold", modify: func(s *skipScenario) { s.dlqThreshold = 4; s.recorder = skipRecorderCounting }},
+		{name: "receive count at threshold", modify: func(s *skipScenario) { s.dlqThreshold = 3; s.recorder = skipRecorderCounting }},
+		{name: "receive count above threshold without recorder", modify: func(s *skipScenario) { s.dlqThreshold = 2 }},
+		{name: "panicking skip recorder still emits dlq", modify: func(s *skipScenario) { s.dlqThreshold = 1; s.recorder = skipRecorderPanicking }},
+		{name: "missing message and group ids", modify: func(s *skipScenario) { s.messageID = ""; s.groupID = ""; s.recorder = skipRecorderPlain }},
+		{name: "per group id", modify: func(s *skipScenario) { s.runMode = router.PerGroupID; s.recorder = skipRecorderCounting }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := base
+			tt.modify(&s)
+			synctest.Test(t, func(t *testing.T) {
+				run := runSkipScenario(t, s)
+				assertSkipSignals(t, s, run)
+			})
+		})
+	}
+}
+
+var (
+	errModelReceiptHandle = errors.New("receipt handle is invalid")
+	errModelNotInFlight   = errors.New("message is not in flight")
+)
+
+type modelMessage struct {
+	visibleAt time.Time
+	id        string
+	groupID   string
+	handle    string
+	receives  int
+	deleted   bool
+}
+
+type sqsModel struct {
+	onDrained func()
+	byHandle  map[string]*modelMessage
+	messages  []*modelMessage
+	deleted   int
+	mu        sync.Mutex
+}
+
+func newSQSModel(n int, groups int, onDrained func()) *sqsModel {
+	m := &sqsModel{onDrained: onDrained, byHandle: make(map[string]*modelMessage)}
+	for i := range n {
+		msg := &modelMessage{id: "message-" + strconv.Itoa(i)}
+		if groups > 0 {
+			msg.groupID = "group-" + strconv.Itoa(i%groups)
+		}
+		m.messages = append(m.messages, msg)
+	}
+	return m
+}
+
+func (m *sqsModel) client() *fake.SQSClient {
+	return &fake.SQSClient{
+		GetQueueUrlFunc: func(_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error) {
+			return &sqs.GetQueueUrlOutput{QueueUrl: aws.String(flowQueueURL)}, nil
+		},
+		ReceiveMessageFunc:          m.receive,
+		DeleteMessageFunc:           m.delete,
+		ChangeMessageVisibilityFunc: m.changeVisibility,
+	}
+}
+
+func (m *sqsModel) take(limit int32, visibility int32) ([]types.Message, time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	var (
+		out  []types.Message
+		next time.Time
+	)
+	for _, msg := range m.messages {
+		if msg.deleted {
+			continue
+		}
+		if msg.visibleAt.After(now) {
+			if next.IsZero() || msg.visibleAt.Before(next) {
+				next = msg.visibleAt
+			}
+			continue
+		}
+		if int32(len(out)) == limit {
+			continue
+		}
+		delete(m.byHandle, msg.handle)
+		msg.receives++
+		msg.handle = msg.id + "#" + strconv.Itoa(msg.receives)
+		msg.visibleAt = now.Add(time.Duration(visibility) * time.Second)
+		m.byHandle[msg.handle] = msg
+		attrs := map[string]string{"ApproximateReceiveCount": strconv.Itoa(msg.receives)}
+		if msg.groupID != "" {
+			attrs["MessageGroupId"] = msg.groupID
+		}
+		out = append(out, types.Message{
+			MessageId:     aws.String(msg.id),
+			ReceiptHandle: aws.String(msg.handle),
+			Body:          aws.String(msg.id),
+			Attributes:    attrs,
+		})
+	}
+	return out, next
+}
+
+func (m *sqsModel) receive(ctx context.Context, params *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+	waitUntil := time.Now().Add(time.Duration(params.WaitTimeSeconds) * time.Second)
+	for {
+		out, next := m.take(params.MaxNumberOfMessages, params.VisibilityTimeout)
+		if len(out) > 0 || !time.Now().Before(waitUntil) {
+			return &sqs.ReceiveMessageOutput{Messages: out}, nil
+		}
+		until := waitUntil
+		if !next.IsZero() && next.Before(until) {
+			until = next
+		}
+		timer := time.NewTimer(time.Until(until))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *sqsModel) inFlightLocked(handle string) (*modelMessage, error) {
+	msg, ok := m.byHandle[handle]
+	if !ok || msg.deleted {
+		return nil, errModelReceiptHandle
+	}
+	if !msg.visibleAt.After(time.Now()) {
+		return nil, errModelNotInFlight
+	}
+	return msg, nil
+}
+
+func (m *sqsModel) changeVisibility(
+	_ context.Context, params *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	msg, err := m.inFlightLocked(aws.ToString(params.ReceiptHandle))
+	if err != nil {
+		return nil, err
+	}
+	msg.visibleAt = time.Now().Add(time.Duration(params.VisibilityTimeout) * time.Second)
+	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+func (m *sqsModel) delete(_ context.Context, params *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+	m.mu.Lock()
+	msg, ok := m.byHandle[aws.ToString(params.ReceiptHandle)]
+	if !ok || msg.deleted {
+		m.mu.Unlock()
+		return nil, errModelReceiptHandle
+	}
+	msg.deleted = true
+	m.deleted++
+	drained := m.deleted == len(m.messages)
+	m.mu.Unlock()
+
+	if drained {
+		m.onDrained()
+	}
+	return &sqs.DeleteMessageOutput{}, nil
+}
+
+func (m *sqsModel) receiveCounts() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int, len(m.messages))
+	for _, msg := range m.messages {
+		out[msg.id] = msg.receives
+	}
+	return out
+}
+
+func (m *sqsModel) deletedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deleted
+}
+
+func TestRun_SlowSingleWorkerNeverSkipsPendingMessages(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const (
+		messages    = 30
+		handlerTime = 5 * time.Second
+		timeLimit   = 3 * time.Minute
+	)
+	tests := []struct {
+		name   string
+		opts   []router.Option
+		groups int
+	}{
+		{name: "parallel"},
+		{name: "per group id", opts: []router.Option{router.WithRunMode(router.PerGroupID)}, groups: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				model := newSQSModel(messages, tt.groups, cancel)
+				var mu sync.Mutex
+				handled := make(map[string]int, messages)
+				handler := func(_ context.Context, m middleware.Message) error {
+					mu.Lock()
+					handled[string(m.Body())]++
+					mu.Unlock()
+					time.Sleep(handlerTime)
+					return nil
+				}
+
+				opts := append([]router.Option{router.WithWorkerPoolSize(1), router.WithVisibilityTimeout(11)}, tt.opts...)
+				route, err := router.New(flowQueueName, handler, opts...)
+				require.NoError(t, err)
+				logs := fake.NewLogHandler()
+				c, err := consumer.New(model.client(), route, consumer.WithLogger(slog.New(logs)))
+				require.NoError(t, err)
+
+				go func() {
+					select {
+					case <-ctx.Done():
+					case <-time.After(timeLimit):
+						cancel()
+					}
+				}()
+				start := time.Now()
+				require.NoError(t, c.Run(ctx))
+				elapsed := time.Since(start)
+
+				want := make(map[string]int, messages)
+				for i := range messages {
+					want["message-"+strconv.Itoa(i)] = 1
+				}
+				assert.Equal(t, messages, model.deletedCount())
+				assert.Equal(t, want, handled)
+				assert.Equal(t, want, model.receiveCounts())
+				assert.LessOrEqual(t, elapsed, timeLimit)
+				assert.Empty(t, logsWithMessage(logs, slog.LevelError, skipLogMessage))
+				assert.Empty(t, logsWithMessage(logs, slog.LevelError, "failed to change message visibility"))
+			})
+		})
+	}
+}

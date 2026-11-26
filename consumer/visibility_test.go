@@ -191,7 +191,7 @@ func TestVisibilityManager_ExtensionTimingFromReceiveTime(t *testing.T) {
 			for _, i := range vmOrder(trackAfter) {
 				vmSleepUntil(base.Add(vmMillis(trackAfter[i])))
 				consumer.SetReceivedAt(msgs[i], time.Now().Add(-vmMillis(waits[i])))
-				vm.Track(msgs[i])
+				vm.TrackActive(msgs[i])
 				synctest.Wait()
 			}
 			time.Sleep(vmQuiet)
@@ -236,7 +236,7 @@ func TestVisibilityManager_ExtensionLimitIsExact(t *testing.T) {
 			vm := startVM(rec.client, vt, limit, nil)
 			trackAt = time.Now()
 			consumer.SetReceivedAt(msg, trackAt.Add(-wait))
-			vm.Track(msg)
+			vm.TrackActive(msg)
 			time.Sleep(vmQuiet)
 			vm.Close()
 		})
@@ -279,7 +279,7 @@ func TestVisibilityManager_TwelveHourCeiling(t *testing.T) {
 			vm := startVM(rec.client, vt, limit, nil)
 			for i, msg := range msgs {
 				consumer.SetReceivedAt(msg, base.Add(-vmMillis(waits[i])))
-				vm.Track(msg)
+				vm.TrackActive(msg)
 				synctest.Wait()
 			}
 			time.Sleep(vmQuiet)
@@ -346,7 +346,7 @@ func runVMOps(vm *consumer.VisibilityManager, rec *vmRecorder, msgs []*consumer.
 		case vmOpTrack:
 			if !everTracked[op.pick] {
 				consumer.SetReceivedAt(msgs[op.pick], time.Now().Add(-max(op.delay, 0)))
-				vm.Track(msgs[op.pick])
+				vm.TrackActive(msgs[op.pick])
 				everTracked[op.pick], tracked[op.pick] = true, true
 			}
 		case vmOpUntrack:
@@ -448,7 +448,7 @@ func TestVisibilityManager_Coalescing(t *testing.T) {
 			for _, i := range vmOrder(offsets) {
 				vmSleepUntil(base.Add(vmMillis(offsets[i])))
 				consumer.SetReceivedAt(msgs[i], time.Now())
-				vm.Track(msgs[i])
+				vm.TrackActive(msgs[i])
 				synctest.Wait()
 			}
 			time.Sleep(vmQuiet)
@@ -742,7 +742,7 @@ func TestVisibilityManager_BatchFailureReporting(t *testing.T) {
 			for i, m := range msgs[:trackedN] {
 				consumer.SetReceivedAt(m, base.Add(-vmMillis(waits[i])))
 				c.receipts[m.Identifier()] = base.Add(-vmMillis(waits[i]))
-				script.vm.Track(m)
+				script.vm.TrackActive(m)
 				synctest.Wait()
 			}
 			var releases []*consumer.TestMessage
@@ -805,7 +805,7 @@ func TestVisibilityManager_Backoff(t *testing.T) {
 				rec := newVMRecorder(nil)
 				vm := startVM(rec.client, 30, 3, nil)
 				msg := vmMessages(1)[0]
-				vm.Track(msg)
+				vm.TrackActive(msg)
 				time.Sleep(3 * time.Second)
 				at := time.Now()
 
@@ -873,7 +873,7 @@ func TestVisibilityManager_Release(t *testing.T) {
 				vm := startVM(rec.client, 30, 3, nil)
 				msgs := vmMessages(tt.count)
 				for _, m := range msgs {
-					vm.Track(m)
+					vm.TrackActive(m)
 				}
 				synctest.Wait()
 				at := time.Now()
@@ -918,7 +918,7 @@ func TestVisibilityManager_CloseFlushesQueuedChanges(t *testing.T) {
 		})
 		vm := startVM(rec.client, 30, 3, nil)
 		msgs := vmMessages(5)
-		vm.Track(msgs[4])
+		vm.TrackActive(msgs[4])
 		vm.Backoff(msgs[0], 5*time.Second)
 		synctest.Wait()
 		vm.Backoff(msgs[1], 7*time.Second)
@@ -979,7 +979,7 @@ func TestVisibilityManager_Close(t *testing.T) {
 				}
 				msgs := vmMessages(tt.trackCount + tt.backoffs)
 				for _, m := range msgs[:tt.trackCount] {
-					vm.Track(m)
+					vm.TrackActive(m)
 				}
 				for _, m := range msgs[tt.trackCount:] {
 					vm.Backoff(m, time.Minute)
@@ -1005,7 +1005,7 @@ func TestVisibilityManager_NilLogger(t *testing.T) {
 		})
 		vm := startVM(rec.client, 30, 2, nil)
 		msgs := vmMessages(2)
-		vm.Track(msgs[0])
+		vm.TrackActive(msgs[0])
 		vm.Backoff(msgs[1], time.Minute)
 
 		assert.NotPanics(t, func() { time.Sleep(vmQuiet) })
@@ -1029,7 +1029,7 @@ func TestVisibilityManager_Tracked(t *testing.T) {
 				assert.Zero(t, vm.Tracked())
 
 				for _, m := range msgs[:3] {
-					vm.Track(m)
+					vm.TrackActive(m)
 				}
 				assert.Equal(t, 3, vm.Tracked())
 
@@ -1087,7 +1087,7 @@ func TestVisibilityManager_RetryAfterFailure(t *testing.T) {
 		synctest.Test(t, func(*testing.T) {
 			base = time.Now()
 			vm := startVM(rec.client, vt, 1, slog.New(logs))
-			vm.Track(msg)
+			vm.TrackActive(msg)
 			time.Sleep(vmQuiet)
 			vm.Close()
 		})
@@ -1130,8 +1130,8 @@ func TestVisibilityManager_UntrackedDuringFlight(t *testing.T) {
 		vm := startVM(rec.client, 30, 2, slog.New(logs))
 		msgs := vmMessages(2)
 		base := time.Now()
-		vm.Track(msgs[0])
-		vm.Track(msgs[1])
+		vm.TrackActive(msgs[0])
+		vm.TrackActive(msgs[1])
 
 		time.Sleep(20 * time.Second)
 		synctest.Wait()
@@ -1200,7 +1200,7 @@ func runVMFallbackScript(t *testing.T, client consumer.SQSClient, s vmFallbackSc
 		msgs := vmMessages(len(s.waits))
 		for i, m := range msgs {
 			consumer.SetReceivedAt(m, base.Add(-vmMillis(s.waits[i])))
-			vm.Track(m)
+			vm.TrackActive(m)
 			synctest.Wait()
 		}
 		time.Sleep(s.releaseAt)
@@ -1281,7 +1281,7 @@ func TestVisibilityManager_ZeroReceivedAtIsStampedAtTrack(t *testing.T) {
 			vm := startVM(rec.client, vt, 1, nil)
 			time.Sleep(trackAfter)
 			trackAt = time.Now()
-			vm.Track(msg)
+			vm.TrackActive(msg)
 			time.Sleep(vmQuiet)
 			vm.Close()
 		})
@@ -1317,7 +1317,7 @@ func TestVisibilityManager_ExtensionNotSent(t *testing.T) {
 				msg := vmMessages(1)[0]
 				consumer.SetReceivedAt(msg, time.Now().Add(-tt.wait))
 
-				vm.Track(msg)
+				vm.TrackActive(msg)
 				time.Sleep(vmQuiet)
 				vm.Close()
 
@@ -1357,10 +1357,10 @@ func TestVisibilityManager_CoalesceWindowEdges(t *testing.T) {
 				msgs := vmMessages(2)
 				base := time.Now()
 				consumer.SetReceivedAt(msgs[0], base)
-				vm.Track(msgs[0])
+				vm.TrackActive(msgs[0])
 				time.Sleep(tt.offset)
 				consumer.SetReceivedAt(msgs[1], time.Now())
-				vm.Track(msgs[1])
+				vm.TrackActive(msgs[1])
 				time.Sleep(vmQuiet)
 				vm.Close()
 
@@ -1415,7 +1415,7 @@ func TestVisibilityManager_IsExpired(t *testing.T) {
 			msg := visibilityMessages("msg")[0]
 			consumer.SetReceivedAt(msg, received)
 			if tt.track {
-				vm.Track(msg)
+				vm.TrackActive(msg)
 			}
 			if tt.untrack {
 				vm.Untrack(msg)
@@ -1438,7 +1438,7 @@ func TestVisibilityManager_IsExpiredAgainstDeadline(t *testing.T) {
 		vm := consumer.NewVisibilityManager(&fake.SQSClient{}, visibilityQueueURL, vt, limit, nil)
 		msg := visibilityMessages("msg")[0]
 		consumer.SetReceivedAt(msg, received)
-		vm.Track(msg)
+		vm.TrackActive(msg)
 
 		remaining := vmSeconds(vt) - offset
 		want := remaining <= 0 || (limit == 0 && remaining < vmStartMargin)
@@ -1474,7 +1474,7 @@ func TestVisibilityManager_IsExpiredAfterExtension(t *testing.T) {
 				received := time.Now()
 				consumer.SetReceivedAt(msg, received)
 				deadline := received.Add(vmSeconds(vt))
-				vm.Track(msg)
+				vm.TrackActive(msg)
 
 				vmSleepUntil(deadline.Add(-consumer.RenewalMargin))
 				synctest.Wait()
@@ -1556,7 +1556,7 @@ func TestVisibilityManager_ConcurrentBatchRequests(t *testing.T) {
 			vm := startVM(rec.client, vt, 1, nil)
 			for _, m := range msgs {
 				consumer.SetReceivedAt(m, base)
-				vm.Track(m)
+				vm.TrackActive(m)
 			}
 			vmSleepUntil(base.Add(vmSeconds(vt) - consumer.RenewalMargin))
 			synctest.Wait()
@@ -1628,7 +1628,7 @@ func TestVisibilityManager_SlowRequestDoesNotDelayOtherChunks(t *testing.T) {
 			vm := startVM(rec.client, vt, 1, nil)
 			for _, m := range msgs {
 				consumer.SetReceivedAt(m, base)
-				vm.Track(m)
+				vm.TrackActive(m)
 			}
 			deadline := base.Add(vmSeconds(vt))
 			vmSleepUntil(deadline.Add(-consumer.RenewalMargin))
@@ -1693,7 +1693,7 @@ func TestVisibilityManager_SingleClientSendsChangesConcurrently(t *testing.T) {
 			vm := startVM(client, vt, 1, nil)
 			for _, m := range msgs {
 				consumer.SetReceivedAt(m, base)
-				vm.Track(m)
+				vm.TrackActive(m)
 			}
 			vmSleepUntil(base.Add(vmSeconds(vt) - consumer.RenewalMargin))
 			synctest.Wait()
@@ -1713,6 +1713,319 @@ func TestVisibilityManager_SingleClientSendsChangesConcurrently(t *testing.T) {
 		for _, s := range sends {
 			assert.WithinDuration(rt, due, s.at, 0)
 			assert.Equal(rt, vt, s.timeout)
+		}
+	})
+}
+
+type vmPendingRun struct {
+	receivedAt time.Time
+	beginAt    time.Time
+	checks     []bool
+	sends      []vmSend
+	preBegin   int
+	expired    bool
+	began      bool
+}
+
+func runVMPendingThenBegin(t *testing.T, rec *vmRecorder, vt int32, limit int, wait time.Duration, checkpoints []time.Duration) vmPendingRun {
+	var run vmPendingRun
+	msg := vmMessages(1)[0]
+
+	synctest.Test(t, func(*testing.T) {
+		vm := startVM(rec.client, vt, limit, nil)
+		run.receivedAt = time.Now()
+		consumer.SetReceivedAt(msg, run.receivedAt)
+		vm.Track(msg)
+		for _, c := range checkpoints {
+			vmSleepUntil(run.receivedAt.Add(c))
+			synctest.Wait()
+			run.checks = append(run.checks, vm.IsExpired(msg, time.Now()))
+		}
+		vmSleepUntil(run.receivedAt.Add(wait))
+		synctest.Wait()
+		run.beginAt = time.Now()
+		run.preBegin = len(rec.sends())
+		run.expired = vm.IsExpired(msg, run.beginAt)
+		run.began = vm.Begin(msg, run.beginAt)
+		time.Sleep(vmQuiet)
+		vm.Close()
+	})
+
+	run.sends = rec.sends()
+	return run
+}
+
+func vmPendingExtensions(receivedAt, beginAt time.Time, vt int32, limit int) ([]time.Time, time.Time) {
+	deadline := receivedAt.Add(vmSeconds(vt))
+	if limit == 0 {
+		return nil, deadline
+	}
+	var out []time.Time
+	for {
+		due := deadline.Add(-consumer.RenewalMargin)
+		if due.After(beginAt) {
+			return out, deadline
+		}
+		out = append(out, due)
+		deadline = due.Add(vmSeconds(vt))
+	}
+}
+
+func assertVMCountedExtensions(t *rapid.T, run vmPendingRun, deadline time.Time, vt int32, limit int) {
+	require.Len(t, run.sends, run.preBegin+limit)
+	for k, s := range run.sends[run.preBegin:] {
+		assert.True(t, s.at.After(run.beginAt), "counted extension %d at %v, begin at %v", k+1, s.at, run.beginAt)
+		assert.WithinDuration(t, deadline.Add(-consumer.RenewalMargin), s.at, 0, "counted extension %d", k+1)
+		want := min(int64(k+1)*int64(vt), consumer.MaxVisibilitySeconds-vmCeilSeconds(s.at.Sub(run.receivedAt)))
+		assert.Equal(t, int32(want), s.timeout, "counted extension %d", k+1)
+		deadline = s.at.Add(vmSeconds(s.timeout))
+	}
+}
+
+// Feature: consumer-flow-control, Property 21: For any VT ≥ 11 s, ExtensionLimit ≥ 1, and wait before handler start that keeps the message within the 12-hour ceiling, when every Extension succeeds the message is never Skipped, every Extension sent before the handler starts carries timeout VT, and none of them counts against the Extension_Limit, including one whose result arrives after the handler started.
+func TestVisibilityManager_PendingMessageNeverExpiresWhileWaiting(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		vt := rapid.Int32Range(11, 600).Draw(rt, "visibilityTimeout")
+		limit := rapid.IntRange(1, 5).Draw(rt, "extensionLimit")
+		waitMillis := rapid.Int64Range(0, 20*int64(vt)*1000).Draw(rt, "waitMillis")
+		checkMillis := rapid.SliceOfN(rapid.Int64Range(0, waitMillis), 0, 6).Draw(rt, "checkMillis")
+		slices.Sort(checkMillis)
+		checkpoints := make([]time.Duration, len(checkMillis))
+		for i, ms := range checkMillis {
+			checkpoints[i] = vmMillis(ms)
+		}
+		rec := newVMRecorder(nil)
+
+		run := runVMPendingThenBegin(t, rec, vt, limit, vmMillis(waitMillis), checkpoints)
+
+		for i, expired := range run.checks {
+			assert.False(rt, expired, "checkpoint %d at %v", i, checkpoints[i])
+		}
+		assert.False(rt, run.expired)
+		assert.True(rt, run.began)
+
+		pending, deadline := vmPendingExtensions(run.receivedAt, run.beginAt, vt, limit)
+		require.Equal(rt, len(pending), run.preBegin)
+		for i, at := range pending {
+			assert.WithinDuration(rt, at, run.sends[i].at, 0, "pending extension %d", i+1)
+			assert.Equal(rt, vt, run.sends[i].timeout, "pending extension %d", i+1)
+		}
+		assertVMCountedExtensions(rt, run, deadline, vt, limit)
+	})
+}
+
+// Feature: consumer-flow-control, Property 12: For any ExtensionLimit = n ≥ 0, wait before handler start, and a handler that outlives every Extension, exactly n Extensions are sent after the handler starts, and the k-th of them carries timeout min(k × VT, 43200 − elapsed). With n = 0 no Extension is sent at all, before or after the handler starts.
+func TestVisibilityManager_ExtensionLimitIsExactAfterPendingWait(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		vt := rapid.Int32Range(11, 600).Draw(rt, "visibilityTimeout")
+		limit := rapid.IntRange(0, 5).Draw(rt, "extensionLimit")
+		maxWait := 20 * int64(vt) * 1000
+		if limit == 0 {
+			maxWait = int64(vmSeconds(vt)-vmStartMargin) / int64(time.Millisecond)
+		}
+		wait := vmMillis(rapid.Int64Range(0, maxWait).Draw(rt, "waitMillis"))
+		rec := newVMRecorder(nil)
+
+		run := runVMPendingThenBegin(t, rec, vt, limit, wait, nil)
+
+		require.True(rt, run.began)
+		pending, deadline := vmPendingExtensions(run.receivedAt, run.beginAt, vt, limit)
+		require.Equal(rt, len(pending), run.preBegin)
+		assertVMCountedExtensions(rt, run, deadline, vt, limit)
+		if limit == 0 {
+			assert.Empty(rt, run.sends)
+			assert.Empty(rt, rec.snapshot())
+		}
+	})
+}
+
+// Feature: consumer-flow-control, Property 21: For any VT ≥ 11 s, ExtensionLimit ≥ 1, and wait before handler start that keeps the message within the 12-hour ceiling, when every Extension succeeds the message is never Skipped, every Extension sent before the handler starts carries timeout VT, and none of them counts against the Extension_Limit, including one whose result arrives after the handler started.
+func TestVisibilityManager_PendingExtensionInFlightAcrossBegin(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		vt := rapid.Int32Range(11, 600).Draw(rt, "visibilityTimeout")
+		limit := rapid.IntRange(1, 5).Draw(rt, "extensionLimit")
+		var gate chan struct{}
+		rec := newVMRecorder(func(call int, _ *sqs.ChangeMessageVisibilityBatchInput) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+			if call == 0 {
+				<-gate
+			}
+			return &sqs.ChangeMessageVisibilityBatchOutput{}, nil
+		})
+		msg := vmMessages(1)[0]
+		var (
+			receivedAt time.Time
+			beginAt    time.Time
+			inFlight   int
+			began      bool
+		)
+
+		synctest.Test(t, func(*testing.T) {
+			gate = make(chan struct{})
+			vm := startVM(rec.client, vt, limit, nil)
+			receivedAt = time.Now()
+			consumer.SetReceivedAt(msg, receivedAt)
+			vm.Track(msg)
+			vmSleepUntil(receivedAt.Add(vmSeconds(vt) - consumer.RenewalMargin))
+			synctest.Wait()
+			inFlight = len(rec.snapshot())
+			beginAt = time.Now()
+			began = vm.Begin(msg, beginAt)
+			close(gate)
+			time.Sleep(vmQuiet)
+			vm.Close()
+		})
+
+		require.Equal(rt, 1, inFlight)
+		require.True(rt, began)
+		sends := rec.sends()
+		require.Len(rt, sends, 1+limit)
+		assert.WithinDuration(rt, beginAt, sends[0].at, 0)
+		assert.Equal(rt, vt, sends[0].timeout)
+
+		run := vmPendingRun{receivedAt: receivedAt, beginAt: beginAt, sends: sends, preBegin: 1}
+		assertVMCountedExtensions(rt, run, sends[0].at.Add(vmSeconds(vt)), vt, limit)
+	})
+}
+
+func TestVisibilityManager_BeginWithoutExtensions(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const vt = 30
+	tests := []struct {
+		name string
+		at   time.Duration
+		want bool
+	}{
+		{name: "at receive time", at: 0, want: true},
+		{name: "one second before the deadline", at: vmSeconds(vt) - vmStartMargin, want: true},
+		{name: "just under one second before the deadline", at: vmSeconds(vt) - vmStartMargin + time.Nanosecond},
+		{name: "half a second before the deadline", at: vmSeconds(vt) - vmStartMargin/2},
+		{name: "at the deadline", at: vmSeconds(vt)},
+		{name: "an hour after the deadline", at: vmSeconds(vt) + time.Hour},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rec := newVMRecorder(nil)
+				vm := startVM(rec.client, vt, 0, nil)
+				msg := vmMessages(1)[0]
+				received := time.Now()
+				consumer.SetReceivedAt(msg, received)
+				vm.Track(msg)
+
+				vmSleepUntil(received.Add(tt.at))
+				synctest.Wait()
+				now := time.Now()
+
+				assert.Equal(t, tt.want, vm.Begin(msg, now))
+				assert.Equal(t, !tt.want, vm.IsExpired(msg, now))
+				assert.Equal(t, 1, vm.Tracked())
+
+				time.Sleep(vmQuiet)
+				assert.Empty(t, rec.snapshot())
+				vm.Untrack(msg)
+				assert.Zero(t, vm.Tracked())
+				vm.Close()
+			})
+		})
+	}
+}
+
+func TestVisibilityManager_BeginUntracked(t *testing.T) {
+	tests := []struct {
+		name    string
+		track   bool
+		untrack bool
+	}{
+		{name: "never tracked"},
+		{name: "untracked after tracking", track: true, untrack: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rapid.Check(t, func(rt *rapid.T) {
+				vt := rapid.Int32Range(11, 600).Draw(rt, "visibilityTimeout")
+				limit := rapid.IntRange(0, 5).Draw(rt, "extensionLimit")
+				offset := time.Duration(rapid.Int64Range(-int64(time.Hour), int64(13*time.Hour)).Draw(rt, "offset"))
+				vm := consumer.NewVisibilityManager(&fake.SQSClient{}, visibilityQueueURL, vt, limit, nil)
+				msg := visibilityMessages("msg")[0]
+				received := time.Unix(rapid.Int64Range(0, 1<<32).Draw(rt, "received"), 0)
+				consumer.SetReceivedAt(msg, received)
+				if tt.track {
+					vm.Track(msg)
+				}
+				if tt.untrack {
+					vm.Untrack(msg)
+				}
+
+				assert.True(rt, vm.Begin(msg, received.Add(offset)))
+				assert.False(rt, vm.IsExpired(msg, received.Add(offset)))
+				assert.Zero(rt, vm.Tracked())
+			})
+		})
+	}
+}
+
+func TestVisibilityManager_PendingMessageWithFailingExtensionsExpires(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	rapid.Check(t, func(rt *rapid.T) {
+		vt := rapid.Int32Range(11, 600).Draw(rt, "visibilityTimeout")
+		limit := rapid.IntRange(1, 5).Draw(rt, "extensionLimit")
+		late := vmMillis(rapid.Int64Range(0, 3_600_000).Draw(rt, "lateMillis"))
+		rec := newVMRecorder(func(int, *sqs.ChangeMessageVisibilityBatchInput) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+			return nil, errVisibilityRequest
+		})
+		msg := vmMessages(1)[0]
+		var (
+			receivedAt    time.Time
+			beforeExpired bool
+			began         bool
+			expired       bool
+			tracked       int
+			trackedAfter  int
+		)
+
+		synctest.Test(t, func(*testing.T) {
+			vm := startVM(rec.client, vt, limit, nil)
+			receivedAt = time.Now()
+			consumer.SetReceivedAt(msg, receivedAt)
+			vm.Track(msg)
+			deadline := receivedAt.Add(vmSeconds(vt))
+			vmSleepUntil(deadline.Add(-time.Nanosecond))
+			synctest.Wait()
+			beforeExpired = vm.IsExpired(msg, time.Now())
+			vmSleepUntil(deadline.Add(late))
+			synctest.Wait()
+			now := time.Now()
+			began = vm.Begin(msg, now)
+			expired = vm.IsExpired(msg, now)
+			tracked = vm.Tracked()
+			time.Sleep(vmQuiet)
+			vm.Untrack(msg)
+			trackedAfter = vm.Tracked()
+			vm.Close()
+		})
+
+		assert.False(rt, beforeExpired)
+		assert.False(rt, began)
+		assert.True(rt, expired)
+		assert.Equal(rt, 1, tracked)
+		assert.Zero(rt, trackedAfter)
+
+		due := receivedAt.Add(vmSeconds(vt) - consumer.RenewalMargin)
+		sends := rec.sends()
+		require.Len(rt, sends, vmMaxAttempts())
+		for i, s := range sends {
+			assert.WithinDuration(rt, due.Add(time.Duration(i)*consumer.ExtensionRetryDelay), s.at, 0, "attempt %d", i+1)
+			assert.Equal(rt, vt, s.timeout, "attempt %d", i+1)
 		}
 	})
 }

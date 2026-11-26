@@ -87,10 +87,13 @@ func WithVisibilityTimeout(seconds int32) Option {
 }
 
 // WithExtensionLimit sets how many times the visibility timeout of a message may
-// be extended while it waits and while it runs; a limit of n allows exactly n
-// extensions, and zero disables them. The k-th extension sets the visibility
+// be extended after its handler starts; a limit of n allows exactly n such
+// extensions. While a received message waits for a worker it is extended by one
+// visibility timeout at a time, as often as needed, and those extensions are not
+// counted. The k-th extension after the handler starts sets the visibility
 // timeout to k times the route visibility timeout, and a message never stays
-// invisible longer than 12 hours after it was received. The value must not be
+// invisible longer than 12 hours after it was received. Zero disables every
+// extension, including the ones while a message waits. The value must not be
 // negative. The default is 2.
 func WithExtensionLimit(n int) Option {
 	return func(r *Route) error {

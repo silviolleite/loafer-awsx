@@ -25,6 +25,19 @@ type MetricsRecorder interface {
 	IncDeadLetter(routeName string)
 }
 
+// SkipRecorder is an optional extension of MetricsRecorder. When the recorder
+// passed to WithMetrics also implements SkipRecorder, the consumer invokes
+// IncSkipped once for every message it finishes without running its handler
+// because the message's visibility timeout ran out before a worker started it.
+// Such a message never reaches the handler middlewares, so this is the only
+// metric that sees it. It is a separate interface so that existing
+// MetricsRecorder implementations keep compiling; the same panic-recovery rules
+// apply.
+type SkipRecorder interface {
+	// IncSkipped increments the skipped-message counter for the route.
+	IncSkipped(routeName string)
+}
+
 // emitMetric invokes inc for the named route, guarding the call with a recover
 // so a panicking recorder can never abort the message outcome.
 //

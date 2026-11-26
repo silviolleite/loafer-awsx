@@ -271,6 +271,7 @@ func TestDispatcherProcessObservesDLQWhenExhausted(t *testing.T) {
 	d.metrics = stubRecorder{dlq: func(route string) { metricRoute = route }}
 
 	msg := buildDLQMessage("receipt-dlq", "3")
+	msg.original.MessageId = aws.String("sqs-id-dlq")
 	d.process(context.Background(), msg)
 
 	assert.Empty(t, client.deletes())
@@ -280,6 +281,7 @@ func TestDispatcherProcessObservesDLQWhenExhausted(t *testing.T) {
 	require.Len(t, errs, 1)
 	assert.Equal(t, "queue", errs[0]["queue_name"])
 	assert.Equal(t, "receipt-dlq", errs[0]["message_id"])
+	assert.Equal(t, "sqs-id-dlq", errs[0]["sqs_message_id"])
 	assert.Equal(t, "3", errs[0]["receive_count"])
 
 	assert.Equal(t, "queue", metricRoute)
@@ -343,6 +345,8 @@ func TestDispatcherProcessDLQWithoutMetricOrCallback(t *testing.T) {
 	errs := capture.errorAttrs()
 	require.Len(t, errs, 1)
 	assert.Equal(t, "receipt-plain-dlq", errs[0]["message_id"])
+	assert.Contains(t, errs[0], "sqs_message_id")
+	assert.Empty(t, errs[0]["sqs_message_id"])
 }
 
 func TestDispatcherProcessDLQReceiveCountParsing(t *testing.T) {

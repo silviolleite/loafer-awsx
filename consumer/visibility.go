@@ -49,21 +49,29 @@ const (
 	changeExtension
 )
 
-// trackedEntry is the visibility state of one Tracked_Message.
+// trackedEntry is the visibility state of one Tracked_Message. extensions
+// counts only the Extensions sent after the handler started, which are the
+// ones bounded by the Extension_Limit and the ones that grow the timeout.
+// isActive is set once a worker starts the message.
 type trackedEntry struct {
 	msg        *message
 	deadline   time.Time
 	due        time.Time
 	extensions int
 	index      int
+	isActive   bool
 }
 
 // sentChange pairs a change with the data needed to apply its result.
+// isCounted records whether the message was active when the Extension was
+// sent, so an Extension sent while it waited is never counted against the
+// Extension_Limit even if its result arrives after the handler started.
 type sentChange struct {
-	entry  *trackedEntry
-	sentAt time.Time
-	change visibilityChange
-	kind   changeKind
+	entry     *trackedEntry
+	sentAt    time.Time
+	change    visibilityChange
+	kind      changeKind
+	isCounted bool
 }
 
 // visibilityManager is the single per-Consumer component that keeps every
@@ -76,8 +84,17 @@ type sentChange struct {
 // sends every Extension due within coalesceWindow in batch requests of up to
 // ten entries. The k-th Extension of a message sets its visibility timeout to k
 // times the route visibility timeout, capped so the message never stays
-// invisible longer than 12 hours after its receive. At most extensionLimit
-// Extensions are sent per message.
+// invisible longer than 12 hours after its receive.
+//
+// A Pending_Message is extended for as long as it waits, each time by one
+// visibility timeout, so it never expires before a worker starts it and, if
+// its handler then fails at once, it becomes visible again about one
+// visibility timeout later. These Extensions are not counted: k and the
+// extensionLimit only count the Extensions sent after a worker started the
+// message, so at most extensionLimit Extensions are sent while its handler
+// runs. The wait itself is bounded by the credit pool and by the 12-hour
+// ceiling. An extensionLimit of zero disables Extensions entirely, for pending
+// and active messages alike.
 //
 // Backoff changes and shutdown releases are queued as immediate changes and
 // sent by the same goroutine, so they are batched as well. Untracking a message
@@ -206,17 +223,32 @@ func (v *visibilityManager) release(msgs ...*message) {
 	v.signal()
 }
 
-// isExpired reports whether msg is tracked and should not be started: its
-// Visibility_Deadline is not after now, which means SQS may already have made
-// it visible again, or it has no Extension left and less than startMargin of
-// visibility remains, so it would become visible while its handler runs.
-func (v *visibilityManager) isExpired(msg *message, now time.Time) bool {
+// begin reports whether a worker may start msg at now and, when it may, marks
+// msg active so that from then on its Extensions count against the
+// Extension_Limit. A message that is not tracked may always start. A tracked
+// message must not start when it is expired (see isExpiredLocked); it is then
+// left pending and the caller finishes it without running its handler.
+func (v *visibilityManager) begin(msg *message, now time.Time) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	e, ok := v.entries[msg]
 	if !ok {
+		return true
+	}
+	if v.isExpiredLocked(e, now) {
 		return false
 	}
+	e.isActive = true
+	return true
+}
+
+// isExpiredLocked reports whether e should not be started at now: its
+// Visibility_Deadline is not after now, which means SQS may already have made
+// it visible again, or it has no Extension left and less than startMargin of
+// visibility remains, so it would become visible while its handler runs. A
+// pending message only runs out of Extensions when the Extension_Limit is zero.
+// v.mu must be held.
+func (v *visibilityManager) isExpiredLocked(e *trackedEntry, now time.Time) bool {
 	remaining := e.deadline.Sub(now)
 	if remaining <= 0 {
 		return true
@@ -326,10 +358,11 @@ func (v *visibilityManager) collectDueLocked(now time.Time, batch []sentChange) 
 		}
 
 		batch = append(batch, sentChange{
-			entry:  e,
-			change: visibilityChange{msg: e.msg, timeout: timeout},
-			kind:   changeExtension,
-			sentAt: now,
+			entry:     e,
+			change:    visibilityChange{msg: e.msg, timeout: timeout},
+			kind:      changeExtension,
+			sentAt:    now,
+			isCounted: e.isActive,
 		})
 	}
 
@@ -341,9 +374,10 @@ func (v *visibilityManager) collectDueLocked(now time.Time, batch []sentChange) 
 }
 
 // nextTimeout returns the visibility timeout of the next Extension of e and
-// whether sending it now moves the deadline later. The k-th Extension asks for
-// k times the visibility timeout, capped by what is left of the 12-hour budget
-// counted from the message receive.
+// whether sending it now moves the deadline later. The k-th Extension since the
+// handler started asks for k times the visibility timeout, and every Extension
+// of a pending message asks for one visibility timeout; both are capped by
+// what is left of the 12-hour budget counted from the message receive.
 func (v *visibilityManager) nextTimeout(e *trackedEntry, now time.Time) (int32, bool) {
 	k := int64(e.extensions + 1)
 	want := k * int64(v.visibilitySeconds)
@@ -392,7 +426,9 @@ func (v *visibilityManager) dispatch(ctx context.Context, batch []sentChange) {
 }
 
 // apply records the result of each sent change. A successful Extension moves
-// the deadline and, below the limit, schedules the next one. A failed
+// the deadline and schedules the next one while the message is pending or, once
+// it is active, while fewer than extensionLimit counted Extensions were sent.
+// Only an Extension sent while the message was active is counted. A failed
 // Extension keeps its deadline and is retried after extensionRetryDelay while
 // the deadline has not passed. Failures are logged, except for Extensions of
 // messages untracked while the request was in flight.
@@ -430,10 +466,12 @@ func (v *visibilityManager) apply(chunk []sentChange, failures []*visibilityFail
 			continue
 		}
 
-		e.extensions++
+		if sc.isCounted {
+			e.extensions++
+		}
 		e.deadline = sc.sentAt.Add(time.Duration(sc.change.timeout) * time.Second)
 		e.due = e.deadline.Add(-renewalMargin)
-		if e.extensions < v.extensionLimit {
+		if !e.isActive || e.extensions < v.extensionLimit {
 			heap.Push(&v.heap, e)
 		}
 	}

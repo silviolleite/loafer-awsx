@@ -1,8 +1,10 @@
 package consumer
 
 import (
+	"container/heap"
 	"context"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -277,6 +279,32 @@ func (v *VisibilityManager) Track(msg *TestMessage) {
 	v.vm.track(msg)
 }
 
+// TrackActive starts tracking msg from its Receive_Time and marks it active at
+// that instant, as if a worker had started it right after the receive. It does
+// what track does, but creates the entry already active under the same lock, so
+// the manager goroutine can never send an uncounted pending Extension between
+// the track and the start.
+func (v *VisibilityManager) TrackActive(msg *TestMessage) {
+	v.vm.mu.Lock()
+	v.vm.untrackLocked(msg)
+	if msg.receivedAt.IsZero() {
+		msg.receivedAt = time.Now()
+	}
+	e := &trackedEntry{
+		msg:      msg,
+		deadline: msg.receivedAt.Add(v.vm.visibility),
+		index:    -1,
+		isActive: true,
+	}
+	e.due = e.deadline.Add(-renewalMargin)
+	v.vm.entries[msg] = e
+	if v.vm.extensionLimit > 0 {
+		heap.Push(&v.vm.heap, e)
+	}
+	v.vm.mu.Unlock()
+	v.vm.signal()
+}
+
 // Untrack stops tracking msg.
 func (v *VisibilityManager) Untrack(msg *TestMessage) {
 	v.vm.untrack(msg)
@@ -340,8 +368,31 @@ func NewGroupSchedulerWithIdle(capacity int, fields []string, idle *IdleWorkers)
 	return &WorkSource{ws: newGroupScheduler(capacity, fields, idle)}
 }
 
-// IsExpired reports whether msg is tracked and its visibility deadline is not
-// after now.
+// IsExpired reports whether msg is tracked and must not be started at now,
+// without marking it active.
 func (v *VisibilityManager) IsExpired(msg *TestMessage, now time.Time) bool {
-	return v.vm.isExpired(msg, now)
+	v.vm.mu.Lock()
+	defer v.vm.mu.Unlock()
+	e, ok := v.vm.entries[msg]
+	return ok && v.vm.isExpiredLocked(e, now)
+}
+
+// Begin wraps visibilityManager.begin: it reports whether msg may start at now
+// and, when it may, marks it active.
+func (v *VisibilityManager) Begin(msg *TestMessage, now time.Time) bool {
+	return v.vm.begin(msg, now)
+}
+
+// SetMessageID sets the SQS MessageId of a test message.
+func SetMessageID(msg *TestMessage, id string) {
+	msg.original.MessageId = &id
+}
+
+// SetReceiveCount sets the ApproximateReceiveCount system attribute of a test
+// message.
+func SetReceiveCount(msg *TestMessage, n int) {
+	if msg.original.Attributes == nil {
+		msg.original.Attributes = map[string]string{}
+	}
+	msg.original.Attributes[approximateReceiveCountKey] = strconv.Itoa(n)
 }
