@@ -52,4 +52,13 @@
 // consumer.BatchDeleteClient, as *sqs.Client does; otherwise the consumer fails
 // fast with errors.ErrDeleteBatchUnsupported. See the consumer package
 // documentation for how batches form, failure handling, and the shutdown flush.
+//
+// # Flow control
+//
+// WithPrefetch sets how many received messages a consumer may hold beyond its
+// worker pool size (default MaxMessages), and WithPollers sets how many
+// goroutines receive concurrently (default 1). Together they bound how long a
+// message waits between being received and starting, and how fast the route
+// can receive. MaxMessages only sets the size of one receive request. See the
+// consumer package documentation for the admission and dispatch model.
 package router

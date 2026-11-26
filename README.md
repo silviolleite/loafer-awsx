@@ -35,9 +35,10 @@ functional options, and every component accepts the standard library
 7. [IAM permissions](#iam-permissions)
 8. [Scheduled Retry (FIFO)](#scheduled-retry-fifo)
 9. [Batched deletes](#batched-deletes)
-10. [Benchmarks](#benchmarks)
-11. [Acknowledgements](#acknowledgements)
-12. [License](#license)
+10. [Flow control](#flow-control)
+11. [Benchmarks](#benchmarks)
+12. [Acknowledgements](#acknowledgements)
+13. [License](#license)
 
 ---
 
@@ -213,8 +214,9 @@ easy to miss from signatures alone.
 - **`router`** declares an immutable `Route` binding a queue to a handler, with
   options for worker-pool size, receive batching, long-poll wait, visibility
   timeout and extension limit, run mode, route middleware, DLQ
-  observability, and batched deletes (`WithDeleteBatch()`, see
-  [Batched deletes](#batched-deletes)).
+  observability, batched deletes (`WithDeleteBatch()`, see
+  [Batched deletes](#batched-deletes)), and flow control (`WithPrefetch(n)`,
+  `WithPollers(n)`, see [Flow control](#flow-control)).
 - **`consumer`** and **`broker`** run the polling loop and orchestrate one
   consumer per route; both accept a `*slog.Logger`, a retry timeout, and
   middleware, and the broker adds a shutdown timeout.
@@ -225,9 +227,11 @@ easy to miss from signatures alone.
   the middleware primitives and built-ins, `*slog.Logger` constructors, and the
   sentinel error set respectively.
 
-**Run modes** (`router.Mode`): `Parallel` assigns messages to workers randomly;
-`PerGroupID` hashes the `MessageGroupId` plus any custom group fields so a
-group's messages are handled in order.
+**Run modes** (`router.Mode`): `Parallel` hands each message to whichever worker
+is free next; `PerGroupID` keeps at most one message per group (the
+`MessageGroupId` plus any custom group fields) running at a time, in receive
+order, and lets any free worker take any group that is ready. See
+[Flow control](#flow-control).
 
 **Middleware ordering:** broker-level (global) middleware is applied outermost
 and route-level middleware innermost (closest to the handler).
@@ -319,7 +323,7 @@ permissions each client requires.
 | --- | --- | --- |
 | `sqs:ReceiveMessage` | Runtime (consumer poll) | On the Entry_Queue. |
 | `sqs:DeleteMessage` | Runtime | On the Entry_Queue. Also authorizes `DeleteMessageBatch` (used by `router.WithDeleteBatch()`); no extra permission is needed. |
-| `sqs:ChangeMessageVisibility` | Runtime | Visibility extension during processing. |
+| `sqs:ChangeMessageVisibility` | Runtime | Visibility extensions, backoff, and shutdown release. Also authorizes `ChangeMessageVisibilityBatch`, which the consumer uses when the client supports it; no extra permission is needed. |
 | `sqs:GetQueueUrl` | Runtime | Resolve the queue URL from its name. |
 | `sqs:SendMessage` | Runtime (Scheduled Retry only) | On the DLQ, to publish exhausted messages. |
 | `sqs:ListQueues` | Construction (Ping) | Account-level; omit only if the check is disabled. |
@@ -740,6 +744,81 @@ within the library's at-least-once contract: handlers must be **idempotent**.
 
 ---
 
+## Flow control
+
+The consumer only receives a message when it has capacity to start it soon, and
+it keeps every received message invisible from the moment it was received until
+it reaches an outcome.
+
+### Credit-based admission
+
+Each route has an admission capacity of `WorkerPoolSize + Prefetch` messages.
+Every message returned by `ReceiveMessage` holds one credit until it reaches an
+outcome (deleted, left for redelivery, backed off, held, or released). Before
+each receive, a poller acquires `min(MaxMessages, Prefetch + 1)` credits and asks
+for exactly that many messages; credits the response does not use are returned
+at once. A poller that cannot get a full batch of credits waits, so with the
+default `Prefetch` receives stay full-sized under backlog and cost the same
+number of requests as before. The `Prefetch + 1` bound guarantees that a
+receive can always start while any worker is idle.
+
+| Option | Default | Bounds | Effect |
+| --- | --- | --- | --- |
+| `router.WithPrefetch(n)` | `MaxMessages` | `n >= 0` | Messages held beyond the worker count. Lower values shorten the wait between receive and start but also shrink each receive to `n + 1` messages, which costs more receive requests; `0` receives one message at a time. |
+| `router.WithPollers(n)` | `1` | `n >= 1` | Concurrent receive loops sharing the same capacity. Raise it when handlers are fast and the receive round trip is the bottleneck. |
+
+`MaxMessages` (`router.WithMaxMessages`) only sets the size of one receive
+request; it no longer sizes any internal buffer.
+
+### Dispatch
+
+- **`Parallel`:** one shared queue; any idle worker takes the next message, so a
+  slow handler never blocks receiving or other workers.
+- **`PerGroupID`:** a scheduler keeps a FIFO per group key and at most one
+  message per group running. Any idle worker takes any group that has pending
+  messages and nothing running, so unrelated groups never wait for each other
+  and a slow group occupies one worker, not the route. Under the Visibility
+  retry model, when a message fails (error or backoff), every pending message of
+  the same group is held: its handler does not run, it is not deleted, and its
+  visibility is not changed, so SQS redelivers the group in order.
+
+### Visibility management
+
+One goroutine per consumer tracks the visibility deadline of every received
+message, starting at `receive time + VisibilityTimeout`. An extension becomes
+due 10 s before the deadline; when one is due, every extension due within the
+next 5 s is sent with it, in `ChangeMessageVisibilityBatch` requests of up to 10
+entries (or one `ChangeMessageVisibility` per message when the client does not
+implement `consumer.BatchVisibilityClient`). The k-th extension sets the
+visibility timeout to `k × VisibilityTimeout`, never past 12 hours after the
+receive. `router.WithExtensionLimit(n)` allows exactly `n` extensions (`0`
+disables them). Messages that finish before their first due instant cost no
+visibility request at all.
+
+`Message.Backoff(delay)` never blocks; the last delay wins and is applied when
+the handler returns.
+
+### Sizing
+
+A message waits roughly `t × Prefetch / WorkerPoolSize` before starting, where
+`t` is the handler duration, and with `PerGroupID` another `(m − 1) × t` for the
+m-th message of a group in one receive. To avoid any extension, keep
+`VisibilityTimeout` above that wait plus the p99 handler duration plus 10 s.
+For longer handlers, size `ExtensionLimit` so that
+`VisibilityTimeout + Σ(k × VisibilityTimeout − 10 s)` for `k = 1..n` covers the
+p99. Handlers should still be idempotent: SQS delivery is at least once.
+
+### Shutdown
+
+When the run context is canceled, the pollers stop, every message whose
+handler is running finishes, and every received message that has not started is
+released with a visibility timeout of 0, so it and its FIFO group are available
+to other consumers at once instead of after a full visibility timeout. On a
+batched-delete route the pending deletes are then sent. These final requests are
+not canceled by the run context; each is bounded by its own timeout.
+
+---
+
 ## Benchmarks
 
 The numbers below compare the per-message processing overhead of `loafer-awsx`
@@ -796,39 +875,103 @@ message; `entries/batch` is the average number of entries per
 
 | Benchmark | Delete latency | Time/op | Throughput | delete-calls/msg | entries/batch |
 | --- | --- | ---: | ---: | ---: | ---: |
-| StandardSync | 0 | 5.36 µs | 186,576 msg/s | 1.000 | – |
-| StandardBatch | 0 | 3.86 µs | 259,312 msg/s | 0.747 | 1.34 |
-| FIFOSync | 0 | 6.65 µs | 150,328 msg/s | 1.000 | – |
-| FIFOBatch | 0 | 5.33 µs | 187,490 msg/s | 0.861 | 1.16 |
-| StandardSync | 2 ms | 344.8 µs | 2,900 msg/s | 1.000 | – |
-| StandardBatch | 2 ms | 34.6 µs | 28,944 msg/s | 0.100 | 9.99 |
-| FIFOSync | 2 ms | 342.7 µs | 2,918 msg/s | 1.000 | – |
-| FIFOBatch | 2 ms | 34.2 µs | 29,209 msg/s | 0.100 | 9.99 |
+| StandardSync | 0 | 1.36 µs | 736,202 msg/s | 1.000 | – |
+| StandardBatch | 0 | 1.70 µs | 586,698 msg/s | 0.974 | 1.03 |
+| FIFOSync | 0 | 1.42 µs | 704,286 msg/s | 1.000 | – |
+| FIFOBatch | 0 | 1.76 µs | 567,352 msg/s | 0.995 | 1.01 |
+| StandardSync | 2 ms | 284.0 µs | 3,522 msg/s | 1.000 | – |
+| StandardBatch | 2 ms | 28.3 µs | 35,372 msg/s | 0.100 | 9.99 |
+| FIFOSync | 2 ms | 283.9 µs | 3,523 msg/s | 1.000 | – |
+| FIFOBatch | 2 ms | 28.2 µs | 35,410 msg/s | 0.100 | 9.99 |
 
-Medians of 24 samples (four runs of `-benchtime=2s -count=6`) on an Intel Core
-i5-8265U (4 cores / 8 threads, laptop), Go 1.26.6, `linux/amd64`.
+Medians of 6 samples (`-benchtime=2s -count=6`) on an Apple M5 (10 cores),
+Go 1.27, `darwin/arm64`. Every receive was full (0.100 `receive_reqs/msg`).
 
 - **With 2 ms delete latency:** batches were almost always full (9.99 entries),
   so delete requests dropped by 90% and throughput rose about 10x on both
   standard and FIFO routes. The synchronous path is bound by 8 workers each
-  blocking on one delete. Batching also used about 170 B and 4 allocations less
-  per message. Run-to-run spread was 11% or less.
-- **With zero delete latency:** the result is not stable, so the medians in
-  the table hide a split. In three of four runs, batches held 1.16–1.37
-  entries and batching took 20–47% less time per message than the
-  synchronous path. In the fourth run, batches barely formed (1.06–1.13
-  entries) and batching took 13–25% more time. Either way it costs about
-  295–380 B and 5–7 allocations more per message. Do not expect a speedup
-  from batching when deletes are this cheap.
+  blocking on one delete, a ceiling of 4,000 msg/s; it reaches 88% of it.
+  Batching also used about 170 B and 4 allocations less per message.
+  Run-to-run spread was 0.5% or less.
+- **With zero delete latency:** batches barely formed (1.01–1.03 entries), so
+  batching only added work: about 25% more time, 390–400 B and 7 allocations
+  more per message than the synchronous path. Run-to-run spread reached 38%,
+  so read these rows as orders of magnitude. Do not expect a speedup from
+  batching when deletes are this cheap.
 
-In short, `WithDeleteBatch()` pays off most when delete round trips are real,
-as with any networked SQS endpoint, and volume is high. With in-memory,
-zero-latency deletes it can be faster or slower per message, and it always
-uses slightly more memory and allocations. To reproduce:
+In short, `WithDeleteBatch()` pays off when delete round trips are real, as
+with any networked SQS endpoint, and volume is high. With in-memory,
+zero-latency deletes it is slower per message and uses more memory and
+allocations.
+
+Compared with v1.1.1, run back to back on the same machine:
+
+| Benchmark | Delete latency | v1.1.1 | flow control | Time/op |
+| --- | --- | ---: | ---: | ---: |
+| StandardSync | 2 ms | 323.8 µs (3,089 msg/s) | 284.0 µs (3,522 msg/s) | −12% |
+| FIFOSync | 2 ms | 319.3 µs (3,132 msg/s) | 283.9 µs (3,523 msg/s) | −11% |
+| StandardBatch | 2 ms | 28.2 µs | 28.3 µs | ~0% |
+| FIFOBatch | 2 ms | 28.2 µs | 28.2 µs | ~0% |
+| StandardSync | 0 | 1.04 µs | 1.36 µs | +31% |
+| StandardBatch | 0 | 1.44 µs | 1.70 µs | +18% |
+| FIFOSync | 0 | 1.13 µs | 1.42 µs | +26% |
+| FIFOBatch | 0 | 1.64 µs | 1.76 µs | +8% |
+
+With 2 ms deletes the synchronous path rose from 77% to 88% of its 4,000 msg/s
+ceiling, and batched routes were already at their limit. With zero-latency
+deletes the flow-control pipeline adds about 0.1–0.3 µs of fixed cost per
+message, three orders of magnitude below a real SQS round trip, and batches
+no longer form (v1.1.1 reached 1.20–1.36 entries). Every scenario allocates
+205–320 B and 1–4 allocations less per message than v1.1.1. To reproduce:
 
 ```bash
 cd benchmarks
 go test -run '^$' -bench 'Delete' -benchtime=2s -count=6
+```
+
+### Flow-control benchmarks
+
+`BenchmarkFlowControl` runs the route the flow-control design targets: 30
+workers, `MaxMessages` 10, a 2 ms handler, a 5 ms simulated receive round trip,
+and 64 message groups for `PerGroupID`. `queue_wait_ms` is the mean time
+between the receive and the handler start.
+
+| Scenario | Throughput | queue_wait_ms | receive_reqs/msg | visibility_reqs/msg |
+| --- | ---: | ---: | ---: | ---: |
+| parallel, pollers=1 | 1,843 msg/s | 0.06 | 0.101 | 0 |
+| parallel, pollers=2 | 3,688 msg/s | 0.05 | 0.102 | 0 |
+| pergroup, pollers=1 | 1,831 msg/s | 0.07 | 0.101 | 0 |
+| pergroup, pollers=2 | 3,669 msg/s | 0.07 | 0.102 | 0 |
+
+With a 2 ms handler the single poller is the bottleneck (about 10 messages per
+5 ms round trip); a second poller doubles throughput without holding more
+messages. Receives stay full (0.1 requests per message) and no visibility
+request is needed.
+
+Compared with v1.1.1, which buffered up to `MaxMessages` messages per worker,
+on the same scenario with slower handlers and one poller:
+
+| Scenario | Version | Throughput | Mean wait | Max wait | receive_reqs/msg |
+| --- | --- | ---: | ---: | ---: | ---: |
+| parallel, 20 ms handler | v1.1.1 | 1,088 msg/s | 54.0 ms | 242 ms | 0.165 |
+| parallel, 20 ms handler | flow control | 1,460 msg/s | 1.2 ms | 4.7 ms | 0.106 |
+| pergroup, 20 ms handler | v1.1.1 | 512 msg/s | 50.6 ms | 247 ms | 0.165 |
+| pergroup, 20 ms handler | flow control | 1,458 msg/s | 1.2 ms | 4.0 ms | 0.106 |
+| parallel, 100 ms handler | v1.1.1 | 239 msg/s | 345 ms | 1,208 ms | 0.421 |
+| parallel, 100 ms handler | flow control | 297 msg/s | 28.1 ms | 86 ms | 0.129 |
+| pergroup, 100 ms handler | v1.1.1 | 106 msg/s | 261 ms | 1,208 ms | 0.420 |
+| pergroup, 100 ms handler | flow control | 297 msg/s | 28.1 ms | 86 ms | 0.129 |
+
+Single runs of 3,000 messages on an Apple M5 (10 cores), Go 1.27, `darwin/arm64`.
+The maximum wait of v1.1.1 (about 12 × the handler duration) is the time a
+message spent in a worker buffer while its visibility timeout was already
+running; with flow control it stays below one handler duration. `PerGroupID`
+throughput nearly triples because groups are no longer pinned to a worker by
+hash. To reproduce the flow-control table:
+
+```bash
+cd benchmarks
+go test -run '^$' -bench 'FlowControl' -benchtime=3000x
 ```
 
 ---
