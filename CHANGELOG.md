@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 from the [Conventional Commits](https://www.conventionalcommits.org/) history.
 
+## [1.2.0](https://github.com/silviolleite/loafer-awsx/compare/v1.1.1...v1.2.0) (2026-11-27)
+
+
+### Features
+
+* **consumer:** add credit-based flow control and batched visibility ([#16](https://github.com/silviolleite/loafer-awsx/issues/16)) ([846d401](https://github.com/silviolleite/loafer-awsx/commit/846d401d1d85a5267ac77febd4d7f68b9d5df75a))
+
 ## [1.1.1](https://github.com/silviolleite/loafer-awsx/compare/v1.1.0...v1.1.1) (2026-11-23)
 
 
