@@ -7,7 +7,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/silviolleite/loafer-awsx/errors"
 	"github.com/silviolleite/loafer-awsx/logger"
@@ -15,16 +14,12 @@ import (
 	"github.com/silviolleite/loafer-awsx/router"
 )
 
-// allAttributes requests every custom message attribute on each receive.
-var allAttributes = []string{"All"}
-
-// allSystemAttributes requests every system attribute on each receive.
-var allSystemAttributes = []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll}
-
 // Consumer polls a single SQS queue and drives the message lifecycle for one
-// route. It resolves the queue URL, receives messages in batches with long
-// polling, and hands each message to a worker-pool dispatcher that runs the
-// middleware-wrapped handler and applies the outcome. A Consumer is created
+// route. It resolves the queue URL, receives messages with long polling only
+// while it has capacity to start them soon, and hands each message to a worker
+// pool that runs the middleware-wrapped handler and applies the outcome. A
+// single visibility manager keeps every received message invisible from the
+// moment it was received until it reaches an outcome. A Consumer is created
 // with New and run with Run; it carries no exported mutable state and a single
 // Consumer is intended to be run once at a time.
 type Consumer struct {
@@ -72,8 +67,10 @@ func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, erro
 	return c, nil
 }
 
-// Run resolves the queue URL, starts the worker pool, and enters the polling
-// loop until ctx is canceled.
+// Run resolves the queue URL, starts the visibility manager and the worker
+// pool, and runs Route.Pollers() polling loops until ctx is canceled. The
+// consumer never holds more than WorkerPoolSize plus Prefetch received messages
+// that have not reached an outcome.
 //
 // It fails fast, before resolving the queue URL and without starting any
 // goroutine, with errors.ErrNoSchedulerClient when a Scheduled-model route has
@@ -85,11 +82,13 @@ func New(client SQSClient, route *router.Route, opts ...Option) (*Consumer, erro
 //
 // Once polling starts, a receive error is logged and retried after the
 // configured retry timeout, with the wait honoring ctx cancellation. On ctx
-// cancellation Run stops polling, tears down the dispatcher (closing the worker
-// channels and waiting for all in-flight messages and visibility goroutines to
-// finish), and returns nil for a clean shutdown. On a batched-delete route the
-// teardown also sends every pending delete, each request bounded by its own
-// timeout and unaffected by ctx cancellation, before Run returns.
+// cancellation Run stops polling, waits for every message whose handler is
+// running to reach its outcome, and releases every received message that has
+// not started by setting its visibility timeout to zero, so it is redelivered
+// at once instead of after its visibility timeout. On a batched-delete route it
+// then sends every pending delete. The final deletes and visibility changes are
+// not canceled by ctx; each request is bounded by its own timeout. Run returns
+// nil for a clean shutdown, after every goroutine it started has exited.
 func (c *Consumer) Run(ctx context.Context) error {
 	scheduled := c.route.RetryModel() == router.ScheduledRetryModel
 
@@ -110,12 +109,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return err
 	}
 
-	var vm *visibilityManager
-	if scheduled {
-		vm = newScheduledVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
-	} else {
-		vm = newVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
-	}
+	// The visibility manager runs on a context detached from ctx: messages
+	// still running after cancellation keep receiving Extensions until they
+	// finish. It is closed after every worker has exited.
+	vm := newVisibilityManager(c.client, queueURL, c.route.VisibilityTimeout(), c.route.ExtensionLimit(), c.log)
+	vm.start(context.WithoutCancel(ctx))
+	defer vm.close()
 
 	d := newDispatcher(c.client, c.route, queueURL, vm, c.schedulerClient, c.log, c.globalMiddlewares...)
 
@@ -125,18 +124,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 	// owns, so a single recorder is wired unconditionally.
 	d.metrics = c.metrics
 
-	// Senders get a context detached from ctx so deletes committed while the
-	// workers drain during shutdown are still sent; dispatcher.stop closes the
-	// batcher only after every worker has exited.
+	// Senders get a context detached from ctx so deletes committed by messages
+	// still running at shutdown are still sent; the batcher is closed only after
+	// every worker has exited.
 	if batchClient != nil {
-		d.batcher = newDeleteBatcher(batchClient, queueURL, d.workerPoolSize*d.bufferSize, c.log)
+		d.batcher = newDeleteBatcher(batchClient, queueURL, d.workerPoolSize*int(c.route.MaxMessages()), c.log)
 		d.batcher.start(context.WithoutCancel(ctx), d.workerPoolSize)
 	}
 
-	d.start(ctx)
-	defer d.stop()
+	d.startWorkers(ctx)
+	c.runPollers(ctx, queueURL, d)
+	d.stopWorkers()
+	d.releasePending()
 
-	c.poll(ctx, queueURL, d)
+	if d.batcher != nil {
+		d.batcher.close()
+	}
 
 	return nil
 }
@@ -173,78 +176,4 @@ func (c *Consumer) resolveQueueURL(ctx context.Context) (string, error) {
 	}
 
 	return *out.QueueUrl, nil
-}
-
-// poll runs the receive loop until ctx is canceled. Each iteration requests a
-// batch of messages with all attributes and dispatches every received message
-// to the worker pool. A receive error is logged and followed by a retry-timeout
-// wait; the loop returns as soon as ctx is canceled, whether at the top of the
-// loop, during the retry wait, or while dispatching.
-//
-// Each batch shares one group barrier, attached to every message before
-// dispatch. The barrier is nil unless the route uses PerGroupID dispatch with
-// the Visibility retry model; when non-nil it lets the dispatcher hold back the
-// tail of a FIFO group whose head failed, preserving order.
-//
-// The receive request sets VisibilityTimeout to the route value so each message
-// starts hidden for the configured duration. This lets the visibility manager
-// skip the initial ChangeMessageVisibility call — it only extends after the
-// first tick when processing is still ongoing — avoiding an extra API call (and
-// its cost) for messages that complete quickly.
-func (c *Consumer) poll(ctx context.Context, queueURL string, d *dispatcher) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		out, err := c.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-			QueueUrl:                    aws.String(queueURL),
-			MaxNumberOfMessages:         c.route.MaxMessages(),
-			WaitTimeSeconds:             c.route.WaitTimeSeconds(),
-			VisibilityTimeout:           c.route.VisibilityTimeout(),
-			MessageAttributeNames:       allAttributes,
-			MessageSystemAttributeNames: allSystemAttributes,
-		})
-		if err != nil {
-			if !c.retryAfterError(ctx, queueURL, err) {
-				return
-			}
-			continue
-		}
-
-		barrier := d.newBatchBarrier()
-		for i := range out.Messages {
-			msg := newMessage(out.Messages[i])
-			msg.barrier = barrier
-			d.dispatch(ctx, msg)
-		}
-	}
-}
-
-// retryAfterError handles a failed receive. When ctx is already canceled it
-// returns false immediately without logging so a shutdown-induced error is not
-// reported as a failure. Otherwise it logs the error and waits the configured
-// retry timeout, returning true to retry or false if ctx is canceled during the
-// wait.
-func (c *Consumer) retryAfterError(ctx context.Context, queueURL string, err error) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-
-	c.log.Error("failed to receive messages",
-		slog.String("queue_url", queueURL),
-		slog.Any("error", errors.Wrap(errors.ErrGetMessage, err)),
-	)
-
-	timer := time.NewTimer(c.retryTimeout)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }

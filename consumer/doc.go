@@ -2,6 +2,48 @@
 // visibility-timeout management, and the message commit/backoff lifecycle for a
 // single queue.
 //
+// # Flow control
+//
+// A consumer holds at most WorkerPoolSize plus Prefetch received messages that
+// have not reached an outcome (see [router.WithPrefetch]). Each of the route's
+// pollers ([router.WithPollers]) acquires min(MaxMessages, Prefetch+1) credits
+// from a shared credit pool before every ReceiveMessage call and asks for
+// exactly that many messages; the Prefetch+1 bound means a receive can start
+// whenever a worker is idle. Credits the response does not use are returned at
+// once, and each admitted message returns its credit when it reaches an
+// outcome. Pollers therefore never receive messages the workers
+// cannot start soon, and they never wait on a particular worker.
+//
+// In Parallel mode every worker drains one shared queue. In PerGroupID mode a
+// group scheduler keeps a FIFO of pending messages per group key, runs at most
+// one message per group at a time, and hands any ready group to any idle
+// worker. Under the Visibility retry model, a handler error or backoff holds
+// every pending message of the same group: its handler does not run and it is
+// left in the queue, so SQS redelivers the group in order.
+//
+// A single visibility manager per consumer tracks the visibility deadline of
+// every admitted message from the instant it was received. Extensions become
+// due ten seconds before the deadline and are sent in
+// ChangeMessageVisibilityBatch requests of up to ten entries, together with any
+// extension due within the next five seconds, when the client implements
+// [BatchVisibilityClient]; otherwise each change is sent through
+// ChangeMessageVisibility. Backoff changes and shutdown releases go through the
+// same path. A message that finishes before its first extension is due costs no
+// visibility request. While a message waits for a worker it is extended by one
+// visibility timeout at a time and those extensions are not counted; the
+// route's extension limit only bounds the extensions sent after its handler
+// starts.
+//
+// A message whose visibility deadline has already passed when a worker takes
+// it (because its extensions failed, or the route disables them) is skipped:
+// its handler does not run and SQS redelivers it. The skip is logged at Error
+// with the receipt handle, the SQS MessageId (sqs_message_id), the group id,
+// and the receive count; it is counted through the optional [SkipRecorder];
+// and the observe-only DLQ path runs for it as after a handler error.
+//
+// On shutdown the pollers stop, running handlers finish, and every admitted
+// message that has not started is released with a visibility timeout of zero.
+//
 // # Scheduled Retry consumption path
 //
 // When a route selects the Scheduled Retry model (see the router package), the
@@ -66,7 +108,9 @@
 // a message detected as exhausted under the observe-only DLQ path, and
 // IncSuccess, IncRetry, and IncDeadLetter for a handled-and-deleted message, a
 // successfully created retry schedule, and a successful DLQ publish under the
-// Scheduled Retry model. The recorder is expected to be backed by counters
+// Scheduled Retry model. A recorder that also implements the optional
+// [SkipRecorder] interface receives IncSkipped for every skipped message. The
+// recorder is expected to be backed by counters
 // registered by the Metrics middleware and is supplied only when metrics are
 // enabled. A nil recorder is ignored, so callers never have to guard against nil
 // and the counters are left untouched.

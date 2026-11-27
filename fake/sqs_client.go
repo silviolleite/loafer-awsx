@@ -4,43 +4,53 @@ import (
 	"context"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/silviolleite/loafer-awsx/consumer"
 )
 
-// Compile-time assertions that SQSClient satisfies the consumer.SQSClient and
-// consumer.BatchDeleteClient interfaces.
+// Compile-time assertions that SQSClient satisfies the consumer.SQSClient,
+// consumer.BatchDeleteClient, and consumer.BatchVisibilityClient interfaces.
 var (
-	_ consumer.SQSClient         = (*SQSClient)(nil)
-	_ consumer.BatchDeleteClient = (*SQSClient)(nil)
+	_ consumer.SQSClient             = (*SQSClient)(nil)
+	_ consumer.BatchDeleteClient     = (*SQSClient)(nil)
+	_ consumer.BatchVisibilityClient = (*SQSClient)(nil)
 )
 
-// SQSClient is a configurable test double for the consumer.SQSClient and
-// consumer.BatchDeleteClient interfaces. Each method delegates to a
-// corresponding function field, letting tests program the response (or error)
-// for every call. When a function field is nil the method returns a nil output
-// and a nil error, except DeleteMessageBatch, which reports every entry as
-// successful. Every call is recorded so tests can assert on the parameters the
-// code under test sent.
+// SQSClient is a configurable test double for the consumer.SQSClient,
+// consumer.BatchDeleteClient, and consumer.BatchVisibilityClient interfaces.
+// Each method delegates to a corresponding function field, letting tests
+// program the response (or error) for every call. When a function field is nil
+// the method returns a nil output and a nil error, with two exceptions:
+// DeleteMessageBatch reports every entry as successful, and
+// ChangeMessageVisibilityBatch replays every entry through
+// ChangeMessageVisibility (see its doc). Every call is recorded so tests can
+// assert on the parameters the code under test sent.
 //
 // SQSClient is safe for concurrent use; the recorded call slices are guarded by
 // an internal mutex.
 type SQSClient struct {
-	ReceiveMessageFunc           func(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
-	DeleteMessageFunc            func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
-	ChangeMessageVisibilityFunc  func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
-	GetQueueUrlFunc              func(ctx context.Context, params *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
-	SendMessageFunc              func(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
-	DeleteMessageBatchFunc       func(ctx context.Context, params *sqs.DeleteMessageBatchInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error)
-	receiveMessageCalls          []*sqs.ReceiveMessageInput
-	deleteMessageCalls           []*sqs.DeleteMessageInput
-	changeMessageVisibilityCalls []*sqs.ChangeMessageVisibilityInput
-	getQueueURLCalls             []*sqs.GetQueueUrlInput
-	sendMessageCalls             []*sqs.SendMessageInput
-	deleteMessageBatchCalls      []*sqs.DeleteMessageBatchInput
-	mu                           sync.Mutex
+	ReceiveMessageFunc               func(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
+	DeleteMessageFunc                func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+	ChangeMessageVisibilityFunc      func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	GetQueueUrlFunc                  func(ctx context.Context, params *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
+	SendMessageFunc                  func(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+	DeleteMessageBatchFunc           func(ctx context.Context, params *sqs.DeleteMessageBatchInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error)
+	ChangeMessageVisibilityBatchFunc func(
+		ctx context.Context,
+		params *sqs.ChangeMessageVisibilityBatchInput,
+		optFns ...func(*sqs.Options),
+	) (*sqs.ChangeMessageVisibilityBatchOutput, error)
+	receiveMessageCalls               []*sqs.ReceiveMessageInput
+	deleteMessageCalls                []*sqs.DeleteMessageInput
+	changeMessageVisibilityCalls      []*sqs.ChangeMessageVisibilityInput
+	getQueueURLCalls                  []*sqs.GetQueueUrlInput
+	sendMessageCalls                  []*sqs.SendMessageInput
+	deleteMessageBatchCalls           []*sqs.DeleteMessageBatchInput
+	changeMessageVisibilityBatchCalls []*sqs.ChangeMessageVisibilityBatchInput
+	mu                                sync.Mutex
 }
 
 // ReceiveMessage records the call and delegates to ReceiveMessageFunc, or
@@ -136,6 +146,65 @@ func (c *SQSClient) DeleteMessageBatch(
 	return out, nil
 }
 
+// ChangeMessageVisibilityBatch records the call in
+// ChangeMessageVisibilityBatchCalls and delegates to
+// ChangeMessageVisibilityBatchFunc when that function is set.
+//
+// When ChangeMessageVisibilityBatchFunc is not set, the batch is replayed as one
+// ChangeMessageVisibility call per entry: each entry goes through
+// ChangeMessageVisibilityFunc (when set) and is recorded in
+// ChangeMessageVisibilityCalls, and the batch itself is not recorded. Tests
+// written before the consumer used batched visibility changes therefore keep
+// observing every change through ChangeMessageVisibilityCalls. An entry whose
+// single call returns an error is reported in Failed with that error as its
+// Message. Set ChangeMessageVisibilityBatchFunc to observe the batch requests
+// themselves.
+func (c *SQSClient) ChangeMessageVisibilityBatch(
+	ctx context.Context,
+	params *sqs.ChangeMessageVisibilityBatchInput,
+	optFns ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+	if c.ChangeMessageVisibilityBatchFunc == nil {
+		return c.replayVisibilityBatch(ctx, params, optFns...), nil
+	}
+
+	c.mu.Lock()
+	c.changeMessageVisibilityBatchCalls = append(c.changeMessageVisibilityBatchCalls, params)
+	c.mu.Unlock()
+
+	return c.ChangeMessageVisibilityBatchFunc(ctx, params, optFns...)
+}
+
+// replayVisibilityBatch sends every entry of params through
+// ChangeMessageVisibility and builds the batch output from the results.
+func (c *SQSClient) replayVisibilityBatch(
+	ctx context.Context,
+	params *sqs.ChangeMessageVisibilityBatchInput,
+	optFns ...func(*sqs.Options),
+) *sqs.ChangeMessageVisibilityBatchOutput {
+	out := &sqs.ChangeMessageVisibilityBatchOutput{}
+	if params == nil {
+		return out
+	}
+	for _, entry := range params.Entries {
+		_, err := c.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+			QueueUrl:          params.QueueUrl,
+			ReceiptHandle:     entry.ReceiptHandle,
+			VisibilityTimeout: entry.VisibilityTimeout,
+		}, optFns...)
+		if err != nil {
+			out.Failed = append(out.Failed, types.BatchResultErrorEntry{
+				Id:      entry.Id,
+				Code:    aws.String("FakeChangeMessageVisibilityError"),
+				Message: aws.String(err.Error()),
+			})
+			continue
+		}
+		out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: entry.Id})
+	}
+	return out
+}
+
 // ReceiveMessageCalls returns a copy of the inputs passed to ReceiveMessage, in
 // call order.
 func (c *SQSClient) ReceiveMessageCalls() []*sqs.ReceiveMessageInput {
@@ -193,5 +262,15 @@ func (c *SQSClient) DeleteMessageBatchCalls() []*sqs.DeleteMessageBatchInput {
 	defer c.mu.Unlock()
 	out := make([]*sqs.DeleteMessageBatchInput, len(c.deleteMessageBatchCalls))
 	copy(out, c.deleteMessageBatchCalls)
+	return out
+}
+
+// ChangeMessageVisibilityBatchCalls returns a copy of the inputs passed to
+// ChangeMessageVisibilityBatch, in call order.
+func (c *SQSClient) ChangeMessageVisibilityBatchCalls() []*sqs.ChangeMessageVisibilityBatchInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*sqs.ChangeMessageVisibilityBatchInput, len(c.changeMessageVisibilityBatchCalls))
+	copy(out, c.changeMessageVisibilityBatchCalls)
 	return out
 }

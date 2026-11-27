@@ -184,8 +184,8 @@ func handleMessage(_ context.Context, msg middleware.Message) error {
 	return fmt.Errorf("simulated processing failure for message %q", id)
 }
 
-// loggingMetrics is a consumer.MetricsRecorder that logs each Scheduled Retry
-// outcome so the path is easy to observe when running the example. A real
+// loggingMetrics is a consumer.MetricsRecorder, and an optional
+// consumer.SkipRecorder, that logs each Scheduled Retry outcome so the path is easy to observe when running the example. A real
 // application would back these methods with the counters registered by the
 // Metrics middleware.
 type loggingMetrics struct{}
@@ -204,4 +204,8 @@ func (loggingMetrics) IncRetry(route string) {
 
 func (loggingMetrics) IncDeadLetter(route string) {
 	log.Printf("dead-letter: route=%q exhausted message sent to DLQ", route)
+}
+
+func (loggingMetrics) IncSkipped(route string) {
+	log.Printf("skipped: route=%q message expired before a worker started it", route)
 }

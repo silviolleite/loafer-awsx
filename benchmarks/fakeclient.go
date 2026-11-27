@@ -12,6 +12,11 @@
 // client to simulate the SQS round trip, and read its delete counters to report
 // how many delete requests (DeleteMessage and DeleteMessageBatch) each message
 // cost and how many entries each batch request carried.
+//
+// The flow-control benchmarks set a per-call receive latency, read the receive
+// and visibility-change counters, and have the client record the receive
+// instant of every message to measure how long messages wait between being
+// received and starting.
 package benchmarks
 
 import (
@@ -29,25 +34,38 @@ import (
 // benchQueueURL is the fixed URL the fake client resolves for every queue.
 const benchQueueURL = "https://sqs.local/000000000000/bench-queue"
 
-// receiveBatch mirrors the SQS maximum of ten messages per ReceiveMessage call,
-// which both libraries request by default.
+// receiveBatch mirrors the SQS maximum of ten messages per ReceiveMessage call.
+// It is used when a caller does not set MaxNumberOfMessages.
 const receiveBatch = 10
 
 // benchClient is an in-memory SQS client shared by both libraries. Its method
 // set matches both loafergo.SQSClient and consumer.SQSClient, so a single value
-// drives either library. It also implements DeleteMessageBatch, so it satisfies
-// consumer.BatchDeleteClient. It hands out exactly total messages across
+// drives either library. It also implements DeleteMessageBatch and
+// ChangeMessageVisibilityBatch, so it satisfies consumer.BatchDeleteClient and
+// consumer.BatchVisibilityClient. It hands out exactly total messages across
 // ReceiveMessage calls and closes done once total messages have been deleted
 // through either delete API.
 //
 // deleteLatency, when non-zero, is slept by every DeleteMessage and
 // DeleteMessageBatch call to simulate the SQS round trip. deleteCalls counts
 // requests across both delete APIs, while batchCalls and batchEntries count
-// DeleteMessageBatch requests and the entries they carried. All counters are
-// accessed atomically.
+// DeleteMessageBatch requests and the entries they carried. receiveLatency,
+// when non-zero, is slept by every ReceiveMessage call that hands out messages.
+// receiveCalls counts ReceiveMessage requests and visibilityCalls counts
+// ChangeMessageVisibility and ChangeMessageVisibilityBatch requests. All
+// counters are accessed atomically. When recordReceivedAt is set, receivedAt
+// maps each receipt handle to the instant its ReceiveMessage call returned. It
+// is off by default because the map grows with every message and would add
+// its cost to benchmarks that never read it.
 type benchClient struct {
-	done chan struct{}
-	body []byte
+	done       chan struct{}
+	receivedAt sync.Map
+	body       []byte
+
+	receiveLatency   time.Duration
+	receiveCalls     int64
+	visibilityCalls  int64
+	recordReceivedAt bool
 
 	groups        int64 // when > 0, messages carry a cycling MessageGroupId (FIFO mode)
 	total         int64
@@ -86,7 +104,16 @@ func (c *benchClient) GetQueueUrl(_ context.Context, _ *sqs.GetQueueUrlInput, _ 
 // budget is exhausted, after which it briefly idles and returns an empty batch
 // so the caller's polling loop does not busy-spin before the context is
 // canceled.
-func (c *benchClient) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (c *benchClient) ReceiveMessage(
+	ctx context.Context, params *sqs.ReceiveMessageInput, _ ...func(*sqs.Options),
+) (*sqs.ReceiveMessageOutput, error) {
+	atomic.AddInt64(&c.receiveCalls, 1)
+
+	limit := int64(receiveBatch)
+	if params != nil && params.MaxNumberOfMessages > 0 {
+		limit = min(limit, int64(params.MaxNumberOfMessages))
+	}
+
 	var take int64
 	for {
 		rem := atomic.LoadInt64(&c.remaining)
@@ -99,20 +126,27 @@ func (c *benchClient) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageI
 			}
 		}
 
-		take = rem
-		if take > receiveBatch {
-			take = receiveBatch
-		}
+		take = min(rem, limit)
 		if atomic.CompareAndSwapInt64(&c.remaining, rem, rem-take) {
 			break
 		}
 	}
 
+	if err := sleepCtx(ctx, c.receiveLatency); err != nil {
+		atomic.AddInt64(&c.remaining, take)
+		return &sqs.ReceiveMessageOutput{}, err
+	}
+
+	now := time.Now()
 	msgs := make([]types.Message, take)
 	for i := range msgs {
 		id := atomic.AddInt64(&c.seq, 1)
+		handle := strconv.FormatInt(id, 10)
+		if c.recordReceivedAt {
+			c.receivedAt.Store(handle, now)
+		}
 		m := types.Message{
-			ReceiptHandle: aws.String(strconv.FormatInt(id, 10)),
+			ReceiptHandle: aws.String(handle),
 			Body:          aws.String(string(c.body)),
 		}
 		if c.groups > 0 {
@@ -129,7 +163,9 @@ func (c *benchClient) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageI
 // DeleteMessage waits deleteLatency, records a fully processed message, and
 // signals completion once every seeded message has been deleted. It returns the
 // context error without deleting when ctx ends during the simulated latency.
-func (c *benchClient) DeleteMessage(ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+func (c *benchClient) DeleteMessage(
+	ctx context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options),
+) (*sqs.DeleteMessageOutput, error) {
 	if err := c.simulateDeleteLatency(ctx); err != nil {
 		return nil, err
 	}
@@ -167,10 +203,16 @@ func (c *benchClient) DeleteMessageBatch(
 // context error when ctx ends first. It returns immediately when no latency is
 // configured.
 func (c *benchClient) simulateDeleteLatency(ctx context.Context) error {
-	if c.deleteLatency <= 0 {
+	return sleepCtx(ctx, c.deleteLatency)
+}
+
+// sleepCtx blocks for d, returning early with the context error when ctx ends
+// first. It returns immediately when d is not positive.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
 		return nil
 	}
-	t := time.NewTimer(c.deleteLatency)
+	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
@@ -188,10 +230,39 @@ func (c *benchClient) markDelivered(n int64) {
 	}
 }
 
-// ChangeMessageVisibility is a no-op; the benchmarks complete well within the
-// visibility window so no extension is ever attempted.
-func (c *benchClient) ChangeMessageVisibility(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+// ChangeMessageVisibility counts the request and otherwise does nothing.
+func (c *benchClient) ChangeMessageVisibility(
+	_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityOutput, error) {
+	atomic.AddInt64(&c.visibilityCalls, 1)
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+// ChangeMessageVisibilityBatch counts the request and reports every entry as
+// successful.
+func (c *benchClient) ChangeMessageVisibilityBatch(
+	_ context.Context, params *sqs.ChangeMessageVisibilityBatchInput, _ ...func(*sqs.Options),
+) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+	atomic.AddInt64(&c.visibilityCalls, 1)
+	successful := make([]types.ChangeMessageVisibilityBatchResultEntry, len(params.Entries))
+	for i, e := range params.Entries {
+		successful[i] = types.ChangeMessageVisibilityBatchResultEntry{Id: e.Id}
+	}
+	return &sqs.ChangeMessageVisibilityBatchOutput{Successful: successful}, nil
+}
+
+// waitSince reports how long ago the message with the given receipt handle was
+// received, and false when the handle is unknown.
+func (c *benchClient) waitSince(handle string) (time.Duration, bool) {
+	v, ok := c.receivedAt.Load(handle)
+	if !ok {
+		return 0, false
+	}
+	at, ok := v.(time.Time)
+	if !ok {
+		return 0, false
+	}
+	return time.Since(at), true
 }
 
 // SendMessage is a no-op that satisfies the SendMessage method added to

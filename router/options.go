@@ -17,6 +17,10 @@ const maxReceiveMessages = int32(10)
 // maxWaitTimeSeconds is the largest long-polling wait time AWS SQS accepts.
 const maxWaitTimeSeconds = int32(20)
 
+// maxPrefetch is the largest Prefetch a route accepts. Holding more received
+// messages than this only lengthens how long they wait before starting.
+const maxPrefetch = 1000
+
 // Scheduled Retry model configuration bounds.
 const (
 	// defaultBaseBackoff is the base Backoff_Delay applied when none is
@@ -82,14 +86,53 @@ func WithVisibilityTimeout(seconds int32) Option {
 	}
 }
 
-// WithExtensionLimit sets how many times the visibility timeout may be extended
-// while a message is processed. The value must not be negative. The default is 2.
+// WithExtensionLimit sets how many times the visibility timeout of a message may
+// be extended after its handler starts; a limit of n allows exactly n such
+// extensions. While a received message waits for a worker it is extended by one
+// visibility timeout at a time, as often as needed, and those extensions are not
+// counted. The k-th extension after the handler starts sets the visibility
+// timeout to k times the route visibility timeout, and a message never stays
+// invisible longer than 12 hours after it was received. Zero disables every
+// extension, including the ones while a message waits. The value must not be
+// negative. The default is 2.
 func WithExtensionLimit(n int) Option {
 	return func(r *Route) error {
 		if n < 0 {
 			return fmt.Errorf("extension limit must not be negative, got %d", n)
 		}
 		r.extensionLimit = n
+		return nil
+	}
+}
+
+// WithPrefetch sets how many received messages the consumer may hold beyond its
+// worker pool size. The consumer never holds more than WorkerPoolSize plus
+// Prefetch received-but-unfinished messages, so a lower value shortens the time
+// a message waits between being received and starting, at the cost of idle
+// workers while a receive is in flight. Each receive asks for at most Prefetch
+// plus one messages, so a Prefetch below MaxMessages also means smaller, more
+// frequent receives. The value must be within the inclusive range [0, 1000].
+// The default is the route's MaxMessages.
+func WithPrefetch(n int) Option {
+	return func(r *Route) error {
+		if n < 0 || n > maxPrefetch {
+			return fmt.Errorf("prefetch must be between 0 and %d, got %d", maxPrefetch, n)
+		}
+		r.prefetch = n
+		return nil
+	}
+}
+
+// WithPollers sets how many goroutines receive from the queue concurrently. All
+// pollers share the route's admission capacity of WorkerPoolSize plus Prefetch,
+// so adding pollers raises receive throughput without holding more messages.
+// The value must be at least 1. The default is 1.
+func WithPollers(n int) Option {
+	return func(r *Route) error {
+		if n < 1 {
+			return fmt.Errorf("pollers must be at least 1, got %d", n)
+		}
+		r.pollers = n
 		return nil
 	}
 }

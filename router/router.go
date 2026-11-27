@@ -12,6 +12,11 @@ const (
 	defaultWaitTimeSeconds   = int32(10)
 	defaultVisibilityTimeout = int32(30)
 	defaultExtensionLimit    = 2
+	defaultPollers           = 1
+
+	// unsetPrefetch marks a Route whose Prefetch was not configured; New
+	// resolves it to MaxMessages after all options are applied.
+	unsetPrefetch = -1
 
 	// minVisibilityTimeout is the smallest visibility timeout the consumer can
 	// operate with; smaller values are clamped up to this bound.
@@ -30,6 +35,8 @@ type Route struct {
 	customGroupFields []string
 	workerPoolSize    int
 	extensionLimit    int
+	prefetch          int
+	pollers           int
 	runMode           Mode
 	retryModel        RetryModel
 	maxMessages       int32
@@ -43,8 +50,8 @@ type Route struct {
 type Option func(*Route) error
 
 // New creates a Route with the given queue name, handler, and options. It seeds
-// library defaults, applies the options in order, and finally clamps the
-// visibility timeout to its minimum.
+// library defaults, applies the options in order, clamps the visibility timeout
+// to its minimum, and resolves an unset Prefetch to MaxMessages.
 //
 // New returns errors.ErrEmptyQueueName when queueName is empty and
 // errors.ErrNoHandler when handler is nil. Option failures are wrapped with
@@ -65,6 +72,8 @@ func New(queueName string, handler middleware.Handler, opts ...Option) (*Route, 
 		waitTimeSeconds:   defaultWaitTimeSeconds,
 		visibilityTimeout: defaultVisibilityTimeout,
 		extensionLimit:    defaultExtensionLimit,
+		prefetch:          unsetPrefetch,
+		pollers:           defaultPollers,
 		runMode:           Parallel,
 	}
 
@@ -79,6 +88,10 @@ func New(queueName string, handler middleware.Handler, opts ...Option) (*Route, 
 
 	if r.visibilityTimeout <= minVisibilityTimeout {
 		r.visibilityTimeout = minVisibilityTimeout
+	}
+
+	if r.prefetch == unsetPrefetch {
+		r.prefetch = int(r.maxMessages)
 	}
 
 	return r, nil
@@ -117,6 +130,18 @@ func (r *Route) WaitTimeSeconds() int32 {
 // VisibilityTimeout returns the visibility timeout in seconds.
 func (r *Route) VisibilityTimeout() int32 {
 	return r.visibilityTimeout
+}
+
+// Prefetch returns the number of received messages the consumer may hold beyond
+// its worker pool size.
+func (r *Route) Prefetch() int {
+	return r.prefetch
+}
+
+// Pollers returns the number of goroutines that receive from the queue
+// concurrently.
+func (r *Route) Pollers() int {
+	return r.pollers
 }
 
 // ExtensionLimit returns the maximum number of visibility extensions.

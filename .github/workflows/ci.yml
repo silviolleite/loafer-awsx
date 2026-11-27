@@ -14,16 +14,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version-file: go.mod
           check-latest: true
       - name: Test with race detection and coverage
         run: |
@@ -34,16 +30,12 @@ jobs:
   vulncheck:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version-file: go.mod
           check-latest: true
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
@@ -52,13 +44,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: false
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
           args: --timeout 5m --config .golangci.yml

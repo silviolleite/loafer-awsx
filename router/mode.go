@@ -4,11 +4,13 @@ package router
 type Mode int
 
 const (
-	// Parallel dispatches each message to a randomly selected worker,
+	// Parallel hands each message to whichever worker is free next,
 	// maximizing throughput without preserving per-group ordering.
 	Parallel Mode = iota
-	// PerGroupID dispatches messages to a worker chosen by hashing the
-	// message group key, preserving ordering within a group.
+	// PerGroupID runs at most one message per group key (MessageGroupId plus
+	// any custom group fields) at a time, in receive order, and lets any free
+	// worker take any group that has pending messages, preserving ordering
+	// within a group without binding a group to a worker.
 	PerGroupID
 )
 

@@ -113,6 +113,11 @@ func TestMetricsRegistersAllCollectors(t *testing.T) {
 		Name: "loafer_messages_dlq_total",
 		Help: "Total messages observed as exhausted (receive count reached maxReceiveCount; redriven by AWS SQS)",
 	}, []string{"route"}))
+
+	assertAlreadyRegistered(t, reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "loafer_messages_skipped_total",
+		Help: "Total messages skipped without running their handler because their visibility timeout expired before they started",
+	}, []string{"route"}))
 }
 
 func TestMetricsSuccessUpdatesCollectors(t *testing.T) {

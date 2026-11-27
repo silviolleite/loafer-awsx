@@ -17,6 +17,7 @@ const (
 	metricDuration  = "loafer_message_processing_duration_seconds"
 	metricInflight  = "loafer_messages_inflight"
 	metricDLQ       = "loafer_messages_dlq_total"
+	metricSkipped   = "loafer_messages_skipped_total"
 )
 
 // Metric label names and values used by the Metrics middleware.
@@ -76,6 +77,10 @@ func loadMetricsConfig(opts ...MetricsOption) metricsConfig {
 //   - loafer_messages_dlq_total (counter): registered here so it is available
 //     to the consumer's dead-letter-queue observability; it is not incremented
 //     by this middleware.
+//   - loafer_messages_skipped_total (counter): registered here so it is
+//     available to a consumer.SkipRecorder, which counts messages the consumer
+//     finishes without running their handler because their visibility timeout
+//     ran out before they started; it is not incremented by this middleware.
 //
 // Collectors are registered on the configured registerer using a safe,
 // idempotent registration that reuses any previously registered collector,
@@ -117,6 +122,13 @@ func Metrics(routeName string, opts ...MetricsOption) Middleware {
 	_ = registerCounterVec(cfg.registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricDLQ,
 		Help: "Total messages observed as exhausted (receive count reached maxReceiveCount; redriven by AWS SQS)",
+	}, []string{labelRoute}))
+
+	// Registered so the collector is available to a consumer SkipRecorder;
+	// not incremented by this middleware.
+	_ = registerCounterVec(cfg.registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricSkipped,
+		Help: "Total messages skipped without running their handler because their visibility timeout expired before they started",
 	}, []string{labelRoute}))
 
 	return func(next Handler) Handler {

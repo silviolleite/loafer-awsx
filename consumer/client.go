@@ -41,6 +41,23 @@ type BatchDeleteClient interface {
 	) (*sqs.DeleteMessageBatchOutput, error)
 }
 
+// BatchVisibilityClient is implemented by SQS clients that support
+// ChangeMessageVisibilityBatch. When the consumer's client implements it,
+// visibility extensions, backoff changes, and shutdown releases are sent in
+// batches of up to ten; otherwise each change is sent on its own through
+// SQSClient.ChangeMessageVisibility. A concrete *sqs.Client satisfies it. It is
+// kept separate from SQSClient so that existing SQSClient implementations
+// remain valid.
+type BatchVisibilityClient interface {
+	// ChangeMessageVisibilityBatch changes the visibility timeout of up to ten
+	// messages of the specified queue.
+	ChangeMessageVisibilityBatch(
+		ctx context.Context,
+		params *sqs.ChangeMessageVisibilityBatchInput,
+		optFns ...func(*sqs.Options),
+	) (*sqs.ChangeMessageVisibilityBatchOutput, error)
+}
+
 // SchedulerClient defines the minimal EventBridge Scheduler surface the
 // consumer relies on for the Scheduled Retry model. It mirrors the
 // aws-sdk-go-v2 scheduler.Client method signatures so a concrete
@@ -58,7 +75,8 @@ type SchedulerClient interface {
 // Compile-time assertions that the concrete aws-sdk-go-v2 clients satisfy the
 // consumer's client interfaces.
 var (
-	_ SQSClient         = (*sqs.Client)(nil)
-	_ BatchDeleteClient = (*sqs.Client)(nil)
-	_ SchedulerClient   = (*scheduler.Client)(nil)
+	_ SQSClient             = (*sqs.Client)(nil)
+	_ BatchDeleteClient     = (*sqs.Client)(nil)
+	_ BatchVisibilityClient = (*sqs.Client)(nil)
+	_ SchedulerClient       = (*scheduler.Client)(nil)
 )

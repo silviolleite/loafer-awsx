@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/silviolleite/loafer-awsx/middleware"
@@ -25,11 +26,14 @@ type Message interface {
 	Identifier() string
 	// TimeStamp returns the message timestamp.
 	TimeStamp() time.Time
-	// Dispatch signals that processing has completed, releasing any goroutine
-	// managing the message visibility timeout.
+	// Dispatch marks processing as completed. It is idempotent. The consumer
+	// stops managing the message visibility timeout as soon as the message
+	// reaches an outcome, so handlers do not need to call it.
 	Dispatch()
 	// Backoff requests that redelivery of the message be delayed by delay and
-	// marks the message as backed off.
+	// marks the message as backed off. It never blocks; when it is called more
+	// than once, the last delay wins. The consumer applies the delay when the
+	// handler returns.
 	Backoff(delay time.Duration)
 	// BackedOff reports whether Backoff has been called for the message.
 	BackedOff() bool
@@ -56,21 +60,21 @@ type snsEnvelope struct {
 }
 
 // message is the internal implementation of Message. It wraps a single SQS
-// types.Message, lazily parsed SNS envelope data, and the channels used by the
-// visibility-timeout manager to observe dispatch and backoff decisions.
+// types.Message, lazily parsed SNS envelope data, the instant it was received,
+// and the handler's backoff request.
 //
-// A message is safe for concurrent use: BackedOff state is stored atomically,
-// Dispatch is idempotent, and the backoff channel is buffered so Backoff never
-// blocks the caller.
+// A message is safe for concurrent use: the backoff state is stored atomically
+// and Dispatch is idempotent. receivedAt is written by the poller before the
+// message is shared and only read afterwards.
 type message struct {
-	backoffChannel chan time.Duration
-	dispatched     chan struct{}
-	barrier        *groupBarrier
-	original       types.Message
-	groupKey       string
-	envelope       snsEnvelope
-	dispatchOnce   sync.Once
-	backedOff      atomic.Bool
+	receivedAt   time.Time
+	dispatched   chan struct{}
+	original     types.Message
+	envelope     snsEnvelope
+	groupKey     string
+	backoffNanos atomic.Int64
+	dispatchOnce sync.Once
+	backedOff    atomic.Bool
 }
 
 // newMessage builds a message from an SQS types.Message. The body is parsed as
@@ -84,10 +88,9 @@ func newMessage(m types.Message) *message {
 	}
 
 	return &message{
-		original:       m,
-		envelope:       envelope,
-		backoffChannel: make(chan time.Duration, 1),
-		dispatched:     make(chan struct{}),
+		original:   m,
+		envelope:   envelope,
+		dispatched: make(chan struct{}),
 	}
 }
 
@@ -194,6 +197,12 @@ func (m *message) Identifier() string {
 	return *m.original.ReceiptHandle
 }
 
+// sqsMessageID returns the SQS MessageId, or the empty string when it is
+// absent. Unlike the receipt handle it stays the same across deliveries.
+func (m *message) sqsMessageID() string {
+	return aws.ToString(m.original.MessageId)
+}
+
 // Message returns the inner message content as a string.
 func (m *message) Message() string {
 	return m.envelope.Message
@@ -212,24 +221,16 @@ func (m *message) Dispatch() {
 	})
 }
 
-// dispatchSignal exposes the dispatch channel to the visibility-timeout manager
-// within the package. The channel is closed once Dispatch is called.
-func (m *message) dispatchSignal() <-chan struct{} {
-	return m.dispatched
-}
-
-// Backoff marks the message as backed off and sends delay to the backoff
-// channel so the visibility-timeout manager can apply a custom visibility. The
-// channel is buffered with capacity one, so the first call never blocks.
+// Backoff marks the message as backed off and records delay. It never blocks;
+// the last recorded delay is applied when the handler returns.
 func (m *message) Backoff(delay time.Duration) {
+	m.backoffNanos.Store(int64(delay))
 	m.backedOff.Store(true)
-	m.backoffChannel <- delay
 }
 
-// backoffSignal exposes the backoff channel to the visibility-timeout manager
-// within the package.
-func (m *message) backoffSignal() <-chan time.Duration {
-	return m.backoffChannel
+// backoffDelay returns the delay recorded by the last Backoff call.
+func (m *message) backoffDelay() time.Duration {
+	return time.Duration(m.backoffNanos.Load())
 }
 
 // BackedOff reports whether Backoff has been called for the message.
